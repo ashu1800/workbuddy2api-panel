@@ -303,10 +303,20 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
      被相邻单元格的边框覆盖，故用 separate + border-spacing: 0 自行画线；
    · 数字列统一 tabular-nums 且右对齐（旧版 .num 只设等宽没设对齐）。
    ════════════════════════════════════════════════════════════════════════ */
+/* 表格高度按「视口剩余高度」算，而不是拍一个 62vh：
+   62vh 在 989px 高的窗口里只给到 613px，而表格顶部在 161px —— 下方白空 187px，
+   同时 37 个模型被压在滚动区里（该用的空间没用、该看的内容被藏）。
+   单表视图（账号管理 / 模型档位）用 calc(100dvh - 表格以上所有内容高度 - 28px 呼吸位)：
+     · 模型档位：顶栏 56 + 视图内边距 20 + 卡片头 48 + 说明条 34 + 描边 ≈ 161
+     · 账号管理：再多一条统计条（73 + 16 外边距）≈ 216
+   max(240px, …) 兜住极矮窗口，避免表格被压成一条缝；不支持 dvh 的浏览器
+   回落上一行的 60vh。用量统计是四张表纵向排列的长页面，保持 60vh 让它自然滚动。 */
 .tbl-wrap {
-  overflow: auto; max-height: 62vh; overscroll-behavior: contain;
+  overflow: auto; max-height: 60vh; overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
+#view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 251px)); }
+#view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 196px)); }
 .dlg .tbl-wrap { max-height: none; overflow: visible; }
 .acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
 .acc caption { text-align: left; }

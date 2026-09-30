@@ -466,11 +466,13 @@ async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = skeletonRows(7, 4);
   try {
-    // 探测数据是可选增强：拉取失败不影响模型列表本身
-    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
-    const list = d.models || [];
+    // 探测数据是可选增强：拉取失败或返回非对象都不影响模型列表本身。
+    // （.catch 只兜住 reject；200 + 非对象 body 会原样落到下面，故这里显式判空，
+    //   否则一个可选接口的畸形响应会让整张模型表塌成一行报错。）
+    const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => null)]);
+    const list = (d && d.models) || [];
     if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
-    const probes = pr.probes || {};
+    const probes = (pr && pr.probes) || {};
     const probeKeys = Object.keys(probes);
     const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
     tb.innerHTML = list.map(m => {
