@@ -5,6 +5,11 @@
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <meta name="color-scheme" content="light dark">
 <title>WorkBuddy2API · 控制台</title>
+<!-- 站点图标：data URI 内联（CSP 的 img-src 允许 data:，无需新增静态路由）。
+     蓝底白 W = WorkBuddy 首字母。选字标而非图形化标记（汇聚节点 / 闪电）是因为
+     16px 是主战场：汇聚那类多点+连线的图形在这个尺寸下糊成一团，字标仍清晰。
+     几何与侧边栏品牌标一致（同 rx=8 圆角、同字宽），改一处要同时改两处。 -->
+<link rel="icon" href="data:image/svg+xml,%3Csvg%20xmlns='http://www.w3.org/2000/svg'%20viewBox='0%200%2032%2032'%3E%3Crect%20width='32'%20height='32'%20rx='8'%20fill='%230d74ce'/%3E%3Cpath%20d='M8%2010.5%2011.6%2021.5%2016%2013%2020.4%2021.5%2024%2010.5'%20fill='none'%20stroke='%23fff'%20stroke-width='2.8'%20stroke-linecap='round'%20stroke-linejoin='round'/%3E%3C/svg%3E">
 <style>
 /* ════════════════════════════════════════════════════════════════════════
    1. 设计令牌 —— 唯一真相层
@@ -60,6 +65,10 @@
           "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
   --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace;
   --content-max: 1360px;
+  /* 侧边栏宽度：导航是 16px 图标 + 4 字标题（约 100px 内容），216px 有近一半是空白。
+     184px 让主区多出 32px（账号表 11 列受益最明显），文字与内边距的呼吸感不变——
+     只是把多余的留白收掉。 */
+  --side-w: 184px;
   /* 图表（白底实测 ≥3:1） */
   --chart-1: #0d74ce; --chart-2: #1f7a4d; --chart-3: #a16207; --chart-4: #b91c1c;
   --chart-5: #6d28d9; --chart-6: #0e7490; --chart-7: #c2410c; --chart-8: #4d7c0f;
@@ -144,12 +153,14 @@ body {
 /* ════════════════════════════════════════════════════════════════════════
    3. 壳层：左侧导航 + 主区
    ════════════════════════════════════════════════════════════════════════ */
-.shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100dvh; }
+.shell { display: grid; grid-template-columns: var(--side-w) minmax(0, 1fr); min-height: 100dvh; }
 .nav {
   background: var(--surface); border-right: 1px solid var(--line);
   display: flex; flex-direction: column; position: sticky; top: 0; height: 100dvh;
 }
-.brand { padding: var(--sp-4) var(--sp-4) var(--sp-3); border-bottom: 1px solid var(--line-soft); }
+.brand { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-4) var(--sp-4) var(--sp-3); border-bottom: 1px solid var(--line-soft); }
+/* 品牌标：与 favicon 同一几何（蓝底圆角方块 + 白 W），随主题换蓝（浅 blue-11 / 深 blue-9） */
+.brand .mark { width: 26px; height: 26px; flex: none; }
 .brand .name { font-weight: 600; font-size: var(--fs-14); letter-spacing: -.01em; }
 .brand .sub { color: var(--ink-2); font-size: var(--fs-11); margin-top: 2px; }
 .nav ul { list-style: none; padding: var(--sp-2) var(--sp-2); flex: 1; display: flex; flex-direction: column; gap: 2px; }
@@ -167,16 +178,22 @@ body {
 .nav .sig .mono { font-family: var(--mono); }
 
 .main { min-width: 0; display: flex; flex-direction: column; }
+/* 顶栏与内容区共用同一个「封顶 + 居中」容器：宽度上限一致、左右内边距一致，
+   所以在任何视口下标题左缘都与卡片左缘对齐，右侧也不会留下单边空白
+   （侧边栏收窄到 184px 后，若内容区仍然左对齐，右侧会多出 56px 死白）。 */
 .topbar {
-  display: flex; align-items: center; gap: var(--sp-3); min-height: 56px; padding: 0 var(--sp-6);
   border-bottom: 1px solid var(--line); background: var(--surface);
   position: sticky; top: 0; z-index: var(--z-topbar);
+}
+.topbar .bar {
+  display: flex; align-items: center; gap: var(--sp-3); min-height: 56px; padding: 0 var(--sp-6);
+  max-width: var(--content-max); width: 100%; margin: 0 auto;
 }
 .topbar h2 { font-size: var(--fs-16); font-weight: 600; letter-spacing: -.01em; }
 .topbar .sep { color: var(--ink-faint); }
 .topbar .meta { color: var(--ink-2); font-size: var(--fs-12); font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: var(--sp-5) var(--sp-6) var(--sp-8); max-width: var(--content-max); width: 100%; }
+.view { padding: var(--sp-5) var(--sp-6) var(--sp-8); max-width: var(--content-max); width: 100%; margin: 0 auto; }
 
 /* ════════════════════════════════════════════════════════════════════════
    4. 通用组件：按钮 / 表单 / 卡片 / 统计条 / 徽标 / 空态
@@ -672,7 +689,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
   .brand { border: none; padding-right: var(--sp-3); }
   .grid2, .grid3 { grid-template-columns: 1fr; }
   .view { padding: var(--sp-4); }
-  .topbar { padding: 0 var(--sp-4); }
+  .topbar .bar { padding: 0 var(--sp-4); }
 }
 @media (max-width: 640px) {
   .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
@@ -684,8 +701,14 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
 <div class="shell">
   <nav class="nav" aria-label="主导航">
     <div class="brand">
-      <div class="name">WorkBuddy2API</div>
-      <div class="sub" id="navSub">控制台</div>
+      <svg class="mark" viewBox="0 0 32 32" aria-hidden="true">
+        <rect width="32" height="32" rx="8" fill="var(--accent)"/>
+        <path d="M8 10.5 11.6 21.5 16 13 20.4 21.5 24 10.5" fill="none" stroke="var(--on-accent)" stroke-width="2.8" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <div class="name">WorkBuddy2API</div>
+        <div class="sub" id="navSub">控制台</div>
+      </div>
     </div>
     <ul>
       <li><a href="#accounts" data-view="accounts" class="on">
@@ -718,15 +741,17 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
 
   <div class="main" id="main" tabindex="-1">
     <div class="topbar">
-      <h2 id="ttl">账号管理</h2>
-      <span class="sep">/</span>
-      <span class="meta" id="subMeta">-</span>
-      <div class="grow"></div>
-      <button class="icon ghost" id="btnTheme" title="切换明暗（浅色 / 深色）" aria-label="切换主题">
-        <svg id="icoTheme" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
-      </button>
-      <button id="btnRefresh">刷新</button>
-      <button class="primary" id="btnAdd">添加账号</button>
+      <div class="bar">
+        <h2 id="ttl">账号管理</h2>
+        <span class="sep">/</span>
+        <span class="meta" id="subMeta">-</span>
+        <div class="grow"></div>
+        <button class="icon ghost" id="btnTheme" title="切换明暗（浅色 / 深色）" aria-label="切换主题">
+          <svg id="icoTheme" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+        </button>
+        <button id="btnRefresh">刷新</button>
+        <button class="primary" id="btnAdd">添加账号</button>
+      </div>
     </div>
 
     <!-- 账号池 -->
