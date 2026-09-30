@@ -384,11 +384,9 @@ th.num, td.num { text-align: right; }
 .calls-cell .sep { margin: 0 var(--sp-1); color: var(--ink-faint); }
 /* 账号表：除「账号」列外，列标题与列内容一律居中。
    用 #view-accounts 限定作用域，不影响其它表格的右对齐数字列（.num 的全局右对齐
-   在这里被覆盖）。限流条保持整行宽度（-webkit-line-clamp 需要确定宽度才能正确
-   截两行），只把文字居中；积分条用 margin auto 居中。 */
+   在这里被覆盖）。积分条用 margin auto 居中。 */
 #view-accounts .acc th, #view-accounts .acc td { text-align: center; }
 #view-accounts .acc th:nth-child(2), #view-accounts .acc td:nth-child(2) { text-align: left; }
-#view-accounts .acc .rate-limit { text-align: center; }
 #view-accounts .acc .cred .bar { margin-left: auto; margin-right: auto; }
 #view-accounts .acc td.acts { justify-content: center; }
 .usage-line {
@@ -399,17 +397,6 @@ th.num, td.num { text-align: right; }
 .usage-item b { font-weight: 600; }
 .usage-item em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
 .usage-total { color: var(--accent-ink); background: var(--accent-soft); }
-/* 限流条：最多两行（超出省略），title 携带全文。单行省略会把「预计 … 恢复」
-   这类关键信息整段切掉，三行以上又会把行高撑得参差不齐，两行是折中。 */
-.rate-limits { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-1); min-width: 200px; max-width: 340px; }
-.rate-limit {
-  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
-  padding: 2px var(--sp-2); overflow: hidden;
-  border: 1px solid var(--warn-line); border-radius: var(--r-sm); background: var(--warn-soft);
-  font-size: var(--fs-11); line-height: 1.45; color: var(--warn-ink);
-}
-.rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-3); color: var(--ink-2); }
-.rate-limit b { color: inherit; font-family: var(--mono); font-weight: 600; }
 
 /* ════════════════════════════════════════════════════════════════════════
    6. 日志：请求指标 + 运行日志

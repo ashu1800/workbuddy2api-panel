@@ -183,7 +183,7 @@ func TestAppJSRateLimitMeta(t *testing.T) {
 const vm = require('vm');
 const src = fs.readFileSync(process.argv[2], 'utf8');
 const start = src.indexOf('function dur(');
-const end = src.indexOf('function rateLimitRowsHtml');
+const end = src.indexOf('function formatTokenCount');
 if (start < 0 || end < 0) throw new Error('rate limit helpers not found');
 const ctx = { Date, Number, String, Math };
 vm.createContext(ctx);
@@ -485,8 +485,12 @@ console.log(JSON.stringify({
   tagMixed: tagOf(statusTagOf({}, '', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }, { model: 'm2', kind: 'model_unavailable', detail: 'd2' }])),
   tagDisabledWins: tagOf(statusTagOf({ disabled: true }, '', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }])),
   tagCoolWins: tagOf(statusTagOf({}, '熔断 · 1分', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }])),
+  tagOffReason: tagOf(statusTagOf({ disabled: true, reason: '连续 3 次会话失效' }, '', [])),
+  tagRlReason: tagOf(statusTagOf({ reason: 'R' }, '', [{ model: 'm1', kind: 'rate_limit', detail: 'D' }])),
   tagTitle: statusTagOf({}, '', [{ model: 'MODELX', kind: 'rate_limit', detail: 'DETAILY' }]).title.indexOf('MODELX') >= 0
     && statusTagOf({}, '', [{ model: 'MODELX', kind: 'rate_limit', detail: 'DETAILY' }]).title.indexOf('DETAILY') >= 0,
+  tagTitleReason: statusTagOf({ disabled: true, reason: 'REASONZ' }, '', []).title.indexOf('REASONZ') >= 0
+    && statusTagOf({ reason: 'REASONZ' }, '', [{ model: 'm', kind: 'rate_limit', detail: 'd' }]).title.indexOf('REASONZ') >= 0,
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "avg-*.cjs")
 	if err != nil {
@@ -503,10 +507,12 @@ console.log(JSON.stringify({
 	const want = `{"ttfb":400,"ttfbNone":null,"ttfbMissing":null,"ttfbNull":null,` +
 		`"rate":500,"rateNone":null,"rateMissing":null,"rateNull":null,` +
 		`"okRate":99.83060417843026,"okFull":100,"okZero":0,"okNoField":null,"okNoAttempts":null,"okNull":null,` +
-		`"tagOk":"|ok|可用|-","tagOff":"off|bad|已禁用|-","tagCool":"cool|warn|限流冷却 · 14分02秒|-",` +
+		`"tagOk":"|ok|可用|-","tagOff":"off|bad|已禁用|-","tagCool":"cool|warn|限流冷却 · 14分02秒|T",` +
 		`"tagLimited1":"rl|warn|限流|T","tagLimited2":"rl|warn|限流 · 2 个模型|T",` +
 		`"tagUnavail":"rl|warn|待重探|T","tagMixed":"rl|warn|异常 · 2 个模型|T",` +
-		`"tagDisabledWins":"off|bad|已禁用|-","tagCoolWins":"cool|warn|熔断 · 1分|-","tagTitle":true}`
+		`"tagDisabledWins":"off|bad|已禁用|-","tagCoolWins":"cool|warn|熔断 · 1分|T",` +
+		`"tagOffReason":"off|bad|已禁用|T","tagRlReason":"rl|warn|限流|T",` +
+		`"tagTitle":true,"tagTitleReason":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("avg perf=%s want %s", strings.TrimSpace(string(out)), want)
 	}

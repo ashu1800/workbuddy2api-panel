@@ -123,16 +123,6 @@ function rateLimitMeta(row, now) {
   }
   return { model, kind, detail, title: title.join('\n') };
 }
-function rateLimitRowsHtml(rows, now) {
-  const list = Array.isArray(rows) ? rows.filter(row => row && row.model) : [];
-  if (!list.length) return '';
-  return '<div class="rate-limits">' + list.map(row => {
-    const m = rateLimitMeta(row, now);
-    return '<div class="rate-limit ' + (m.kind === 'model_unavailable' ? 'model-unavailable' : '') +
-      '" title="' + esc(m.title) + '"><b>' + esc(m.model) + '</b><span>' + esc(m.detail) + '</span></div>';
-  }).join('') + '</div>';
-}
-
 function formatTokenCount(tokens) {
   if (tokens == null || tokens === '') return '—';
   const n = Number(tokens);
@@ -305,25 +295,34 @@ function okRateOf(tu) {
 /* statusTagOf 账号状态结论（纯函数，便于测试）：优先级 = 账号级状态 > 模型级受限 > 可用。
    账号自身可能既没冷却也没熔断，却已经有模型在限流或待重探——这时只显示「可用」会
    让人以为它完全健康（实测：标签写着可用，下面挂着「预计 10-01 11:14 解封」的琥珀条）。
-   coolText 由调用方格式化（本函数不依赖 dur）；rlMetas 是 rateLimitMeta 的结果数组。
-   返回 {cls, tone, label, title}：cls 供行级样式（左色条），tone 是标签语义色。 */
+   状态列只渲染这一个标签：具体原因（哪些模型、何时解封、禁用原因）全部放进 title，
+   悬浮才显示——常显的原因会把行高撑得参差不齐，也让「状态」这一列喧宾夺主。
+   coolText 由调用方格式化（本函数不依赖 dur）；rlMetas 是 rateLimitMeta 的结果数组。 */
 function statusTagOf(s, coolText, rlMetas) {
-  if (s.disabled) return { cls: 'off', tone: 'bad', label: '已禁用', title: '' };
-  if (coolText) return { cls: 'cool', tone: 'warn', label: coolText, title: '' };
+  const reason = (s && s.reason) ? String(s.reason) : '';
+  if (s.disabled) return { cls: 'off', tone: 'bad', label: '已禁用', title: reason };
+  if (coolText) {
+    return {
+      cls: 'cool', tone: 'warn', label: coolText,
+      title: (reason ? reason + '\n' : '') + '账号当前不可用，等待冷却/熔断恢复',
+    };
+  }
   const rl = rlMetas || [];
   if (rl.length) {
     const unavail = rl.filter(m => m.kind === 'model_unavailable').length;
     const limited = rl.length - unavail;
     // 同质时给出具体状态，混杂时统称异常——两者都要求悬浮能看到具体原因
     const label = limited && unavail ? '异常' : (unavail ? '待重探' : '限流');
+    const lines = rl.length + ' 个模型受限：\n' +
+      rl.map(m => '· ' + m.model + '：' + m.detail).join('\n');
     return {
       cls: 'rl',
       tone: 'warn',
       label: label + (rl.length > 1 ? ' · ' + rl.length + ' 个模型' : ''),
-      title: rl.length + ' 个模型受限：\n' + rl.map(m => '· ' + m.model + '：' + m.detail).join('\n'),
+      title: reason ? lines + '\n' + reason : lines,
     };
   }
-  return { cls: '', tone: 'ok', label: '可用', title: '' };
+  return { cls: '', tone: 'ok', label: '可用', title: reason };
 }
 
 function renderAccounts(list) {
@@ -349,10 +348,9 @@ function renderAccounts(list) {
       : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
     const st = statusTagOf(s, cool > 0 ? coolKind + ' · ' + dur(cool) : '', rlMetas);
     const cls = st.cls;
+    // 状态列只放这一个标签：原因（模型限流明细 / 禁用原因）在 title 里，悬浮才显示。
     const tag = '<span class="tag ' + st.tone + '"' +
       (st.title ? ' title="' + esc(st.title) + '"' : '') + '>' + esc(st.label) + '</span>';
-    const note = s.reason ? '<div class="note fs-12 mt-1">' + esc(s.reason) + '</div>' : '';
-    const rateLimits = rateLimitRowsHtml(rl, now);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
@@ -395,7 +393,7 @@ function renderAccounts(list) {
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + note + rateLimits + '</td>' +
+      '<td>' + tag + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div></td>' +
       '<td class="num calls-cell" title="' + esc(callsTitle) + '">' +
         '<span class="calls-n"><b>' + req + '</b><em>次</em></span>' +

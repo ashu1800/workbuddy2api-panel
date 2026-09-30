@@ -31,9 +31,8 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-// 1.13.1：修正推理速度分子口径（同窗口配对）、成功率改用配对计数器（不再 >100%）、
-// 模型级受限时状态标签不再显示"可用"；账号表除账号列外居中。
-const appVersion = "1.13.1-panel"
+// 1.13.2：状态列只留一个标签，原因（模型限流明细 / 禁用原因）改为悬浮显示。
+const appVersion = "1.13.2-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
