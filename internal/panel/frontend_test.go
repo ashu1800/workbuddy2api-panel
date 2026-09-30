@@ -460,3 +460,51 @@ func TestIndexDialogsAccessible(t *testing.T) {
 		}
 	}
 }
+
+// TestAppJSWindowHours 用量窗口「今天」的换算：后端窗口是 [当前整点-(hours-1)h, now]，
+// 所以只有取「当前小时 + 1」才恰好从今天 00:00 起算。算错不会报错，只会静默地多算
+// 或少算几个小时（页面上表现为数字偏一点，很难发现），故用固定时刻钉住。
+func TestAppJSWindowHours(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS window-hours check skipped")
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	start := strings.Index(text, "function windowHours")
+	end := strings.Index(text, "async function loadUsage")
+	if start < 0 || end <= start {
+		t.Fatal("windowHours slice not found in app.js")
+	}
+	script := text[start:end] + `
+const at = (h, m) => new Date(2026, 8, 30, h, m, 0);
+console.log(JSON.stringify({
+  midnight: windowHours('today', at(0, 5)),
+  morning: windowHours('today', at(9, 30)),
+  afternoon: windowHours('today', at(14, 30)),
+  lateNight: windowHours('today', at(23, 30)),
+  days3: windowHours('72'),
+  allHistory: windowHours('0'),
+  missing: windowHours(undefined),
+  garbage: windowHours('abc'),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "wh-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("windowHours node check failed: %v\n%s", err, out)
+	}
+	const want = `{"midnight":1,"morning":10,"afternoon":15,"lateNight":24,"days3":72,"allHistory":0,"missing":72,"garbage":72}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("windowHours=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}

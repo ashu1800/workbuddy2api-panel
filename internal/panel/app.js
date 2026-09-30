@@ -1709,8 +1709,22 @@ async function warmUsageModelRates() {
   usageRateWarmAt = Date.now();
 }
 
+/* windowHours 把用量窗口下拉的取值换算成后端认识的「小时数」。
+   后端窗口是 [当前整点-(hours-1)h, now]（小时粒度、含当前整点），所以：
+     · "today"（今天，自然日口径）= 当前小时 + 1 → 窗口恰好从今天 00:00 开始
+       （00:30 → hours=1 即 [00:00, now]；23:30 → hours=24 即 [00:00, now]）。
+       注意这与"近 24 小时"不是一回事：后者是滚动窗口，只在 23 点后才与今天重合。
+     · 数字 = 直接透传（0 表示全部历史）。
+   now 可注入，便于单测固定时刻。跨时区部署时以浏览器本地小时为准，故面板与服务
+   需在同一时区（本项目默认 TZ=Asia/Shanghai）。 */
+function windowHours(raw, now) {
+  if (raw === 'today') return ((now || new Date()).getHours()) + 1;
+  const n = Number(raw);
+  return Number.isFinite(n) && n >= 0 ? n : 72;
+}
+
 async function loadUsage() {
-  const hours = ($('usWindow') && $('usWindow').value) || 72;
+  const hours = windowHours($('usWindow') && $('usWindow').value);
   try {
     await warmUsageModelRates();
     const d = await api('usage?hours=' + encodeURIComponent(hours));
