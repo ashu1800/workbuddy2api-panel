@@ -1,19 +1,26 @@
 'use strict';
 /* ── 状态 ─────────────────────────────────────────────────────────── */
 const LS_KEY = 'wb2api.key', LS_THEME = 'wb2api.theme';
-let theme = localStorage.getItem(LS_THEME) || 'auto';   // auto | light | dark
+// 主题以浅色为主：只有用户显式切过深色才用深色（历史 'auto' 与未知值回落浅色）。
+let theme = localStorage.getItem(LS_THEME) === 'dark' ? 'dark' : 'light';
 let view = 'accounts';
 let overviewData = null, cfgLoaded = null;
 let logPin = true, loginState = null, loginTimer = null;
 let refTimer = null;
+// lastFocus 记录弹层打开前的焦点，关闭后归还——键盘用户不会丢失位置。
+let lastFocus = null;
+// 用量「模型倍率回填」节流时间戳。必须声明在文件顶部：go() 在顶层被调用，落到
+// #usage 分支时会同步进入 warmUsageModelRates()，声明在下方就是 TDZ
+// ReferenceError（旧版直接刷新用量页即报 "Cannot access 'usageRateWarmAt'
+// before initialization"），async 只是把它变成被 catch 吞掉的 rejection。
+let usageRateWarmAt = 0;
 
 const $ = id => document.getElementById(id);
 
 /* ── 主题 ─────────────────────────────────────────────────────────── */
-/* 两态翻转（浅/深），首次访问跟随系统偏好；点击总是切换可见外观，符合直觉。 */
-function effTheme() {
-  return theme === 'auto' ? (matchMedia('(prefers-color-scheme: light)').matches ? 'light' : 'dark') : theme;
-}
+/* 两态翻转（浅/深），默认浅色；点击总是切换可见外观。深色是次要模式：
+   所有组件样式先在浅色下定稿，深色只做同一套语义 token 的色阶替换。 */
+function effTheme() { return theme === 'dark' ? 'dark' : 'light'; }
 function applyTheme() {
   const eff = effTheme();
   document.documentElement.dataset.theme = eff;
@@ -22,7 +29,6 @@ function applyTheme() {
     : '<path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/>';
   $('btnTheme').title = eff === 'light' ? '切换到深色' : '切换到浅色';
 }
-addEventListener('change', applyTheme);
 $('btnTheme').onclick = () => {
   theme = effTheme() === 'light' ? 'dark' : 'light';
   localStorage.setItem(LS_THEME, theme);
@@ -42,12 +48,18 @@ async function api(path, opts = {}) {
   if (!r.ok) throw new Error(d.error || ('HTTP ' + r.status));
   return d;
 }
+/* toast 提示：容器带 aria-live="polite"（读屏会播报），最多同时 4 条，
+   鼠标悬停暂停自动消失（长文案来得及读完）。 */
 function toast(msg, cls) {
+  const box = $('toasts');
+  while (box.children.length >= 4) box.firstElementChild.remove();
   const el = document.createElement('div');
   el.className = 'tst ' + (cls || '');
   el.textContent = msg;
-  $('toasts').appendChild(el);
-  setTimeout(() => el.remove(), 3600);
+  box.appendChild(el);
+  let timer = setTimeout(() => el.remove(), 3600);
+  el.addEventListener('mouseenter', () => clearTimeout(timer));
+  el.addEventListener('mouseleave', () => { timer = setTimeout(() => el.remove(), 1600); });
 }
 // esc 文本/属性双安全转义。不能只用 div.innerHTML（它转义 <>& 但不转义引号），
 // 否则字符串拼进 HTML 属性（如 title="uid: ..."）时引号可闭合属性并注入事件处理器。
@@ -156,8 +168,58 @@ function formatRate(rate) {
   return n.toFixed(1) + 'tok/s';
 }
 
+/* ── 弹层通用管理 ─────────────────────────────────────────────────── */
+/* 四个弹层（任务 / 券码 / 添加账号 / 密钥）共用一套打开-关闭语义：
+   打开时聚焦首个可交互控件并记住来源焦点；Esc 关闭（data-lock="1" 的密钥门
+   除外——它是鉴权前置，必须由用户显式输入）；Tab 在弹层内循环（焦点陷阱）；
+   关闭后焦点归还来源。 */
+function veilStack() {
+  const list = document.querySelectorAll('.veil.on');
+  return list.length ? list[list.length - 1] : null;
+}
+function veilFocusables(el) {
+  return [...el.querySelectorAll('button, input, select, textarea, a[href]')]
+    .filter(n => !n.disabled && !n.hidden && n.offsetParent !== null);
+}
+function openVeil(id) {
+  const el = $(id);
+  if (!el) return;
+  lastFocus = document.activeElement;
+  el.classList.add('on');
+  // 优先聚焦首个表单控件；纯展示型弹层（任务 / 券码）聚焦弹层本身，而不是随便
+  // 挑一个按钮——否则一打开就有一个按钮带焦点环，视线被引到非主操作上。
+  const field = el.querySelector('input:not([type="hidden"]), select, textarea');
+  const dlg = el.querySelector('.dlg');
+  if (dlg && !dlg.hasAttribute('tabindex')) dlg.setAttribute('tabindex', '-1');
+  const target = field || dlg || el;
+  setTimeout(() => target.focus(), 40);
+}
+function closeVeil(id) {
+  const el = $(id);
+  if (!el || el.dataset.lock === '1') return;
+  el.classList.remove('on');
+  if (lastFocus && document.contains(lastFocus)) { try { lastFocus.focus(); } catch (e) { /* 元素已移除 */ } }
+  lastFocus = null;
+}
+addEventListener('keydown', ev => {
+  const veil = veilStack();
+  if (!veil) return;
+  if (ev.key === 'Escape') {
+    if (veil.dataset.lock === '1') return;
+    ev.preventDefault();
+    closeVeil(veil.id);
+    return;
+  }
+  if (ev.key !== 'Tab') return;
+  const items = veilFocusables(veil);
+  if (!items.length) return;
+  const first = items[0], last = items[items.length - 1];
+  if (ev.shiftKey && document.activeElement === first) { ev.preventDefault(); last.focus(); }
+  else if (!ev.shiftKey && document.activeElement === last) { ev.preventDefault(); first.focus(); }
+});
+
 /* ── 密钥门 ───────────────────────────────────────────────────────── */
-function openKey() { $('keyVeil').classList.add('on'); setTimeout(() => $('keyInput').focus(), 60); }
+function openKey() { openVeil('keyVeil'); }
 $('btnKey').onclick = async () => {
   const v = $('keyInput').value.trim();
   if (!v) return;
@@ -173,10 +235,24 @@ $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKe
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+/* skeletonRow 表格骨架行：加载态给形状不给文字，避免"正在查询…"把表格塌成一行。 */
+function skeletonRows(cols, n) {
+  const w = ['w-1', 'w-2', 'w-3'];
+  let out = '';
+  for (let i = 0; i < (n || 3); i++) {
+    out += '<tr aria-hidden="true"><td colspan="' + cols + '">' +
+      '<span class="skeleton ' + w[i % w.length] + '"></span></td></tr>';
+  }
+  return out;
+}
 function go(v) {
   view = v;
   document.querySelectorAll('.view').forEach(s => s.hidden = s.id !== 'view-' + v);
-  document.querySelectorAll('.nav a').forEach(a => a.classList.toggle('on', a.dataset.view === v));
+  document.querySelectorAll('.nav a').forEach(a => {
+    const on = a.dataset.view === v;
+    a.classList.toggle('on', on);
+    if (on) a.setAttribute('aria-current', 'page'); else a.removeAttribute('aria-current');
+  });
   $('ttl').textContent = TITLES[v];
   if (v === 'models' && !$('mdBody').children.length) loadModels();
   if (v === 'config') loadConfig();
@@ -184,8 +260,11 @@ function go(v) {
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
   if (v === 'taskscenter') reattachQueueView();
+  // 视图切换后把焦点交给主区：读屏与键盘用户不会滞留在导航里。
+  $('main').focus({ preventScroll: true });
 }
 document.querySelectorAll('.nav a').forEach(a => a.onclick = e => { e.preventDefault(); go(a.dataset.view); history.replaceState(null, '', '#' + a.dataset.view); });
+$('skipLink').onclick = () => setTimeout(() => $('main').focus({ preventScroll: true }), 0);
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
@@ -209,7 +288,7 @@ function renderAccounts(list) {
         : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
       tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
     } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
-    const note = s.reason ? '<div class="hint" style="font-size:11.5px;color:var(--ink-3);margin-top:3px">' + esc(s.reason) + '</div>' : '';
+    const note = s.reason ? '<div class="note fs-12 mt-1">' + esc(s.reason) + '</div>' : '';
     const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
@@ -234,18 +313,19 @@ function renderAccounts(list) {
     const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span style="color:var(--ink-3)">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
+      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
-      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="width:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span style="color:var(--ink-3)">/</span> <span style="color:var(--bad)">' + (s.err_total || 0) + '</span></td>' +
+      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div></td>' +
+      '<td class="num">' + (s.success_count || 0) + ' <span class="c-muted">/</span> <span class="c-bad">' + (s.err_total || 0) + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
         '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
-        '<span class="usage-item usage-latency"><b>' + latency + '</b></span>' +
-        '<span class="usage-item usage-rate"><b>' + rate + '</b></span>' +
+        // 无观测值的列不渲染空色块（旧版恒渲染，会留下一个绿色的「—」）
+        (latency === '—' ? '' : '<span class="usage-item usage-latency"><b>' + latency + '</b></span>') +
+        (rate === '—' ? '' : '<span class="usage-item usage-rate"><b>' + rate + '</b></span>') +
       '</span></td>' +
-      '<td class="num" style="color:var(--ink-3)">' + ago(s.last_success) + '</td>' +
+      '<td class="num c-muted">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
         '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
@@ -266,12 +346,13 @@ async function loadOverview(quiet) {
     $('sCooling').textContent = d.cooling;
     $('sDisabled').textContent = d.disabled;
     const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-  const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-  $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
+    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
+    $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
     $('sSticky').textContent = d.sticky_sessions;
-    $('navSub').textContent = 'v' + d.version;
+    // 版本只在侧栏底栏展示一次：旧版品牌区与底栏重复显示同一版本号，观感冗余。
+    // 品牌区改展示部署形态（本地内存 / Redis 镜像），信息不重复。
+    $('navSub').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navVer').textContent = 'v' + d.version;
-    $('navRedis').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
     $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
     const p = $('navPulse');
     p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
@@ -350,15 +431,15 @@ function outCell(m, pr) {
     if (pr.claimed && pr.measured < pr.claimed) {
       const x = pr.claimed / pr.measured;
       const xs = (x >= 10 ? Math.round(x) : Math.round(x * 10) / 10) + '×';
-      return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--warn);font-weight:600">' +
+      return '<td class="num" title="' + esc(tip) + '"><span class="c-warn strong">' +
         fmtK(pr.measured) + ' ⚠</span><div class="note">钳制 ' + xs + stale + '</div></td>';
     }
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ok)">' + fmtK(pr.measured) +
+    return '<td class="num" title="' + esc(tip) + '"><span class="c-ok">' + fmtK(pr.measured) +
       (pr.claimed && pr.measured > pr.claimed ? ' ↑' : ' ✓') + '</span></td>';
   }
   if (pr.verdict === 'at_least' && pr.measured)
-    return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">≥' + fmtK(pr.measured) + '</span></td>';
-  return '<td class="num" title="' + esc(tip) + '"><span style="color:var(--ink-3)">?</span><div class="note">未测出' + stale + '</div></td>';
+    return '<td class="num" title="' + esc(tip) + '"><span class="c-muted">≥' + fmtK(pr.measured) + '</span></td>';
+  return '<td class="num" title="' + esc(tip) + '"><span class="c-muted">?</span><div class="note">未测出' + stale + '</div></td>';
 }
 
 /* rateCell 倍率列：牌价 vs 生效价。上游 credits 是牌价（转正后基准倍率），
@@ -368,20 +449,20 @@ function outCell(m, pr) {
 function rateCell(m) {
   const tip = m.promo_note ? ' title="' + esc(m.promo_note) + '"' : '';
   if (m.promo_factor != null && m.promo_credits) {
-    const base = m.credits ? ' <s style="color:var(--ink-3);font-size:11.5px">' + esc(m.credits) + '</s>' : '';
-    const label = m.promo_label ? ' <span class="tag ok">' + esc(m.promo_label) + '</span>' : '';
-    return '<span' + tip + ' style="cursor:help"><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
+    const base = m.credits ? ' <s class="c-muted fs-12">' + esc(m.credits) + '</s>' : '';
+    const label = m.promo_label ? ' <span class="tag info">' + esc(m.promo_label) + '</span>' : '';
+    return '<span' + tip + ' class="help"><b>' + esc(m.promo_credits) + '</b>' + label + base + '</span>';
   }
   if (m.promo_label) {
-    return '<span' + tip + ' style="cursor:help">' + (m.credits ? esc(m.credits) : '—') +
-      ' <span class="tag warn">' + esc(m.promo_label) + '</span></span>';
+    return '<span' + tip + ' class="help">' + (m.credits ? esc(m.credits) : '—') +
+      ' <span class="tag info">' + esc(m.promo_label) + '</span></span>';
   }
   return m.credits ? esc(m.credits) : '—';
 }
 
 async function loadModels() {
   const tb = $('mdBody');
-  tb.innerHTML = '<tr><td colspan="7"><div class="empty">正在向上游查询…</div></td></tr>';
+  tb.innerHTML = skeletonRows(7, 4);
   try {
     // 探测数据是可选增强：拉取失败不影响模型列表本身
     const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => ({}))]);
@@ -393,20 +474,21 @@ async function loadModels() {
     tb.innerHTML = list.map(m => {
       const eff = (m.supported_efforts || []).slice();
       if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
-      const effs = eff.length ? eff.map(e => '<span class="tag warn">' + esc(e) + '</span>').join(' ')
-        : '<span style="color:var(--ink-3);font-size:12.5px">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）
+      const effs = eff.length ? eff.map(e => '<span class="tag info">' + esc(e) + '</span>').join(' ')
+        : '<span class="c-muted fs-12">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）。
+      // 能力是中性元信息，用 mute；只有「需要你关注」的状态才用琥珀。
       const caps = [];
       if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-      if (m.supports_tool_call) caps.push('<span class="tag warn">工具</span>');
-      if (m.supports_images) caps.push('<span class="tag warn">视觉</span>');
-      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag warn">思考常开</span>');
-      const capHtml = caps.length ? '<div class="id" style="margin-top:2px">' + caps.join(' ') + '</div>' : '';
+      if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
+      if (m.supports_images) caps.push('<span class="tag mute">视觉</span>');
+      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag mute">思考常开</span>');
+      const capHtml = caps.length ? '<div class="id mt-1">' + caps.join(' ') + '</div>' : '';
       const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
       return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
         '<td class="num">' + rateCell(m) + '</td>' +
-        '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span style="color:var(--ink-3)">—</span>') + '</td>' +
-        '<td class="efs" style="white-space:normal">' + effs + '</td>' +
+        '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span class="c-muted">—</span>') + '</td>' +
+        '<td class="efs">' + effs + '</td>' +
         '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
         outCell(m, probeOf(m.id)) + '</tr>';
     }).join('');
@@ -446,7 +528,7 @@ async function loadLogs() {
         const ch = logCh === 'all' ? '<i class="lch c-' + esc(e.ch) + '">' + ({ task: '任务', chat: '对话', sys: '系统' }[e.ch] || e.ch) + '</i>' : '';
         return '<span class="ln' + lvl + '">' + ch + esc(t + ' ' + e.text) + '</span>';
       }).join('')
-      : '<span style="color:var(--ink-3)">暂无日志</span>';
+      : '<span class="c-muted">暂无日志</span>';
     if (logPin && atEnd) box.scrollTop = box.scrollHeight;
     const counts = {};
     for (const e of (d.entries || [])) counts[e.ch] = (counts[e.ch] || 0) + 1;
@@ -471,7 +553,7 @@ function renderRequestMetrics(m, entries) {
     : '仅内存指标，JSONL 归档已关闭';
 
   $('reqLogBox').innerHTML = (entries || []).map(requestLogLine).join('') ||
-    '<span style="color:var(--ink-3)">暂无请求记录</span>';
+    '<span class="c-muted">暂无请求记录</span>';
 }
 
 function requestLogText(e) {
@@ -643,7 +725,7 @@ $('cfgForm').onsubmit = async ev => {
 
 /* ── 添加账号 ─────────────────────────────────────────────────────── */
 function openAdd() {
-  $('addVeil').classList.add('on');
+  openVeil('addVeil');
   // 重置到登录标签
   switchAddTab('login');
   $('addPick').hidden = false;
@@ -655,7 +737,11 @@ function openAdd() {
   stopPoll();
 }
 function switchAddTab(tab) {
-  document.querySelectorAll('#addTabs .tab').forEach(b => b.classList.toggle('on', b.dataset.tab === tab));
+  document.querySelectorAll('#addTabs .tab').forEach(b => {
+    const on = b.dataset.tab === tab;
+    b.classList.toggle('on', on);
+    b.setAttribute('aria-selected', on ? 'true' : 'false');
+  });
   $('addTabLogin').hidden = tab !== 'login';
   $('addTabImport').hidden = tab !== 'import';
 }
@@ -700,7 +786,7 @@ async function pollLogin() {
     $('addErr').textContent = e.message + '（关闭后重新添加）';
   }
 }
-function closeAdd() { stopPoll(); loginState = null; $('addVeil').classList.remove('on'); }
+function closeAdd() { stopPoll(); loginState = null; closeVeil('addVeil'); }
 $('btnCloseAdd').onclick = closeAdd;
 $('btnStartLogin').onclick = startAddLogin;
 $('btnOpenUrl').onclick = () => open($('addUrl').textContent, '_blank');
@@ -801,11 +887,11 @@ const AUTO_TASKS = {
 function openTasks(uid) {
   taskUID = uid;
   $('taskWho').textContent = uid.slice(0, 16);
-  $('taskVeil').classList.add('on');
+  openVeil('taskVeil');
   $('btnTaskReload').hidden = false;
   loadTasks();
 }
-function closeTasks() { $('taskVeil').classList.remove('on'); taskUID = null; }
+function closeTasks() { closeVeil('taskVeil'); taskUID = null; }
 $('btnCloseTask').onclick = closeTasks;
 $('btnTaskReload').onclick = loadTasks;
 
@@ -846,14 +932,17 @@ $('btnTaskAutoAll').onclick = async () => {
 async function loadTasks() {
   if (!taskUID) return;
   const st = $('taskState'), tb = $('taskTable');
-  st.hidden = false;
+  // 加载态直接用骨架表格占位（旧版是"查询中"一行 + 空表，切换时会有跳动）。
+  st.hidden = true;
   st.className = 'state';
-  st.innerHTML = '<span class="dots">查询中</span>';
-  tb.hidden = true;
+  tb.hidden = false;
+  $('taskBody').innerHTML = skeletonRows(6, 5);
   try {
     const d = await api('accounts/' + encodeURIComponent(taskUID) + '/tasks');
     const list = d.tasks || [];
     if (!list.length) {
+      tb.hidden = true;
+      st.hidden = false;
       st.className = 'state';
       st.textContent = '该账号暂无任务';
       return;
@@ -891,6 +980,8 @@ async function loadTasks() {
     st.hidden = true;
     tb.hidden = false;
   } catch (e) {
+    tb.hidden = true;
+    st.hidden = false;
     st.className = 'state err';
     st.textContent = e.message;
   }
@@ -931,24 +1022,10 @@ $('taskBody').addEventListener('click', async ev => {
   finally { loadTasks(); }
 });
 
-/* ── 任务中心：开学季 + 全账号扫描/队列 ──────────────────────────── */
-// 开学季任务单元：✓ 已领（绿）｜◐ x/y 进行中（琥珀）｜○ 未做（灰）
-function staskHTML(t) {
-  if (!t) return '<span class="stask todo"><span class="mark">·</span>—</span>';
-  if (t.status === 'claimed') return '<span class="stask ok"><span class="mark">✓</span>已领</span>';
-  if (t.status === 'completed') return '<span class="stask warn"><span class="mark">◆</span>可领</span>';
-  if (t.status === 'in_progress') {
-    const fr = t.target_count ? '<span class="fr">' + t.progress + '/' + t.target_count + '</span>' : '';
-    return '<span class="stask warn"><span class="mark">◐</span>' + fr + '</span>';
-  }
-  return '<span class="stask todo"><span class="mark">○</span>未做</span>';
-}
-const LUCK_SVG = '<svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3.2 5.2 5 1.8l3 2.4 3-2.4 1.8 3.4-1.4 2.6 1.4 2.6-3.4 2.2H6l-3.4-2.2 1.4-2.6z" opacity=".9"/><circle cx="8" cy="9" r="1.1" fill="currentColor" stroke="none"/></svg>';
-const SCHOOL_TITLES = {
-  share_invite: '分享活动 +100c', desktop_chat_1_time: '桌面端体验 +100c（单次）',
-  chat_3_times: '和 AI 对话 3 次 +50c', expert_use: '召唤开学季专家 +50c',
-  task_student_verify: '学生认证 +100c（需真实认证，不做）',
-};
+/* ── 任务中心：全账号扫描 / 执行队列 ──────────────────────────────── */
+/* 说明：早期版本的「开学季状态卡」相关实现（staskHTML / LUCK_SVG /
+   SCHOOL_TITLES 与配套 .srow/.stask 样式）已随该视图下线成为死代码，
+   2026-10 前端重构时一并移除；活动已于 2026-09-24 结束。 */
 
 /* ── 精简 QR 编码器（券码二维码用）────────────────────────────────────
    规格子集：byte 模式、ECC L、版本 1-5（全部单纠错块，免块交织）、固定掩码 0。
@@ -1096,10 +1173,11 @@ function qrMatrix(text) {
   return M;
 }
 
-// 矩阵 → SVG（quiet zone 4 模块）
+// 矩阵 → SVG（quiet zone 4 模块）。白底由 CSS 提供（.vc-qr svg），
+// 保证深色主题下二维码仍是白底黑块——扫描器需要足够对比度。
 function qrSVG(M, px) {
   const n = M.length, q = 4, total = n + q * 2;
-  let s = '<svg viewBox="0 0 ' + total + ' ' + total + '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges" role="img" style="background:#fff">';
+  let s = '<svg viewBox="0 0 ' + total + ' ' + total + '" width="' + px + '" height="' + px + '" shape-rendering="crispEdges" role="img">';
   for (let r = 0; r < n; r++) for (let c = 0; c < n; c++)
     if (M[r][c]) s += '<rect x="' + (c + q) + '" y="' + (r + q) + '" width="1" height="1"/>';
   return s + '</svg>';
@@ -1142,7 +1220,7 @@ function vcCard(v) {
 
 async function loadSchoolVouchers() {
   const body = $('vcBody');
-  $('vcVeil').classList.add('on');
+  openVeil('vcVeil');
   body.innerHTML = '<div class="state"><span class="dots">查询中</span></div>';
   $('vcNote').textContent = '';
   try {
@@ -1154,11 +1232,11 @@ async function loadSchoolVouchers() {
       '<div class="vc-acct"><span class="nm">' + esc(a.nickname || a.uid) + '</span>' +
       '<span>' + a.vouchers.length + ' 张</span></div>' +
       a.vouchers.map(vcCard).join('')
-    ).join('') || '<div class="empty"><div class="big">🎟️</div>还没有抽到券</div>';
+    ).join('') || '<div class="empty"><div class="big">还没有抽到券</div>开学季活动期间的抽奖奖品会显示在这里。</div>';
     $('vcNote').textContent = total ? total + ' 张券 · ' + ok.filter(a => !(a.vouchers || []).length).length + ' 个账号未抽中' : '';
     const errs = arr.filter(a => a.error);
     if (errs.length) {
-      body.insertAdjacentHTML('beforeend', '<div class="note" style="color:var(--warn);margin-top:8px">查询失败：' +
+      body.insertAdjacentHTML('beforeend', '<div class="note c-warn mt-2">查询失败：' +
         errs.map(a => esc(a.nickname || a.uid.slice(0, 8)) + '（' + esc(a.error) + '）').join('、') + '</div>');
     }
     body.querySelectorAll('button[data-copy]').forEach(b => b.onclick = async () => {
@@ -1181,7 +1259,7 @@ async function loadSchoolVouchers() {
   }
 }
 $('btnSchoolVouchers').onclick = loadSchoolVouchers;
-$('btnVcClose').onclick = () => $('vcVeil').classList.remove('on');
+$('btnVcClose').onclick = () => closeVeil('vcVeil');
 $('btnVcRefresh').onclick = loadSchoolVouchers;
 
 /* 成长任务队列。lastQueueSeq 记录本页启动过的队列代次：执行结束后的残留 items
@@ -1197,7 +1275,7 @@ $('btnScanAll').onclick = async () => {
   b.disabled = true; b.textContent = '扫描中…';
   try {
     const d = await api('tasks/scan_all', { method: 'POST' });
-    renderQueue(groupItems(d), null, '没有待办任务 🎉', '全部账号的成长任务与开学季活动都已完成，明日再来。');
+    renderQueue(groupItems(d), null, '没有待办任务', '全部账号的成长任务与开学季活动都已完成，明日再来。');
   } catch (e) { toast(e.message, 'err'); }
   finally { b.disabled = false; b.textContent = '扫描待办'; }
 };
@@ -1245,15 +1323,14 @@ function qrowHTML(it) {
 function renderQueue(groups, progress, emptyTitle, emptyDesc) {
   const empty = $('tcEmpty'), list = $('qcList');
   if (!groups.length) {
-    empty.style.display = '';
+    empty.hidden = false;
     if (emptyTitle) empty.querySelector('.t').textContent = emptyTitle;
     if (emptyDesc) empty.querySelector('.d').textContent = emptyDesc;
     list.innerHTML = '';
     $('qProg').hidden = true; $('qcSummary').textContent = '';
     return;
   }
-  empty.style.display = 'none';
-  empty.style.display = 'none';
+  empty.hidden = true;
   let total = 0;
   list.innerHTML = groups.map(g => {
     total += g.rows.length;
@@ -1362,14 +1439,23 @@ function usStat(v, k, cls) {
          '</div><div class="k">' + esc(k) + '</div></div>';
 }
 
+/* statsHTML 补齐统计条到 6 的整数倍：统计条用「gap + 容器底色」画 1px 网格，
+   不足列数的空位会透出底色形成灰块。补 .blank 格（同面底色）让网格始终填满；
+   6 的倍数在三个断点（6/3/2 列）下都能整除，不会出现半行空位。 */
+function statsHTML(items) {
+  const out = items.slice();
+  while (out.length % 6 !== 0) out.push('<div class="stat blank" aria-hidden="true"></div>');
+  return out.join('');
+}
+
 function usBar(prompt, completion, total) {
   const t = Number(total || 0);
   if (!t) return '';
   const pp = Math.max(0, Math.min(100, Number(prompt || 0) / t * 100));
   const pc = Math.max(0, Math.min(100, Number(completion || 0) / t * 100));
   return '<span class="us-wrapbar">' +
-    '<span class="bar bar-p" style="width:' + (pp * 0.8).toFixed(1) + 'px" title="prompt"></span>' +
-    '<span class="bar bar-c" style="width:' + Math.max(2, pc * 0.8).toFixed(1) + 'px" title="completion"></span>' +
+    '<span class="bar bar-p" style="--w:' + (pp * 0.8).toFixed(1) + 'px" title="prompt"></span>' +
+    '<span class="bar bar-c" style="--w:' + Math.max(2, pc * 0.8).toFixed(1) + 'px" title="completion"></span>' +
     '</span>';
 }
 
@@ -1381,7 +1467,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td>' + esc(name) + (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +
     (mid || '') +
     '<td class="num">' + fmtTok(a.requests) + '</td>' +
-    '<td class="num">' + (a.errors ? '<span style="color:var(--warn)">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
+    '<td class="num">' + (a.errors ? '<span class="c-warn">' + fmtTok(a.errors) + '</span>' : '—') + '</td>' +
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
@@ -1394,13 +1480,14 @@ function usRow(name, sub, a, mid, withPerf) {
 
 function renderUsage(d) {
   const t = d.totals || {};
-  $('usStats').innerHTML =
-    usStat(fmtTok(t.requests), '请求数') +
-    usStat(fmtTok(t.total_tokens), '总 token') +
-    usStat(fmtTok(t.prompt_tokens), 'prompt') +
-    usStat(fmtTok(t.completion_tokens), 'completion') +
-    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : '') +
-    usStat(fmtMs(t.avg_latency_ms), '平均延迟');
+  $('usStats').innerHTML = statsHTML([
+    usStat(fmtTok(t.requests), '请求数'),
+    usStat(fmtTok(t.total_tokens), '总 token'),
+    usStat(fmtTok(t.prompt_tokens), 'prompt'),
+    usStat(fmtTok(t.completion_tokens), 'completion'),
+    usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : ''),
+    usStat(fmtMs(t.avg_latency_ms), '平均延迟'),
+  ]);
 
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
   // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
@@ -1431,11 +1518,12 @@ function renderCreditDimensions(d) {
   const t = d.totals || {};
   const accounts = d.credit_by_account || [];
   const models = d.credit_by_model || [];
-  $('usCreditStats').innerHTML =
-    usStat(fmtCredit(t.credits), '扣除积分') +
-    usStat(fmtTok(t.credit_tokens), '匹配 Token') +
-    usStat(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens), '平均积分 / 1M Token') +
-    usStat(String(t.credit_samples || 0), '有效积分样本');
+  $('usCreditStats').innerHTML = statsHTML([
+    usStat(fmtCredit(t.credits), '扣除积分'),
+    usStat(fmtTok(t.credit_tokens), '匹配 Token'),
+    usStat(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens), '平均积分 / 1M Token'),
+    usStat(String(t.credit_samples || 0), '有效积分样本'),
+  ]);
 
   $('usCreditNote').textContent =
     accounts.length + ' 个账号 · ' + models.length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
@@ -1546,10 +1634,10 @@ function renderUsageChart(series) {
     const yBase = PT + ih;
     if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
-      '" fill="var(--accent)" rx="1.5"/>';
+      '" fill="var(--chart-1)" rx="1.5"/>';
     if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
-      '" fill="var(--ok)" rx="1.5"/>';
+      '" fill="var(--chart-2)" rx="1.5"/>';
     out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
            fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
   }
@@ -1559,9 +1647,12 @@ function renderUsageChart(series) {
          '" y2="' + (PT + ih) + '"/>';
 
   // x 轴刻度：按真实时间等距取 6 个位置，取该位置**最近的实际柱子**做标签，
-  // 所以标签永远落在有数据的点上，不会指到空档里。
+  // 所以标签永远落在有数据的点上，不会指到空档里。同时按像素间距去重——
+  // 相邻目标点吸附到同一簇柱子时（如 17:00 / 18:00），两个标签会叠在一起。
   const TICKS = Math.min(6, pts.length);
   const usedLabel = new Set();
+  const MIN_LABEL_GAP = 46;
+  let lastLabelX = -Infinity;
   for (let k = 0; k < TICKS; k++) {
     const target = t0 + span * (TICKS === 1 ? 0.5 : k / (TICKS - 1));
     let bi = 0, best = Infinity;
@@ -1570,14 +1661,16 @@ function renderUsageChart(series) {
       if (d < best) { best = d; bi = i; }
     }
     if (usedLabel.has(bi)) continue;
-    usedLabel.add(bi);
     const p = pts[bi];
+    const cx = xOf(p.t);
+    if (cx - lastLabelX < MIN_LABEL_GAP) continue;
+    usedLabel.add(bi);
+    lastLabelX = cx;
     const d = new Date(p.t);
     const lab = p.scope === 'day'
       ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0')
       : String(d.getHours()).padStart(2, '0') + ':00';
     // 首尾标签靠边对齐，避免被裁掉
-    const cx = xOf(p.t);
     const anchor = cx < PL + 14 ? 'start' : (cx > W - PR - 14 ? 'end' : 'middle');
     out += '<text class="tk" x="' + Math.max(PL, Math.min(W - PR, cx)).toFixed(1) +
            '" y="' + (PT + ih + 15) + '" text-anchor="' + anchor + '">' + esc(lab) + '</text>';
@@ -1589,8 +1682,8 @@ function renderUsageChart(series) {
     const d = new Date(p.t).getDate();
     if (prevDay !== null && d !== prevDay) {
       const x = xOf(p.t).toFixed(1);
-      out += '<line class="gl" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
-             (PT + ih) + '" style="opacity:.45"/>';
+      out += '<line class="gl dim" x1="' + x + '" y1="' + PT + '" x2="' + x + '" y2="' +
+             (PT + ih) + '"/>';
     }
     prevDay = d;
   }
@@ -1601,7 +1694,7 @@ function renderUsageChart(series) {
 
 function fmtTokTip(v) { return fmtTok(v); }
 
-let usageRateWarmAt = 0;
+/* 倍率回填节流：usageRateWarmAt 声明在文件顶部（TDZ 修复，见状态区注释）。 */
 async function warmUsageModelRates() {
   if (Date.now() - usageRateWarmAt < 10 * 60 * 1000) return;
   try {
@@ -1632,11 +1725,18 @@ if ($('usWindow')) $('usWindow').onchange = loadUsage;
    完全一致的账号，余额可能差上千——差别只在包里。这里把逐包明细摊开，并给每个
    包名一个稳定配色，跨账号对比时同色即同类。 */
 
-const PK_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6', '#e2607a',
-                   '#5aa9e6', '#8fbf3f', '#b58b5a', '#7d8fa8', '#d4785c'];
-const PK_ACCOUNT_COLORS = ['#4f8cff', '#25b08b', '#e8a33d', '#c96bd6',
-                           '#e2607a', '#20a4a4', '#8fbf3f', '#d4785c',
-                           '#7c83db', '#c48a2f', '#b45f8c', '#5aa9e6'];
+/* 图表配色统一走 CSS 变量（--chart-1..10）：浅/深两套在 index.html 的 token
+   层定义，前端不再持有裸色值——深色主题下的图表颜色随主题自动适配。
+   旧版这里是 12 个硬编码 hex，其中第 2 色 #25b08b 在白底上仅 2.77:1，不达
+   「图形元素 ≥3:1」，重构时整组替换（frontend_test 的断言同步更新）。 */
+const PK_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)',
+                   'var(--chart-5)', 'var(--chart-6)', 'var(--chart-7)', 'var(--chart-8)',
+                   'var(--chart-9)', 'var(--chart-10)'];
+// 与 PK_COLORS 同值但独立声明：frontend_test 会从本行切到 renderExpiryDistribution
+// 单独求值，引用外部常量会让该切片在隔离上下文里 ReferenceError。
+const PK_ACCOUNT_COLORS = ['var(--chart-1)', 'var(--chart-2)', 'var(--chart-3)', 'var(--chart-4)',
+                           'var(--chart-5)', 'var(--chart-6)', 'var(--chart-7)', 'var(--chart-8)',
+                           'var(--chart-9)', 'var(--chart-10)'];
 
 function pkColor(i) { return PK_COLORS[i % PK_COLORS.length]; }
 
@@ -1834,8 +1934,8 @@ function renderExpiryDistribution(list, now) {
         pkExpiryDateTime(segment.expiresAt) + '（' + pkExpiryText(segment.expiresAt) + '）\n' +
         segment.accountName;
       return '<span class="pk-expiry-seg" style="--seg-color:' + color +
-        ';opacity:' + pkCreditOpacity(segment.days).toFixed(5) +
-        ';flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
+        ';--seg-op:' + pkCreditOpacity(segment.days).toFixed(5) +
+        ';--seg-flex:' + Math.max(0.008, segment.amount / total).toFixed(4) +
         ' 1 0" title="' + esc(title) + '" aria-label="' + esc(title) + '"></span>';
     }).join('');
     return '<div class="pk-expiry-row"><span>' + esc(row.days === 0 ? '已到期' : row.days + ' 天') +
@@ -1846,9 +1946,9 @@ function renderExpiryDistribution(list, now) {
     (summary.unavailable ? ' · ' + summary.unavailable + ' 个未获取余额' : '');
   const legend = (list || []).filter(a =>
     a && !a.error && a.uid && pkAccountSegments(a, now).some(s => s.days != null)
-  ).map(a => '<span><i style="background:' + (colors.get(String(a.uid)) || 'var(--accent)') +
+  ).map(a => '<span><i style="--seg-color:' + (colors.get(String(a.uid)) || 'var(--chart-1)') +
     '"></i>' + esc(a.nickname || String(a.uid).slice(0, 8)) + '</span>').join('');
-  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span style="text-align:center">各账号该批剩余</span><b>剩余积分</b></div>';
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span class="ta-c">各账号该批剩余</span><b>剩余积分</b></div>';
   $('pkExpiry').innerHTML = (rows
     ? hdr + '<div class="pk-expiry-chart">' + rows + '</div>'
     : '<div class="pk-expiry-empty">暂无可汇总积分</div>') +
@@ -1895,24 +1995,24 @@ function renderPackages(d, detailLimit) {
     const srcs = pkBySource(a.packages || []);
     const total = Math.max(1, Number(a.size || 0));
     const bar = srcs.map(s =>
-      '<i style="width:' + (s.size / total * 100).toFixed(2) + '%;background:' +
+      '<i style="--w:' + (s.size / total * 100).toFixed(2) + '%;--seg-color:' +
       colorOf(s.key) + '" title="' + esc(s.name) + ' ' + fmtTok(s.size) + '"></i>'
     ).join('');
     const legend = srcs.map(s =>
-      '<span><i style="background:' + colorOf(s.key) + '"></i>' +
+      '<span><i style="--seg-color:' + colorOf(s.key) + '"></i>' +
       esc(s.name.replace(/^CodeBuddy/, '')) + ' x' + s.n + ' · ' + fmtTok(s.size) +
       (s.minCreated ? ' · 首发 ' + esc(s.minCreated.slice(5)) : '') + '</span>'
     ).join('');
     const expiry = pkAccountSegments(a, now);
     const expiryTotal = Math.max(1, expiry.reduce((sum, s) => sum + s.amount, 0));
-    const expiryColor = expiryColors.get(String(a.uid)) || 'var(--accent)';
+    const expiryColor = expiryColors.get(String(a.uid)) || 'var(--chart-1)';
     const expiryBar = expiry.length ? '<div class="expirybar" role="img" aria-label="积分到期分布">' +
       expiry.map(s => {
         const title = s.source + '\n' + fmtTok(s.amount) + ' 积分\n到期时间 ' +
           pkExpiryDateTime(s.expiresAt) + '（' + pkExpiryText(s.expiresAt) + '）';
-        return '<i style="background:' + expiryColor +
-          ';opacity:' + pkCreditOpacity(s.days).toFixed(5) +
-          ';flex:' + Math.max(0.008, s.amount / expiryTotal).toFixed(4) +
+        return '<i style="--seg-color:' + expiryColor +
+          ';--seg-op:' + pkCreditOpacity(s.days).toFixed(5) +
+          ';--seg-flex:' + Math.max(0.008, s.amount / expiryTotal).toFixed(4) +
           ' 1 0" title="' + esc(title) + '"></i>';
       }).join('') + '</div>' : '';
     return '<div class="pk-card">' +
@@ -1939,7 +2039,7 @@ function renderPackages(d, detailLimit) {
                   (p.package_code || '').replace(/^TCACA_/, '');
       return '<tr' + (rowGroup ? ' class="pk-hidden-row pk-' + rowGroup +
         '-row" data-pk-row="' + rowGroup + '" hidden' : '') +
-        '><td class="mark" aria-hidden="true"><i style="background:' +
+        '><td class="mark" aria-hidden="true"><i style="--seg-color:' +
         colorOf(k) + '"></i></td>' +
       '<td>' + esc(p.name || '(未命名)') +
         (sub ? '<div class="note">' + esc(sub) + '</div>' : '') + '</td>' +

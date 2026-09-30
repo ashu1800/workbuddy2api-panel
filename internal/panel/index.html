@@ -1,510 +1,715 @@
 <!DOCTYPE html>
-<html lang="zh-CN" data-theme="dark">
+<html lang="zh-CN" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="color-scheme" content="light dark">
 <title>WorkBuddy2API · 控制台</title>
 <style>
-/* ── 设计令牌：明暗两套独立色板 ─────────────────────────────────────────
-   冷石墨基调（仪表盘语言，非营销页）：底色分层 + 单一靛蓝强调（仅交互），
-   语义色只给状态。等宽数字承载所有观测值，tabular-nums 对齐。 */
+/* ════════════════════════════════════════════════════════════════════════
+   1. 设计令牌 —— 唯一真相层
+   ────────────────────────────────────────────────────────────────────────
+   色阶取自 Radix Colors v3（MIT），按语义重映射。规则：
+     · 组件层只允许引用本节的语义 token，不得出现裸 hex / rgba；
+     · 文字在「白/中性面」上用 step-11（≥4.5:1），在「同色浅底」上用 step-12
+       （step-11 压在 step-3 上只有 4.25:1，实测不达标）；
+     · 实心主按钮底用 blue-11 而非 Radix 惯例的 step-9：白字压 blue-9 仅
+       3.26:1，blue-11 为 4.77:1，满足 14px 正文 AA；
+     · step-9 只用于非文字的图形标记（圆点、图表），实测均 ≥3:1。
+   尺度（间距/圆角/阴影/字级/层级）为封闭集合，新增值需先在此登记。
+   ════════════════════════════════════════════════════════════════════════ */
 :root {
-  --bg: #0c0e14; --surface: #14171f; --surface-2: #1a1e28; --raise: #202531;
-  --line: #262c3a; --line-soft: #1e232e;
-  --ink: #e8ebf2; --ink-2: #a8b0c2; --ink-3: #6b7488;
-  --accent: #5b7cfa; --accent-ink: #ffffff; --accent-soft: rgba(91,124,250,.13);
-  --ok: #3ddc97; --ok-soft: rgba(61,220,151,.12);
-  --warn: #f5b544; --warn-soft: rgba(245,181,68,.12);
-  --bad: #f0655f; --bad-soft: rgba(240,101,95,.12);
-  --shadow: 0 1px 2px rgba(0,0,0,.4), 0 8px 24px -12px rgba(0,0,0,.5);
-  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, monospace;
-  --sans: system-ui, -apple-system, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+  /* 面 */
+  --bg: #f9f9fb;              /* slate-2 */
+  --surface: #ffffff;
+  --surface-2: #f9f9fb;       /* slate-2 */
+  --surface-3: #f0f0f3;       /* slate-3 */
+  --surface-hover: #f0f0f3;
+  /* 线 */
+  --line: #d9d9e0;            /* slate-6 结构描边 */
+  --line-soft: #e0e1e6;       /* slate-5 内部分隔 */
+  --line-strong: #cdced6;     /* slate-7 */
+  /* 文字 */
+  --ink: #1c2024;             /* slate-12  16.4:1 */
+  --ink-2: #60646c;           /* slate-11   5.9:1 */
+  --ink-3: #60646c;           /* 兼容别名（次级文本） */
+  --ink-faint: #8b8d98;       /* slate-9    3.3:1 —— 仅装饰，不承载正文 */
+  /* 强调 */
+  --accent: #0d74ce;          /* blue-11 */
+  --accent-hover: #0588f0;    /* blue-10 */
+  --accent-soft: #e6f4fe;     /* blue-3 */
+  --accent-line: #8ec8f6;     /* blue-7 */
+  --accent-ring: #acd8fc;     /* blue-6 */
+  --accent-ink: #113264;      /* blue-12 软底上的文字 */
+  --on-accent: #ffffff;
+  /* 状态：文字 / 浅底 / 描边 / 浅底文字 / 图形标记 */
+  --ok: #2a7e3b;   --ok-soft: #e9f6e9;   --ok-line: #94ce9a;   --ok-ink: #203c25;   --ok-mark: #46a758;
+  --warn: #ab6400; --warn-soft: #fff7c2; --warn-line: #e9c162; --warn-ink: #4f3422; --warn-mark: #d97706;
+  --bad: #ce2c31;  --bad-soft: #feebec;  --bad-line: #f4a9aa;  --bad-ink: #641723;  --bad-mark: #e5484d;
+  /* 尺度 */
+  --sp-1: 4px;  --sp-2: 8px;  --sp-3: 12px; --sp-4: 16px;
+  --sp-5: 20px; --sp-6: 24px; --sp-8: 32px;
+  --r-sm: 6px;  --r-md: 8px;  --r-lg: 10px; --r-full: 999px;
+  --sh-1: 0 1px 2px rgba(16,20,32,.06), 0 1px 1px rgba(16,20,32,.04);
+  --sh-2: 0 16px 48px -20px rgba(16,20,32,.28), 0 2px 8px rgba(16,20,32,.06);
+  --fs-11: 11px; --fs-12: 12px; --fs-13: 13px; --fs-14: 14px;
+  --fs-16: 16px; --fs-20: 20px; --fs-24: 24px;
+  --z-topbar: 20; --z-veil: 60; --z-toast: 90;
+  --t-fast: 120ms; --t-base: 180ms;
+  --sans: system-ui, -apple-system, "Segoe UI Variable Text", "Segoe UI",
+          "PingFang SC", "Microsoft YaHei UI", "Microsoft YaHei", "Noto Sans SC", sans-serif;
+  --mono: ui-monospace, "Cascadia Mono", "SF Mono", Consolas, "Liberation Mono", monospace;
+  --content-max: 1360px;
+  /* 图表（白底实测 ≥3:1） */
+  --chart-1: #0d74ce; --chart-2: #1f7a4d; --chart-3: #a16207; --chart-4: #b91c1c;
+  --chart-5: #6d28d9; --chart-6: #0e7490; --chart-7: #c2410c; --chart-8: #4d7c0f;
+  --chart-9: #a21caf; --chart-10: #475569;
 }
-[data-theme="light"] {
-  --bg: #f4f5f8; --surface: #ffffff; --surface-2: #f8f9fb; --raise: #ffffff;
-  --line: #e2e5ec; --line-soft: #eceef3;
-  --ink: #14171f; --ink-2: #545c6e; --ink-3: #8b93a5;
-  --accent: #3d5fe0; --accent-ink: #ffffff; --accent-soft: rgba(61,95,224,.09);
-  --ok: #0f9d63; --ok-soft: rgba(15,157,99,.1);
-  --warn: #b47611; --warn-soft: rgba(180,118,17,.11);
-  --bad: #cf3b34; --bad-soft: rgba(207,59,52,.09);
-  --shadow: 0 1px 2px rgba(16,20,32,.06), 0 8px 24px -14px rgba(16,20,32,.14);
+[data-theme="dark"] {
+  --bg: #111113;              /* slate-1 */
+  --surface: #18191b;         /* slate-2 */
+  --surface-2: #212225;       /* slate-3 */
+  --surface-3: #272a2d;       /* slate-4 */
+  --surface-hover: #212225;
+  --line: #363a3f;            /* slate-6 */
+  --line-soft: #2e3135;       /* slate-5 */
+  --line-strong: #43484e;     /* slate-7 */
+  --ink: #edeef0;             /* slate-12 15.2:1 */
+  --ink-2: #b0b4ba;           /* slate-11  8.5:1 */
+  --ink-3: #b0b4ba;
+  --ink-faint: #696e77;       /* slate-9  仅装饰 */
+  --accent: #0090ff;          /* blue-9 */
+  --accent-hover: #3b9eff;    /* blue-10 */
+  --accent-soft: #0d2847;     /* blue-3 */
+  --accent-line: #205d9e;     /* blue-7 */
+  --accent-ring: #104d87;     /* blue-6 */
+  --accent-ink: #c2e6ff;      /* blue-12 */
+  --on-accent: #0b1220;       /* 深底上实心按钮改用深色字：5.7:1（白字仅 3.3:1） */
+  --ok: #71d083;   --ok-soft: #1b2a1e;   --ok-line: #366740;   --ok-ink: #c2f0c2;   --ok-mark: #46a758;
+  --warn: #ffca16; --warn-soft: #302008; --warn-line: #714f19; --warn-ink: #ffe7b3; --warn-mark: #ffc53d;
+  --bad: #ff9592;  --bad-soft: #3b1219;  --bad-line: #8c333a;  --bad-ink: #ffd1d9;  --bad-mark: #e5484d;
+  --sh-1: 0 1px 2px rgba(0,0,0,.4), 0 1px 1px rgba(0,0,0,.3);
+  --sh-2: 0 18px 48px -20px rgba(0,0,0,.7), 0 2px 8px rgba(0,0,0,.4);
+  /* 图表（深底实测 ≥3:1） */
+  --chart-1: #60a5fa; --chart-2: #4ade80; --chart-3: #fbbf24; --chart-4: #f87171;
+  --chart-5: #a78bfa; --chart-6: #22d3ee; --chart-7: #fb923c; --chart-8: #a3e635;
+  --chart-9: #e879f9; --chart-10: #94a3b8;
 }
+
+/* ════════════════════════════════════════════════════════════════════════
+   2. 基础
+   ════════════════════════════════════════════════════════════════════════ */
 * { box-sizing: border-box; margin: 0; padding: 0; }
 [hidden] { display: none !important; }
-html, body { height: 100%; }
+html { color-scheme: light dark; }
 body {
-  background: var(--bg); color: var(--ink); font: 14px/1.55 var(--sans);
-  -webkit-font-smoothing: antialiased;
+  background: var(--bg); color: var(--ink);
+  font: var(--fs-14)/1.55 var(--sans);
+  -webkit-font-smoothing: antialiased; text-rendering: optimizeLegibility;
 }
-::selection { background: var(--accent-soft); }
-:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 4px; }
-@media (prefers-reduced-motion: reduce) { * { transition: none !important; animation: none !important; } }
+::selection { background: var(--accent-soft); color: var(--accent-ink); }
+:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: var(--r-sm); }
+/* 装饰性滚动条：数据区滚动频繁，收窄以免抢视线 */
+* { scrollbar-width: thin; scrollbar-color: var(--line-strong) transparent; }
+*::-webkit-scrollbar { width: 10px; height: 10px; }
+*::-webkit-scrollbar-thumb { background: var(--line-strong); border-radius: var(--r-full); border: 2px solid transparent; background-clip: content-box; }
+*::-webkit-scrollbar-track { background: transparent; }
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; animation: none !important; }
+}
+/* 屏幕阅读器专用文本 / 跳转链接 */
+.sr-only {
+  position: absolute; width: 1px; height: 1px; padding: 0; margin: -1px;
+  overflow: hidden; clip: rect(0 0 0 0); white-space: nowrap; border: 0;
+}
+.skip {
+  position: fixed; top: var(--sp-2); left: var(--sp-2); z-index: calc(var(--z-toast) + 1);
+  transform: translateY(-200%); background: var(--surface); color: var(--ink);
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+  font-size: var(--fs-13); text-decoration: none; box-shadow: var(--sh-2);
+}
+.skip:focus { transform: none; }
+/* 骨架屏（加载态；配合 prefers-reduced-motion 自动静止） */
+.skeleton {
+  display: block; height: 10px; border-radius: var(--r-full);
+  background: linear-gradient(90deg, var(--surface-3) 25%, var(--surface-2) 37%, var(--surface-3) 63%);
+  background-size: 400% 100%; animation: skeleton 1.4s ease infinite;
+}
+@keyframes skeleton { 0% { background-position: 100% 50%; } 100% { background-position: 0 50%; } }
+.skeleton.w-1 { width: 42%; }
+.skeleton.w-2 { width: 66%; }
+.skeleton.w-3 { width: 88%; }
+.acc td .skeleton { margin: var(--sp-1) 0; }
 
-/* ── 壳层：左侧导航 + 主区 ─────────────────────────────────────────── */
-.shell { display: grid; grid-template-columns: 208px 1fr; min-height: 100vh; }
+/* ════════════════════════════════════════════════════════════════════════
+   3. 壳层：左侧导航 + 主区
+   ════════════════════════════════════════════════════════════════════════ */
+.shell { display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100dvh; }
 .nav {
   background: var(--surface); border-right: 1px solid var(--line);
-  display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh;
+  display: flex; flex-direction: column; position: sticky; top: 0; height: 100dvh;
 }
-.brand { padding: 20px 18px 16px; border-bottom: 1px solid var(--line-soft); }
-.brand .name { font-weight: 650; letter-spacing: -.01em; font-size: 15px; }
-.brand .sub { color: var(--ink-3); font-size: 11.5px; font-family: var(--mono); margin-top: 3px; }
-.nav ul { list-style: none; padding: 10px 8px; flex: 1; }
+.brand { padding: var(--sp-4) var(--sp-4) var(--sp-3); border-bottom: 1px solid var(--line-soft); }
+.brand .name { font-weight: 600; font-size: var(--fs-14); letter-spacing: -.01em; }
+.brand .sub { color: var(--ink-2); font-size: var(--fs-11); margin-top: 2px; }
+.nav ul { list-style: none; padding: var(--sp-2) var(--sp-2); flex: 1; display: flex; flex-direction: column; gap: 2px; }
 .nav a {
-  display: flex; align-items: center; gap: 10px; padding: 8px 11px; margin-bottom: 2px;
-  color: var(--ink-2); text-decoration: none; border-radius: 7px; font-size: 13.5px;
+  display: flex; align-items: center; gap: var(--sp-2); height: 34px; padding: 0 var(--sp-3);
+  color: var(--ink-2); text-decoration: none; border-radius: var(--r-sm);
+  font-size: var(--fs-13); transition: background var(--t-fast), color var(--t-fast);
 }
 .nav a:hover { background: var(--surface-2); color: var(--ink); }
-.nav a.on { background: var(--accent-soft); color: var(--accent); font-weight: 550; }
-.nav a svg { width: 15px; height: 15px; flex: none; opacity: .85; }
-.nav .sig { padding: 12px 16px; border-top: 1px solid var(--line-soft); font-size: 11.5px; color: var(--ink-3); }
-.nav .sig .row { display: flex; align-items: center; gap: 7px; }
-/* 日志频道筛选 chips */
-.chips { display: inline-flex; gap: 4px; align-items: center; }
-.chips .chip { padding: 2px 10px; border-radius: 999px; }
-.chips .chip.on { background: var(--accent-soft); color: var(--accent); border-color: transparent; font-weight: 550; }
-.ln .lch { font-style: normal; display: inline-block; font-size: 10px; line-height: 1; padding: 2px 6px; border-radius: 4px; margin-right: 8px; vertical-align: 1px; }
-.ln .lch.c-task { background: var(--accent-soft); color: var(--accent); }
-.ln .lch.c-chat { background: var(--ok-soft); color: var(--ok); }
-.ln .lch.c-sys { background: var(--surface-2); color: var(--ink-3); }
-
-/* 任务中心 */
-.tc-empty { display: flex; flex-direction: column; align-items: center; gap: 6px; padding: 42px 16px; color: var(--ink-3); }
-.tc-empty svg { width: 42px; height: 42px; opacity: .55; margin-bottom: 6px; }
-.tc-empty .t { font-weight: 550; color: var(--ink-2); }
-.tc-empty .d { font-size: 12.5px; max-width: 34em; text-align: center; }
-.sel-note { display: inline-flex; align-items: center; gap: 6px; font-size: 12px; color: var(--ink-3); white-space: nowrap; flex: none; }
-.sel-note select {
-  appearance: none; -webkit-appearance: none;
-  background: var(--surface-2) url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' viewBox='0 0 10 6'%3E%3Cpath d='M1 1l4 4 4-4' fill='none' stroke='%23888' stroke-width='1.6' stroke-linecap='round'/%3E%3C/svg%3E") no-repeat right 8px center;
-  border: 1px solid var(--line); border-radius: 7px; color: var(--ink);
-  font: 550 12px var(--sans); padding: 3px 24px 3px 9px; cursor: pointer;
-}
-.qprog { display: flex; align-items: center; gap: 12px; padding: 12px 16px 0; }
-.qprog .qbar { flex: 1; height: 4px; border-radius: 3px; background: var(--surface-2); overflow: hidden; }
-.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: 3px; transition: width .5s ease; }
-.qprog .note { font-variant-numeric: tabular-nums; white-space: nowrap; }
-.qgroup { padding: 4px 0 10px; }
-.qgroup + .qgroup { border-top: 1px solid var(--line-soft); }
-.qgroup header {
-  display: flex; align-items: baseline; gap: 9px; padding: 10px 16px 6px;
-  background: none; border: none; box-shadow: none;
-}
-.qgroup header .nm { font-weight: 600; font-size: 13.5px; }
-.qgroup header .cnt { font-size: 12px; color: var(--ink-3); font-variant-numeric: tabular-nums; }
-.qrow {
-  display: grid; grid-template-columns: 118px 1fr 52px 84px minmax(120px, 240px);
-  gap: 10px; align-items: center; padding: 7.5px 16px; font-size: 13px;
-}
-.qrow:hover { background: var(--surface-2); }
-.qrow .code { font: 11.5px/1.35 var(--mono); color: var(--ink-3); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qrow .name { display: flex; align-items: center; gap: 7px; min-width: 0; }
-.qrow .name .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
-.qrow .st { display: inline-flex; align-items: center; gap: 6px; white-space: nowrap; }
-.qrow .msg { font-size: 12px; color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.qdot { width: 7px; height: 7px; border-radius: 50%; flex: none; }
-.qdot.done { background: var(--ok); }
-.qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
-.qdot.wait { background: none; border: 1.5px solid var(--ink-3); }
-.qdot.err { background: var(--bad); }
-.qdot.skip { background: var(--ink-3); }
-@keyframes qpulse { 50% { opacity: .35; } }
-@media (prefers-reduced-motion: reduce) { .qdot.run { animation: none; } }
-.srow { display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto; gap: 14px; align-items: center; padding: 13px 16px; }
-.srow + .srow { border-top: 1px solid var(--line-soft); }
-.srow .who .nm { font-weight: 600; font-size: 13.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.srow .who .id { font: 10.5px var(--mono); color: var(--ink-3); margin-top: 2px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.shead {
-  display: grid; grid-template-columns: minmax(150px, 210px) 1fr auto;
-  gap: 14px; align-items: center; padding: 9px 16px 7px;
-  font-size: 11.5px; color: var(--ink-3); border-bottom: 1px solid var(--line-soft);
-}
-.shead .stasks span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.stasks { display: grid; grid-template-columns: repeat(5, minmax(64px, 1fr)); gap: 6px 10px; }
-.stask { display: inline-flex; align-items: center; gap: 6px; font-size: 12.5px; color: var(--ink-2); }
-.stask .mark { font-size: 13px; line-height: 1; width: 14px; text-align: center; flex: none; }
-.stask.ok .mark { color: var(--ok); }
-.stask.warn .mark { color: var(--warn); } .stask.warn .fr { color: var(--warn); font-variant-numeric: tabular-nums; }
-.stask.todo { color: var(--ink-3); }
-.srow .luck { display: flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.srow .luck svg { width: 14px; height: 14px; opacity: .7; }
-.srow .err { grid-column: 1 / -1; font-size: 12px; color: var(--bad); margin-top: -4px; }
-.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok); flex: none; }
-.pulse.bad { background: var(--bad); }
-.pulse.warn { background: var(--warn); }
+.nav a.on { background: var(--accent-soft); color: var(--accent-ink); font-weight: 500; }
+.nav a svg { width: 16px; height: 16px; flex: none; }
+.nav .sig { padding: var(--sp-3) var(--sp-4); border-top: 1px solid var(--line-soft); font-size: var(--fs-11); color: var(--ink-2); }
+.nav .sig .row { display: flex; align-items: center; gap: var(--sp-2); }
+.nav .sig .row + .row { margin-top: var(--sp-1); }
+.nav .sig .mono { font-family: var(--mono); }
 
 .main { min-width: 0; display: flex; flex-direction: column; }
 .topbar {
-  display: flex; align-items: center; gap: 14px; padding: 14px 24px;
-  border-bottom: 1px solid var(--line); background: var(--surface); position: sticky; top: 0; z-index: 20;
+  display: flex; align-items: center; gap: var(--sp-3); min-height: 56px; padding: 0 var(--sp-6);
+  border-bottom: 1px solid var(--line); background: var(--surface);
+  position: sticky; top: 0; z-index: var(--z-topbar);
 }
-.topbar h2 { font-size: 15.5px; font-weight: 620; letter-spacing: -.01em; }
-.topbar .sep { color: var(--ink-3); }
-.topbar .meta { color: var(--ink-3); font-size: 12px; font-family: var(--mono); }
+.topbar h2 { font-size: var(--fs-16); font-weight: 600; letter-spacing: -.01em; }
+.topbar .sep { color: var(--ink-faint); }
+.topbar .meta { color: var(--ink-2); font-size: var(--fs-12); font-family: var(--mono); }
 .topbar .grow { flex: 1; }
-.view { padding: 22px 24px 60px; max-width: 1180px; width: 100%; }
-.view[hidden] { display: none; }
+.view { padding: var(--sp-5) var(--sp-6) var(--sp-8); max-width: var(--content-max); width: 100%; }
 
-/* ── 控件 ─────────────────────────────────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════════════
+   4. 通用组件：按钮 / 表单 / 卡片 / 统计条 / 徽标 / 空态
+   ════════════════════════════════════════════════════════════════════════ */
 button {
-  font: inherit; color: var(--ink); background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 7px; padding: 7px 13px; cursor: pointer;
-  transition: border-color .12s, background .12s;
+  display: inline-flex; align-items: center; justify-content: center; gap: var(--sp-1);
+  height: 32px; padding: 0 var(--sp-3); font: 500 var(--fs-13)/1 var(--sans);
+  color: var(--ink); background: var(--surface); border: 1px solid var(--line);
+  border-radius: var(--r-sm); cursor: pointer; white-space: nowrap;
+  box-shadow: var(--sh-1);
+  transition: background var(--t-fast), border-color var(--t-fast), transform var(--t-fast), opacity var(--t-fast);
 }
-button:hover:not(:disabled) { border-color: var(--accent); }
-button:disabled { opacity: .5; cursor: default; }
-button.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); font-weight: 550; }
-button.primary:hover:not(:disabled) { filter: brightness(1.08); }
-button.ghost { background: transparent; }
+button:hover:not(:disabled) { background: var(--surface-2); border-color: var(--line-strong); }
+button:active:not(:disabled) { transform: translateY(.5px); box-shadow: none; }
+button:disabled { opacity: .5; cursor: not-allowed; box-shadow: none; }
+button.primary { background: var(--accent); border-color: var(--accent); color: var(--on-accent); }
+button.primary:hover:not(:disabled) { background: var(--accent-hover); border-color: var(--accent-hover); }
+button.ghost { background: transparent; box-shadow: none; border-color: transparent; color: var(--ink-2); }
+button.ghost:hover:not(:disabled) { background: var(--surface-2); border-color: var(--line); color: var(--ink); }
 button.danger { color: var(--bad); }
-button.danger:hover:not(:disabled) { border-color: var(--bad); }
-button.xs { padding: 3.5px 9px; font-size: 12.5px; border-radius: 6px; }
-button.icon { padding: 7px 9px; }
-input, select {
-  font: inherit; color: var(--ink); background: var(--surface-2);
-  border: 1px solid var(--line); border-radius: 7px; padding: 7px 11px; width: 100%;
-}
-input:focus, select:focus { outline: none; border-color: var(--accent); }
-input.invalid { border-color: var(--bad); background: var(--bad-soft); }
-input.invalid:focus { border-color: var(--bad); }
-input[type=checkbox] { width: auto; accent-color: var(--accent); }
-label.fld { display: block; margin-bottom: 14px; }
-label.fld > .lb { display: block; font-size: 12.5px; color: var(--ink-2); margin-bottom: 5px; }
-label.fld > .hint { display: block; font-size: 11.5px; color: var(--ink-3); margin-top: 4px; }
-.inline { display: flex; align-items: center; gap: 9px; }
+button.danger:hover:not(:disabled) { background: var(--bad-soft); border-color: var(--bad-line); color: var(--bad-ink); }
+button.xs { height: 26px; padding: 0 var(--sp-2); font-size: var(--fs-12); border-radius: var(--r-sm); }
+button.icon { width: 32px; padding: 0; }
+button.icon.xs { width: 26px; }
+button svg { width: 15px; height: 15px; flex: none; }
 
-/* ── 统计条（观测区）──────────────────────────────────────────────── */
-.stats {
-  display: grid; grid-template-columns: repeat(6, 1fr);
-  border: 1px solid var(--line); border-radius: 11px; background: var(--surface);
-  overflow: hidden; margin-bottom: 20px; box-shadow: var(--shadow);
+input, select, textarea {
+  font: var(--fs-13)/1.4 var(--sans); color: var(--ink); background: var(--surface);
+  border: 1px solid var(--line); border-radius: var(--r-sm); padding: 0 var(--sp-2);
+  height: 32px; width: 100%; min-width: 0;
+  transition: border-color var(--t-fast), box-shadow var(--t-fast);
 }
-@media (max-width: 980px) { .stats { grid-template-columns: repeat(3, 1fr); } }
-@media (max-width: 560px) { .stats { grid-template-columns: repeat(2, 1fr); } }
-.stat { padding: 14px 17px; border-right: 1px solid var(--line-soft); border-bottom: 1px solid var(--line-soft); }
-.stat .v { font: 600 26px/1.15 var(--mono); font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap; }
-.stat .k { color: var(--ink-3); font-size: 11.5px; margin-top: 5px; }
-.stat.good .v { color: var(--ok); } .stat.warn .v { color: var(--warn); } .stat.bad .v { color: var(--bad); }
+input:hover:not(:disabled), select:hover:not(:disabled) { border-color: var(--line-strong); }
+input:focus, select:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-ring); outline: none; }
+input.invalid, input.invalid:focus { border-color: var(--bad); background: var(--bad-soft); box-shadow: none; }
+/* 页头/工具条里的下拉不参与栅格拉伸（全局 width:100% 曾把用量页的「刷新」挤成两行） */
+.topbar select, .box > header select, .sel-note select, select.xs, select.auto { width: auto; }
+input[type="file"] { height: auto; padding: var(--sp-2); }
+input[type="checkbox"], input[type="radio"] { width: auto; height: auto; accent-color: var(--accent); }
+label.fld { display: block; margin-bottom: var(--sp-3); }
+label.fld > .lb { display: block; font-size: var(--fs-12); font-weight: 500; color: var(--ink-2); margin-bottom: var(--sp-1); }
+label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2); margin-top: var(--sp-1); }
+.hint { color: var(--ink-2); font-size: var(--fs-11); }
+.note { color: var(--ink-2); font-size: var(--fs-12); }
+.inline { display: flex; align-items: center; gap: var(--sp-2); }
+.hr { height: 1px; background: var(--line-soft); margin: var(--sp-1) 0 var(--sp-4); }
+.switch { display: flex; align-items: center; justify-content: space-between; gap: var(--sp-4); padding: var(--sp-2) 0; }
+.switch .lb { font-size: var(--fs-13); color: var(--ink); }
+/* 开关：把浏览器原生 checkbox 换成语义正确的滑块（保留原生可聚焦/可读屏语义） */
+.switch input[type="checkbox"] {
+  appearance: none; -webkit-appearance: none; flex: none; position: relative;
+  width: 38px; height: 22px; border-radius: var(--r-full);
+  background: var(--line-strong); border: 1px solid transparent; cursor: pointer;
+  transition: background var(--t-fast);
+}
+.switch input[type="checkbox"]::after {
+  content: ""; position: absolute; top: 2px; left: 2px; width: 16px; height: 16px;
+  border-radius: 50%; background: #fff; box-shadow: var(--sh-1);
+  transition: transform var(--t-fast);
+}
+.switch input[type="checkbox"]:checked { background: var(--accent); }
+.switch input[type="checkbox"]:checked::after { transform: translateX(16px); }
 
-/* ── 面板块 ───────────────────────────────────────────────────────── */
-.box { background: var(--surface); border: 1px solid var(--line); border-radius: 11px; box-shadow: var(--shadow); margin-bottom: 20px; overflow: hidden; }
-.box > header { display: flex; align-items: center; gap: 12px; padding: 12px 17px; border-bottom: 1px solid var(--line-soft); }
-.box > header h3 { font-size: 13.5px; font-weight: 600; }
-.box > header h3 .hint { font-size: 11.5px; font-weight: 400; color: var(--ink-3); margin-left: 6px; }
+.box {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-md);
+  box-shadow: var(--sh-1); margin-bottom: var(--sp-4); overflow: hidden;
+}
+.box > header {
+  display: flex; align-items: center; gap: var(--sp-3); flex-wrap: wrap;
+  min-height: 48px; padding: var(--sp-2) var(--sp-4);
+  border-bottom: 1px solid var(--line-soft);
+}
+.box > header h3 { font-size: var(--fs-13); font-weight: 600; }
+.box > header h3 .hint { font-weight: 400; margin-left: var(--sp-1); }
 .box > header .grow { flex: 1; }
-.box > header .note { color: var(--ink-3); font-size: 12px; }
-.box .pad { padding: 17px; }
-
-/* ── 账号表（签名元素：健康色条 + 积分量条）───────────────────────── */
-.tbl-wrap { overflow-x: auto; }
-.acc { width: 100%; border-collapse: collapse; font-size: 13px; min-width: 640px; }
-.acc th {
-  text-align: left; font-weight: 500; font-size: 11.5px; color: var(--ink-3);
-  padding: 9px 11px; border-bottom: 1px solid var(--line); white-space: nowrap;
+.box > .subnote {
+  padding: var(--sp-2) var(--sp-4); font-size: var(--fs-12); color: var(--ink-2);
+  background: var(--surface-2); border-bottom: 1px solid var(--line-soft);
 }
-.acc td { padding: 11px; border-bottom: 1px solid var(--line-soft); vertical-align: middle; }
-.acc tr:last-child td { border-bottom: none; }
-.acc tbody tr:hover { background: var(--surface-2); }
-/* 健康色条用真实单元格（td.mark）实现，而不是 tr::before 伪元素：
-   伪元素在表格行内会被浏览器当作匿名单元格插入行首，整行内容右移一列、
-   与表头错位——窗口越宽列越宽越明显。 */
+.box .pad { padding: var(--sp-4); }
+.box:last-child { margin-bottom: 0; }
+
+/* 统计条：用 gap + 底色画 1px 网格，避免单元格描边与容器描边叠成双线 */
+.stats {
+  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px;
+  background: var(--line-soft); border: 1px solid var(--line);
+  border-radius: var(--r-md); overflow: hidden; margin-bottom: var(--sp-4);
+}
+.stat { background: var(--surface); padding: var(--sp-3) var(--sp-4); }
+/* 空位补齐格：统计项不足列数时由 JS 补 .blank，避免容器底色透出成灰块 */
+.stat.blank { background: var(--surface); }
+.stat .v {
+  font: 600 var(--fs-24)/1.15 var(--mono);
+  font-variant-numeric: tabular-nums; letter-spacing: -.02em; white-space: nowrap;
+}
+.stat .k { color: var(--ink-2); font-size: var(--fs-11); margin-top: var(--sp-1); }
+.stat.good .v { color: var(--ok); }
+.stat.warn .v { color: var(--warn); }
+.stat.bad .v { color: var(--bad); }
+
+.tag {
+  display: inline-flex; align-items: center; gap: var(--sp-1); height: 22px; padding: 0 var(--sp-2);
+  border-radius: var(--r-full); font-size: var(--fs-11); font-weight: 500; white-space: nowrap;
+}
+.tag.ok { background: var(--ok-soft); color: var(--ok-ink); }
+/* info = 中性元信息（档位、能力徽标、促销标签）：琥珀是"需要关注"的语义色，
+   不能拿来标记普通信息，否则整张模型表看着像满屏告警。 */
+.tag.info { background: var(--accent-soft); color: var(--accent-ink); }
+.tag.warn { background: var(--warn-soft); color: var(--warn-ink); }
+.tag.bad { background: var(--bad-soft); color: var(--bad-ink); }
+.tag.mute { background: var(--surface-3); color: var(--ink-2); }
+.pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok-mark); flex: none; }
+.pulse.warn { background: var(--warn-mark); }
+.pulse.bad { background: var(--bad-mark); }
+
+.empty { padding: var(--sp-8) var(--sp-5); text-align: center; color: var(--ink-2); font-size: var(--fs-13); }
+.empty .big { font-size: var(--fs-14); font-weight: 500; color: var(--ink); margin-bottom: var(--sp-1); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   5. 表格 —— 数据密集区的主力
+   ────────────────────────────────────────────────────────────────────────
+   · thead 吸顶（表在容器内滚动），操作列吸右（宽表横向滚动时按钮永不丢失）；
+   · border-collapse: separate —— sticky 单元格的背景与描边在 collapse 下会
+     被相邻单元格的边框覆盖，故用 separate + border-spacing: 0 自行画线；
+   · 数字列统一 tabular-nums 且右对齐（旧版 .num 只设等宽没设对齐）。
+   ════════════════════════════════════════════════════════════════════════ */
+.tbl-wrap {
+  overflow: auto; max-height: 62vh; overscroll-behavior: contain;
+  scrollbar-gutter: stable;
+}
+.dlg .tbl-wrap { max-height: none; overflow: visible; }
+.acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
+.acc caption { text-align: left; }
+.acc th {
+  position: sticky; top: 0; z-index: 2; background: var(--surface-2);
+  text-align: left; font-weight: 500; font-size: var(--fs-11); color: var(--ink-2);
+  padding: var(--sp-2) var(--sp-3); border-bottom: 1px solid var(--line); white-space: nowrap;
+}
+.acc td {
+  padding: var(--sp-3); border-bottom: 1px solid var(--line-soft);
+  vertical-align: middle; background: var(--surface);
+}
+.acc tbody tr:last-child td { border-bottom: none; }
+.acc tbody tr:hover td { background: var(--surface-2); }
+/* 健康色条用真实单元格（td.mark）而非 tr::before 伪元素：伪元素会被浏览器当作
+   匿名单元格插到行首，整行右移一列并与表头错位——窗口越宽越明显。 */
 .acc .mark { width: 3px; min-width: 3px; padding: 0; }
-.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--ok); }
-.acc tbody tr.cool .mark i { background: var(--warn); }
-.acc tbody tr.off .mark i { background: var(--bad); }
-/* 模型表无色条（健康指示只属于账号表）。 */
+.acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--seg-color, var(--ok-mark)); }
+.acc tbody tr.cool .mark i { background: var(--warn-mark); }
+.acc tbody tr.off .mark i { background: var(--bad-mark); }
+/* 模型表无色条（健康指示只属于账号表） */
 .acc.md .mark { display: none; }
-/* 操作列用 width:1px + nowrap 的经典技巧：列宽恰为内容宽，其余列按内容自适应 */
+.acc.md th, .acc.md td { padding: var(--sp-2) var(--sp-2); }
+.acc.md { min-width: 720px; }
+/* 操作列：width:1px + nowrap 让列宽恰为内容宽；sticky right 使其在横向滚动时钉住。
+   注意表头是 th.c-acts、行内是 td.acts（app.js 生成，类名不同）——两边都要吸右，
+   否则窄屏横向滚动时按钮会滑出视口（1440px 下"移除"曾因此被裁掉）。 */
 .acc .c-acts { width: 1px; white-space: nowrap; }
-/* 档位标签列：允许换行在标签之间（不拆字），并给足最小宽度 */
-.acc .efs { min-width: 150px; }
+.acc th.c-acts, .acc td.acts { position: sticky; right: 0; z-index: 1; }
+.acc td.acts { box-shadow: -1px 0 0 var(--line-soft); }
+.acc th.c-acts { z-index: 3; box-shadow: -1px 0 0 var(--line-soft); }
+.acc .efs { min-width: 150px; white-space: normal; }
 .acc .efs .tag { margin: 1px 0; }
-/* 模型表：紧凑一些，7 列在常见窗口下尽量免横向滚动 */
-.acc.md { min-width: 700px; }
-.acc.md th, .acc.md td { padding: 10px 9px; }
-.who { min-width: 118px; max-width: 200px; }
+.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
+th.num, td.num { text-align: right; }
+.who { min-width: 122px; max-width: 184px; }
 #taskTable .who { max-width: 360px; }
 #taskTable .who .nm, #taskTable .who .id { white-space: normal; word-break: break-all; }
-.who .nm { font-weight: 550; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.who .id { font-family: var(--mono); font-size: 11.5px; color: var(--ink-3); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.realm-tag { display: inline-block; margin-left: 6px; padding: 1px 5px; border-radius: 4px; font: 500 10px/1 var(--sans); color: var(--accent); background: var(--accent-soft); border: 1px solid color-mix(in srgb, var(--accent) 22%, transparent); vertical-align: 1px; }
-.realm-row { display: flex; align-items: center; gap: 14px; padding: 4px 0 10px; }
-.realm-opt { display: inline-flex; align-items: center; gap: 5px; font-size: 12.5px; color: var(--ink-2); cursor: pointer; }
-.realm-opt input { accent-color: var(--accent); margin: 0; }
-.num { font-family: var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap; }
-.usage-cell { min-width: 268px; }
+.who .nm { font-weight: 500; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.who .id { font-family: var(--mono); font-size: var(--fs-11); color: var(--ink-2); margin-top: 1px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.cred { min-width: 88px; }
+.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: var(--fs-13); white-space: nowrap; }
+.cred .n .of { color: var(--ink-2); font-size: var(--fs-11); }
+.bar { height: 4px; background: var(--surface-3); border-radius: var(--r-full); margin-top: var(--sp-1); overflow: hidden; max-width: 88px; }
+.bar i { display: block; width: var(--w, 0); height: 100%; background: var(--seg-color, var(--accent)); border-radius: var(--r-full); }
+.acts { display: flex; gap: var(--sp-1); justify-content: flex-end; white-space: nowrap; }
+.realm-tag {
+  display: inline-block; margin-left: var(--sp-1); padding: 1px var(--sp-1);
+  border-radius: var(--r-sm); font-size: 10px; font-weight: 500;
+  color: var(--accent-ink); background: var(--accent-soft); vertical-align: 1px;
+}
+.realm-row { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-1) 0 var(--sp-2); }
+.realm-opt { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-12); color: var(--ink-2); cursor: pointer; }
+.usage-cell { min-width: 208px; }
 .usage-line {
-  display: inline-flex; align-items: center; gap: 4px; max-width: 100%;
-  font: 600 11.5px/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
+  display: inline-flex; align-items: center; gap: var(--sp-1); max-width: 100%;
+  font: 600 var(--fs-11)/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
 }
-.usage-item {
-  display: inline-flex; align-items: baseline; padding: 3px 6px; border: 1px solid transparent;
-  border-radius: 5px; background: var(--surface-2);
-}
-.usage-item b { font-weight: 650; }
-.usage-item em { margin-left: 2px; font: 500 10px/1 var(--sans); font-style: normal; }
-.usage-count { color: var(--accent); background: var(--accent-soft); border-color: color-mix(in srgb, var(--accent) 18%, transparent); }
-.usage-total {
-  color: var(--accent); background: var(--accent-soft);
-  border-color: color-mix(in srgb, var(--accent) 24%, transparent);
-  box-shadow: inset 0 0 0 1px color-mix(in srgb, var(--accent) 6%, transparent);
-}
-.usage-total b { font-size: 12px; letter-spacing: -.02em; }
-.usage-total em { color: var(--ink-2); }
-.usage-latency { color: var(--warn); background: var(--warn-soft); border-color: color-mix(in srgb, var(--warn) 18%, transparent); }
-.usage-rate { color: var(--ok); background: var(--ok-soft); border-color: color-mix(in srgb, var(--ok) 18%, transparent); }
-.cred { min-width: 84px; }
-.cred .n { font-family: var(--mono); font-variant-numeric: tabular-nums; font-size: 13px; white-space: nowrap; }
-.cred .n .of { color: var(--ink-3); font-size: 11px; }
-.bar { height: 3px; background: var(--line); border-radius: 2px; margin-top: 5px; overflow: hidden; max-width: 88px; }
-.bar i { display: block; height: 100%; background: var(--accent); border-radius: 2px; }
-.tag {
-  display: inline-flex; align-items: center; gap: 5px; padding: 1px 9px;
-  border-radius: 999px; font-size: 11.5px; font-weight: 500; white-space: nowrap;
-}
-.tag.ok { background: var(--ok-soft); color: var(--ok); }
-.tag.warn { background: var(--warn-soft); color: var(--warn); }
-.tag.bad { background: var(--bad-soft); color: var(--bad); }
-.tag.mute { background: var(--surface-2); color: var(--ink-3); border: 1px solid var(--line); }
-.rate-limits { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; min-width: 210px; }
+.usage-item { display: inline-flex; align-items: baseline; padding: 2px var(--sp-1); border-radius: var(--r-sm); background: var(--surface-3); }
+.usage-item b { font-weight: 600; }
+.usage-item em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
+.usage-count { color: var(--accent); background: var(--accent-soft); }
+.usage-total { color: var(--accent-ink); background: var(--accent-soft); }
+.usage-latency { color: var(--warn); background: var(--warn-soft); }
+.usage-rate { color: var(--ok); background: var(--ok-soft); }
+/* 限流条：最多两行（超出省略），title 携带全文。单行省略会把「预计 … 恢复」
+   这类关键信息整段切掉，三行以上又会把行高撑得参差不齐，两行是折中。 */
+.rate-limits { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-1); min-width: 200px; max-width: 340px; }
 .rate-limit {
-  display: flex; align-items: baseline; gap: 6px; padding: 4px 7px;
-  border: 1px solid color-mix(in srgb, var(--warn) 24%, var(--line));
-  border-radius: 6px; background: var(--warn-soft); font-size: 11.5px; line-height: 1.35;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2;
+  padding: 2px var(--sp-2); overflow: hidden;
+  border: 1px solid var(--warn-line); border-radius: var(--r-sm); background: var(--warn-soft);
+  font-size: var(--fs-11); line-height: 1.45; color: var(--warn-ink);
 }
-.rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-2); color: var(--ink-3); }
-.rate-limit b { color: var(--ink); font-family: var(--mono); font-weight: 600; }
-.rate-limit span { color: var(--ink-2); }
-.acts { display: flex; gap: 5px; justify-content: flex-end; white-space: nowrap; }
-.acts button { padding: 3.5px 8px; font-size: 12.5px; white-space: nowrap; flex: none; }
+.rate-limit.model-unavailable { border-color: var(--line); background: var(--surface-3); color: var(--ink-2); }
+.rate-limit b { color: inherit; font-family: var(--mono); font-weight: 600; }
 
-.empty { padding: 40px 20px; text-align: center; color: var(--ink-3); }
-.empty .big { font-size: 14px; color: var(--ink-2); margin-bottom: 6px; }
-
-/* ── 日志（终端质感）────────────────────────────────────────────── */
+/* ════════════════════════════════════════════════════════════════════════
+   6. 日志：请求指标 + 运行日志
+   ════════════════════════════════════════════════════════════════════════ */
+/* 行高取整为 20px，并把 max-height 取成「上下内边距 + 整数行」：容器裁切正好落在
+   行边界上，不会出现半行日志（旧版 420px 会把最后一行切掉一半）。 */
 #logBox, #reqLogBox {
-  max-height: 420px; overflow: auto; margin: 0; padding: 15px 17px;
-  font: 12px/1.75 var(--mono); white-space: pre-wrap; word-break: break-all; color: var(--ink-2);
+  margin: 0; padding: var(--sp-3) var(--sp-4); overflow: auto;
+  font: var(--fs-12)/20px var(--mono); font-variant-numeric: tabular-nums;
+  color: var(--ink-2); white-space: pre-wrap; word-break: break-word;
+  overscroll-behavior: contain;
 }
-#logBox .ln, #reqLogBox .ln { display: block; }
+#logBox { max-height: 424px; }    /* 24 + 20×20 */
+#reqLogBox { max-height: 364px; } /* 24 + 17×20 */
+/* 底部 20px 渐隐：overflow 在 padding box 处裁切，正好会露出下一行的上半截，
+   直切看着像没画完；渐隐把"下面还有内容"变成有意为之的视觉提示。 */
+#logBox, #reqLogBox {
+  -webkit-mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent 100%);
+  mask-image: linear-gradient(to bottom, #000 calc(100% - 20px), transparent 100%);
+}
+/* 悬挂缩进：折行不回到行首，长行仍能一眼看出是同一行日志 */
+#logBox .ln, #reqLogBox .ln { display: block; padding-left: var(--sp-5); text-indent: calc(-1 * var(--sp-5)); }
 #logBox .ln.e, #reqLogBox .ln.e { color: var(--bad); }
 #logBox .ln.w, #reqLogBox .ln.w { color: var(--warn); }
-#reqLogBox { max-height: 360px; }
-#view-logs .box > header { flex-wrap: wrap; }
+.ln .lch {
+  font-style: normal; display: inline-block; font-size: 10px; line-height: 1.6;
+  padding: 0 5px; border-radius: var(--r-sm); margin-right: var(--sp-1); vertical-align: 1px;
+}
+.ln .lch.c-task { background: var(--accent-soft); color: var(--accent-ink); }
+.ln .lch.c-chat { background: var(--ok-soft); color: var(--ok-ink); }
+.ln .lch.c-sys { background: var(--surface-3); color: var(--ink-2); }
+/* 分段控件（日志频道筛选） */
+.chips { display: inline-flex; gap: 2px; padding: 2px; background: var(--surface-3); border-radius: var(--r-sm); }
+.chips .chip {
+  height: 24px; padding: 0 var(--sp-2); border: none; background: transparent;
+  color: var(--ink-2); border-radius: var(--r-sm); box-shadow: none; font-weight: 500;
+}
+.chips .chip:hover:not(:disabled) { background: var(--surface); color: var(--ink); }
+.chips .chip.on { background: var(--surface); color: var(--ink); box-shadow: var(--sh-1); }
+#view-logs .box > header { row-gap: var(--sp-2); }
 #reqSummary, #reqNote { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-#reqSummary { flex: 1 1 320px; }
+#reqSummary { flex: 1 1 320px; font-size: var(--fs-12); color: var(--ink-2); font-variant-numeric: tabular-nums; }
 #reqNote { flex: 0 1 260px; text-align: right; }
 
-/* ── 配置表单 ─────────────────────────────────────────────────────── */
-.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 20px; }
-.grid3 { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 0 16px; }
-@media (max-width: 860px) { .grid2, .grid3 { grid-template-columns: 1fr; } }
-fieldset { border: none; margin-bottom: 6px; }
-legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom: 10px; }
-.hr { height: 1px; background: var(--line-soft); margin: 4px 0 16px; }
-.switch { display: flex; align-items: center; justify-content: space-between; padding: 9px 0; }
-.switch .lb { font-size: 13.5px; }
-.savebar {
-  display: flex; align-items: center; gap: 12px; padding: 13px 17px;
-  border-top: 1px solid var(--line-soft); background: var(--surface-2);
-  position: sticky; bottom: 0;
+/* ════════════════════════════════════════════════════════════════════════
+   7. 任务中心
+   ════════════════════════════════════════════════════════════════════════ */
+.tc-empty { display: flex; flex-direction: column; align-items: center; gap: var(--sp-1); padding: var(--sp-8) var(--sp-4); color: var(--ink-2); }
+.tc-empty svg { width: 40px; height: 40px; opacity: .5; margin-bottom: var(--sp-1); }
+.tc-empty .t { font-weight: 500; color: var(--ink); }
+.tc-empty .d { font-size: var(--fs-12); max-width: 34em; text-align: center; }
+.sel-note { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-12); color: var(--ink-2); white-space: nowrap; flex: none; }
+.sel-note select { height: 26px; font-size: var(--fs-12); padding: 0 var(--sp-3) 0 var(--sp-2); }
+.qprog { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4) 0; }
+.qprog .qbar { flex: 1; height: 6px; border-radius: var(--r-full); background: var(--surface-3); overflow: hidden; }
+.qprog .qbar i { display: block; height: 100%; width: 0; background: var(--accent); border-radius: var(--r-full); transition: width var(--t-base) ease-out; }
+.qprog .note { font-variant-numeric: tabular-nums; white-space: nowrap; }
+.qgroup { padding: var(--sp-1) 0 var(--sp-2); }
+.qgroup + .qgroup { border-top: 1px solid var(--line-soft); }
+.qgroup header { display: flex; align-items: baseline; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) var(--sp-1); }
+.qgroup header .nm { font-weight: 600; font-size: var(--fs-13); }
+.qgroup header .cnt { font-size: var(--fs-11); color: var(--ink-2); font-variant-numeric: tabular-nums; }
+/* 列宽固定：名称列不再用 1fr（旧版 1fr 把进度/状态推到最右，中间留出大片空白） */
+.qrow {
+  display: grid; grid-template-columns: 150px minmax(140px, 260px) 64px 104px minmax(0, 1fr);
+  gap: var(--sp-3); align-items: center; padding: var(--sp-2) var(--sp-4); font-size: var(--fs-13);
 }
-.savebar .grow { flex: 1; }
-.restart-note { color: var(--warn); font-size: 12.5px; }
+.qrow:hover { background: var(--surface-2); }
+.qrow .code { font: var(--fs-11)/1.35 var(--mono); color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .name { display: flex; align-items: center; gap: var(--sp-1); min-width: 0; }
+.qrow .name .t { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qrow .prog { font-variant-numeric: tabular-nums; color: var(--ink-2); text-align: right; }
+.qrow .st { display: inline-flex; align-items: center; gap: var(--sp-1); white-space: nowrap; color: var(--ink-2); }
+.qrow .msg { font-size: var(--fs-12); color: var(--ink-2); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.qdot { width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.qdot.done { background: var(--ok-mark); }
+.qdot.run { background: var(--accent); animation: qpulse 1.2s ease-in-out infinite; }
+.qdot.wait { background: none; border: 1.5px solid var(--ink-faint); }
+.qdot.err { background: var(--bad-mark); }
+.qdot.skip { background: var(--ink-faint); }
+@keyframes qpulse { 50% { opacity: .35; } }
 
-/* ── 弹层 ─────────────────────────────────────────────────────────── */
-.veil { position: fixed; inset: 0; background: rgba(6,8,13,.62); backdrop-filter: blur(2px); display: none; z-index: 60; }
-.veil.on { display: flex; align-items: center; justify-content: center; padding: 20px; }
-.dlg {
-  background: var(--surface); border: 1px solid var(--line); border-radius: 13px;
-  width: 560px; max-width: 100%; max-height: 86vh; display: flex; flex-direction: column;
-  box-shadow: 0 24px 64px -24px rgba(0,0,0,.6);
+/* ════════════════════════════════════════════════════════════════════════
+   8. 用量视图
+   ════════════════════════════════════════════════════════════════════════ */
+.uschart { border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; }
+.uschart-hd {
+  display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-2) var(--sp-3);
+  border-bottom: 1px solid var(--line-soft); font-size: var(--fs-12); background: var(--surface-2);
 }
-.dlg header { padding: 17px 20px 13px; border-bottom: 1px solid var(--line-soft); }
-.dlg header h3 { font-size: 15px; font-weight: 620; }
-.dlg header .hint { color: var(--ink-3); font-size: 12.5px; margin-top: 5px; }
-.dlg .body { padding: 18px 20px; overflow: auto; }
-.dlg footer { padding: 13px 20px; border-top: 1px solid var(--line-soft); display: flex; gap: 10px; }
-.dlg footer .grow { flex: 1; }
-.dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-2); border-radius: 9px; padding: 3px; margin-left: 10px; vertical-align: middle; }
-.dlg .tabs .tab { padding: 4px 14px; border-radius: 7px; border: none; background: transparent; color: var(--ink-3); font: 550 12.5px var(--sans); cursor: pointer; }
-.dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: 0 1px 3px rgba(0,0,0,.25); }
-.tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 -20px; padding: 14px 20px 0; }
-.url {
-  background: var(--surface-2); border: 1px solid var(--line); border-radius: 8px;
-  padding: 11px 13px; font: 12px var(--mono); word-break: break-all; color: var(--accent);
-  margin: 8px 0 12px; user-select: all;
+.uschart-hd .lb { color: var(--ink); font-weight: 500; }
+.uschart-hd .legend { color: var(--ink-2); font-size: var(--fs-11); display: flex; align-items: center; gap: var(--sp-1); }
+.uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: var(--sp-2); }
+.uschart-hd .sw-p { background: var(--chart-1); }
+.uschart-hd .sw-c { background: var(--chart-2); }
+.uschart-body { padding: var(--sp-3) var(--sp-3) var(--sp-1); }
+.uschart-body svg { display: block; width: 100%; height: auto; }
+.uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
+.uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
+.uschart-body .gl.dim { opacity: .45; }
+.uschart-body .tk { fill: var(--ink-2); font: 10px var(--mono); }
+.uschart-body .us-empty { padding: var(--sp-6) 0; text-align: center; color: var(--ink-2); font-size: var(--fs-12); }
+.credit-dim + .credit-dim { margin-top: var(--sp-4); }
+.credit-dim-hd {
+  padding: var(--sp-2) var(--sp-3); border-top: 1px solid var(--line-soft);
+  border-bottom: 1px solid var(--line-soft); background: var(--surface-2);
+  color: var(--ink-2); font-size: var(--fs-12); font-weight: 600;
 }
-.state { font-size: 13px; color: var(--ink-2); display: flex; align-items: center; gap: 8px; }
-.state.ok { color: var(--ok); } .state.err { color: var(--bad); }
-.dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
-@keyframes blink { 0% { opacity: 1; } 50% { opacity: .3; } 100% { opacity: 1; } }
+/* 用量表内的 prompt/completion 小条。必须限定在 .us-wrapbar 内：账号池积分条
+   也叫 .bar（块级容器 + 百分比内条），同优先级下全局 .bar 会覆盖它，把积分条
+   塌成 min-width 的一个小点（v1.9.0 回归，勿删本作用域）。 */
+.us-wrapbar { display: flex; gap: 2px; align-items: center; min-width: 90px; }
+.us-wrapbar .bar { display: inline-block; width: var(--w, 2px); height: 6px; border-radius: var(--r-full); min-width: 2px; vertical-align: middle; margin-top: 0; }
+.us-wrapbar .bar-p { background: var(--chart-1); }
+.us-wrapbar .bar-c { background: var(--chart-2); }
 
-/* ── 券码弹窗（票券式卡片，类名全部 vc- 前缀防越界）────────────────── */
-.vc-acct { display: flex; align-items: baseline; gap: 7px; margin: 18px 2px 8px;
-  font-size: 12px; color: var(--ink-3); }
-.vc-acct:first-child { margin-top: 4px; }
-.vc-acct .nm { font-weight: 650; font-size: 13px; color: var(--ink-2); }
-.vc { border: 1px solid var(--line); border-radius: 11px; overflow: hidden; margin: 0 0 10px;
-  background: var(--surface); transition: border-color .15s; }
-.vc:hover { border-color: var(--accent); }
-.vc .hd { display: flex; align-items: center; gap: 8px; padding: 12px 14px 4px; }
-.vc .hd .nm { font-weight: 640; font-size: 14px; }
+/* ════════════════════════════════════════════════════════════════════════
+   9. 积分构成
+   ════════════════════════════════════════════════════════════════════════ */
+.pk-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(248px, 1fr)); gap: var(--sp-3); }
+.pk-card { border: 1px solid var(--line); border-radius: var(--r-md); padding: var(--sp-3) var(--sp-4); background: var(--surface); }
+.pk-card .who { display: flex; align-items: baseline; gap: var(--sp-1); margin-bottom: var(--sp-1); max-width: none; }
+.pk-card .nm { font-weight: 600; font-size: var(--fs-13); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pk-card .realm { font-size: var(--fs-11); color: var(--ink-2); font-family: var(--mono); flex: none; }
+.pk-card .big { font: 600 var(--fs-24)/1.1 var(--mono); font-variant-numeric: tabular-nums; }
+.pk-card .sub { font-size: var(--fs-11); color: var(--ink-2); margin-top: 2px; }
+.pk-card .mixbar { display: flex; height: 6px; border-radius: var(--r-full); overflow: hidden; margin-top: var(--sp-2); background: var(--surface-3); }
+.pk-card .mixbar i { display: block; width: var(--w, 0); height: 100%; background: var(--seg-color, var(--chart-1)); }
+.pk-card .err { color: var(--warn); font-size: var(--fs-12); }
+.pk-card .expirybar { display: flex; height: 4px; border-radius: var(--r-full); overflow: hidden; margin-top: var(--sp-2); background: var(--surface-3); }
+.pk-card .expirybar i { display: block; height: 100%; min-width: 2px; background: var(--seg-color, var(--chart-1)); opacity: var(--seg-op, 1); flex: var(--seg-flex, 1 1 0); }
+.pk-legend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); margin-top: var(--sp-2); font-size: var(--fs-11); color: var(--ink-2); }
+.pk-legend span { display: flex; align-items: center; gap: var(--sp-1); }
+.pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; flex: none; background: var(--seg-color, var(--chart-1)); }
+.pk-group-summary td { padding: var(--sp-2) var(--sp-3); background: var(--surface-2); }
+.pk-group-toggle { width: 100%; height: auto; padding: var(--sp-1) 0; border: 0; background: transparent; box-shadow: none; color: var(--ink-2); text-align: left; justify-content: flex-start; font-weight: 400; }
+.pk-group-toggle:hover:not(:disabled) { border: 0; background: transparent; color: var(--accent); }
+.pk-hidden-row[hidden] { display: none; }
+.pk-hidden-row td { color: var(--ink-2); }
+.pk-expiry-chart {
+  max-height: 260px; overflow-y: auto; overflow-x: hidden;
+  scrollbar-gutter: stable; padding-right: var(--sp-2); overscroll-behavior: contain;
+}
+.pk-expiry-hdr { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 76px; align-items: center; gap: var(--sp-2); margin-bottom: var(--sp-1); color: var(--ink-2); font-size: var(--fs-11); }
+.pk-expiry-hdr > b { text-align: right; font-weight: 600; }
+.pk-expiry-row { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 76px; align-items: center; gap: var(--sp-2); min-height: 30px; padding-right: 2px; }
+.pk-expiry-row > span { color: var(--ink-2); font-size: var(--fs-11); }
+.pk-expiry-row > b { text-align: right; font: 600 var(--fs-11) var(--mono); font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+.pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 9px; border-radius: var(--r-full); background: var(--surface-3); overflow: hidden; }
+.pk-expiry-seg { display: block; min-width: 3px; height: 100%; cursor: default; background: var(--seg-color, var(--chart-1)); opacity: var(--seg-op, 1); flex: var(--seg-flex, 1 1 0); transition: filter var(--t-fast), transform var(--t-fast); }
+.pk-expiry-seg:hover { filter: brightness(1.1); transform: scaleY(1.35); }
+.pk-expiry-legend { display: flex; flex-wrap: wrap; gap: var(--sp-1) var(--sp-3); margin-top: var(--sp-2); color: var(--ink-2); font-size: var(--fs-11); }
+.pk-expiry-legend span { display: inline-flex; align-items: center; gap: var(--sp-1); }
+.pk-expiry-legend i { width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px; background: var(--seg-color, var(--chart-1)); }
+.pk-expiry-foot { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--line-soft); color: var(--ink-2); font-size: var(--fs-11); }
+.pk-expiry-empty { padding: var(--sp-6) 0; text-align: center; color: var(--ink-2); font-size: var(--fs-12); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   10. 券码弹窗（票券式卡片，类名统一 vc- 前缀防越界）
+   ════════════════════════════════════════════════════════════════════════ */
+.vc-acct { display: flex; align-items: baseline; gap: var(--sp-1); margin: var(--sp-4) 2px var(--sp-2); font-size: var(--fs-12); color: var(--ink-2); }
+.vc-acct:first-child { margin-top: var(--sp-1); }
+.vc-acct .nm { font-weight: 600; font-size: var(--fs-13); color: var(--ink); }
+.vc { border: 1px solid var(--line); border-radius: var(--r-md); overflow: hidden; margin: 0 0 var(--sp-3); background: var(--surface); transition: border-color var(--t-fast); }
+.vc:hover { border-color: var(--line-strong); }
+.vc .hd { display: flex; align-items: center; gap: var(--sp-2); padding: var(--sp-3) var(--sp-4) var(--sp-1); }
+.vc .hd .nm { font-weight: 600; font-size: var(--fs-14); }
 .vc .hd .tag { margin-left: auto; }
-.vc .meta { padding: 2px 14px 10px; font-size: 11.5px; color: var(--ink-3); }
-.vc .sep { border-top: 1px dashed var(--line); margin: 0 12px; }
-.vc .ft { display: flex; align-items: center; gap: 12px; padding: 10px 14px; }
-.vc .ft .lab { font-size: 11.5px; color: var(--ink-3); flex: none; }
-.vc .ft code { font: 600 15px/1 var(--mono); letter-spacing: 1.2px; user-select: all;
-  background: var(--surface-2); border: 1px solid var(--line-soft);
-  border-radius: 7px; padding: 7px 12px; }
-.vc .ft .acts { margin-left: auto; display: flex; gap: 8px; flex: none; }
-.vc .vc-qr { border-top: 1px dashed var(--line); padding: 14px; display: flex; justify-content: center; }
-.vc .vc-qr svg { border-radius: 6px; }
+.vc .meta { padding: 0 var(--sp-4) var(--sp-3); font-size: var(--fs-11); color: var(--ink-2); }
+.vc .sep { border-top: 1px dashed var(--line); margin: 0 var(--sp-3); }
+.vc .ft { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4); }
+.vc .ft .lab { font-size: var(--fs-11); color: var(--ink-2); flex: none; }
+.vc .ft code {
+  font: 600 var(--fs-14)/1 var(--mono); letter-spacing: 1.2px; user-select: all;
+  background: var(--surface-2); border: 1px solid var(--line-soft); border-radius: var(--r-sm); padding: var(--sp-2) var(--sp-3);
+}
+.vc .ft .acts { margin-left: auto; }
+.vc .vc-qr { border-top: 1px dashed var(--line); padding: var(--sp-4); display: flex; justify-content: center; }
+/* 二维码固定白底黑块：扫描器需要高对比度，深色主题下也不例外 */
+.vc .vc-qr svg { border-radius: var(--r-sm); background: #fff; fill: #000; }
 /* 过期态：只淡标题与元信息（保持券码可读），边框改虚线示意作废 */
 .vc.expired { border-style: dashed; }
-.vc.expired .hd, .vc.expired .meta { opacity: .55; }
+.vc.expired .hd, .vc.expired .meta { opacity: .6; }
 
-/* ── Toast ───────────────────────────────────────────────────────── */
-#toasts { position: fixed; right: 20px; bottom: 20px; z-index: 90; display: flex; flex-direction: column; gap: 8px; align-items: flex-end; }
-.tst {
-  background: var(--raise); border: 1px solid var(--line); border-left: 3px solid var(--ink-3);
-  border-radius: 8px; padding: 10px 15px; font-size: 13px; box-shadow: var(--shadow); max-width: 380px;
+/* ════════════════════════════════════════════════════════════════════════
+   11. 配置表单
+   ════════════════════════════════════════════════════════════════════════ */
+.grid2 { display: grid; grid-template-columns: 1fr 1fr; gap: 0 var(--sp-5); }
+.grid3 { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0 var(--sp-4); }
+fieldset { border: none; }
+legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding-bottom: var(--sp-2); }
+.savebar {
+  display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-3) var(--sp-4);
+  border: 1px solid var(--line); border-radius: var(--r-md); background: var(--surface);
+  box-shadow: var(--sh-2); position: sticky; bottom: var(--sp-3); margin-top: var(--sp-4);
 }
-.tst.ok { border-left-color: var(--ok); } .tst.err { border-left-color: var(--bad); }
+.savebar .grow { flex: 1; }
+.restart-note { color: var(--warn); font-size: var(--fs-12); }
 
-@media (max-width: 760px) {
+/* ════════════════════════════════════════════════════════════════════════
+   12. 弹层 / Toast
+   ════════════════════════════════════════════════════════════════════════ */
+.veil { position: fixed; inset: 0; background: rgba(15,18,25,.45); backdrop-filter: blur(3px); display: none; z-index: var(--z-veil); }
+.veil.on { display: flex; align-items: center; justify-content: center; padding: var(--sp-5); }
+.dlg {
+  background: var(--surface); border: 1px solid var(--line); border-radius: var(--r-lg);
+  width: 600px; max-width: 100%; max-height: min(86vh, 920px);
+  display: flex; flex-direction: column; box-shadow: var(--sh-2);
+}
+.dlg.wide { width: 980px; }
+.dlg.narrow { width: 420px; }
+.dlg header { padding: var(--sp-4) var(--sp-5) var(--sp-3); border-bottom: 1px solid var(--line-soft); }
+.dlg header h3 { font-size: var(--fs-16); font-weight: 600; }
+.dlg header .hint { display: block; margin-top: var(--sp-1); }
+.dlg .body { padding: var(--sp-4) var(--sp-5); overflow: auto; overscroll-behavior: contain; }
+.dlg footer { padding: var(--sp-3) var(--sp-5); border-top: 1px solid var(--line-soft); display: flex; align-items: center; gap: var(--sp-2); }
+.dlg footer .grow { flex: 1; }
+.dlg .tabs { display: inline-flex; gap: 2px; background: var(--surface-3); border-radius: var(--r-sm); padding: 2px; margin-top: var(--sp-2); }
+.dlg .tabs .tab { height: 26px; padding: 0 var(--sp-3); border: none; border-radius: var(--r-sm); background: transparent; color: var(--ink-2); font-size: var(--fs-12); box-shadow: none; }
+.dlg .tabs .tab.on { background: var(--surface); color: var(--ink); box-shadow: var(--sh-1); }
+.tab-panel + .tab-panel { border-top: 1px solid var(--line-soft); margin: 0 calc(-1 * var(--sp-5)); padding: var(--sp-4) var(--sp-5) 0; }
+.url {
+  background: var(--surface-2); border: 1px solid var(--line); border-radius: var(--r-sm);
+  padding: var(--sp-3); font: var(--fs-12)/1.5 var(--mono); word-break: break-all;
+  color: var(--accent-ink); margin: var(--sp-2) 0 var(--sp-3); user-select: all;
+}
+.state { font-size: var(--fs-13); color: var(--ink-2); display: flex; align-items: center; gap: var(--sp-2); }
+.state.ok { color: var(--ok); }
+.state.err { color: var(--bad); }
+.dots::after { content: "…"; animation: blink 1.2s steps(4) infinite; }
+@keyframes blink { 50% { opacity: .3; } }
+
+#toasts { position: fixed; right: var(--sp-5); bottom: var(--sp-5); z-index: var(--z-toast); display: flex; flex-direction: column; gap: var(--sp-2); align-items: flex-end; }
+.tst {
+  background: var(--surface); border: 1px solid var(--line); border-left: 3px solid var(--ink-faint);
+  border-radius: var(--r-md); padding: var(--sp-2) var(--sp-3); font-size: var(--fs-13);
+  box-shadow: var(--sh-2); max-width: 380px; color: var(--ink);
+}
+.tst.ok { border-left-color: var(--ok-mark); }
+.tst.err { border-left-color: var(--bad-mark); }
+
+/* ════════════════════════════════════════════════════════════════════════
+   13. 工具类（置于最后以保证覆盖组件默认值）
+   ════════════════════════════════════════════════════════════════════════ */
+.mt-1 { margin-top: var(--sp-1); }
+.mt-2 { margin-top: var(--sp-2); }
+.mt-3 { margin-top: var(--sp-3); }
+.mb-2 { margin-bottom: var(--sp-2); }
+.mb-3 { margin-bottom: var(--sp-3); }
+.fs-12 { font-size: var(--fs-12); }
+.mono { font-family: var(--mono); font-variant-numeric: tabular-nums; }
+.grow { flex: 1; }
+/* 文字语义色：仅用于「中性面」上的文字（同色浅底上请用 tag 的 step-12 文字） */
+.c-ok { color: var(--ok); }
+.c-warn { color: var(--warn); }
+.c-bad { color: var(--bad); }
+.c-muted { color: var(--ink-2); }
+.strong { font-weight: 600; }
+.help { cursor: help; }
+.ta-c { text-align: center; }
+
+/* ════════════════════════════════════════════════════════════════════════
+   14. 响应式（控制台以桌面为主：只保证不横向滚动、导航可折叠）
+   ════════════════════════════════════════════════════════════════════════ */
+@media (max-width: 1180px) {
+  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+  .grid3 { grid-template-columns: 1fr 1fr; }
+}
+@media (max-width: 900px) {
   .shell { grid-template-columns: 1fr; }
   .nav { position: static; height: auto; flex-direction: row; align-items: center; overflow-x: auto; }
-  .nav ul { display: flex; padding: 8px; } .nav .sig { border: none; }
-  .stat { border-right: none; border-bottom: 1px solid var(--line-soft); }
+  .nav ul { flex-direction: row; padding: var(--sp-2); } .nav .sig { border: none; padding-left: 0; }
+  .brand { border: none; padding-right: var(--sp-3); }
+  .grid2, .grid3 { grid-template-columns: 1fr; }
+  .view { padding: var(--sp-4); }
+  .topbar { padding: 0 var(--sp-4); }
 }
-  /* ── 用量视图 ───────────────────────────────────────────────── */
-  .uschart { border: 1px solid var(--line-soft); border-radius: 8px; overflow: hidden; }
-  .uschart-hd { display: flex; align-items: center; gap: 10px; padding: 9px 12px;
-    border-bottom: 1px solid var(--line-soft); font-size: 12px; }
-  .uschart-hd .lb { color: var(--ink-2); font-weight: 550; }
-  .uschart-hd .legend { color: var(--ink-3); font-size: 11.5px; display: flex; align-items: center; gap: 5px; }
-  .uschart-hd .sw { width: 9px; height: 9px; border-radius: 2px; display: inline-block; margin-left: 8px; }
-  .uschart-hd .sw-p { background: var(--accent); }
-  .uschart-hd .sw-c { background: var(--ok); }
-  .uschart-body { padding: 10px 12px 6px; }
-  .uschart-body svg { display: block; width: 100%; height: auto; }
-  .uschart-body .ax { stroke: var(--line-soft); stroke-width: 1; }
-  .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
-  .uschart-body .tk { fill: var(--ink-3); font: 10px var(--mono); }
-  .uschart-body .us-empty { padding: 28px 0; text-align: center; color: var(--ink-3); font-size: 12.5px; }
-  .credit-dim + .credit-dim { margin-top: 16px; }
-  .credit-dim-hd { padding: 8px 11px; border-top: 1px solid var(--line-soft);
-    border-bottom: 1px solid var(--line-soft); background: var(--surface-2);
-    color: var(--ink-2); font-size: 12.5px; font-weight: 600; }
-  /* 用量表内的 prompt/completion 小条。必须限定在 .us-wrapbar 内：账号池积分条
-     也叫 .bar（块级容器 + 百分比内条），同优先级下这里的全局 .bar 会覆盖它，
-     把积分条塌成 min-width 的一个小点（v1.9.0 回归）。 */
-  .us-wrapbar .bar { display: inline-block; height: 6px; border-radius: 3px; min-width: 2px; vertical-align: middle; }
-  .us-wrapbar .bar-p { background: var(--accent); }
-  .us-wrapbar .bar-c { background: var(--ok); }
-  .us-wrapbar { display: flex; gap: 2px; align-items: center; min-width: 90px; }
-
-  /* ── 积分构成 ───────────────────────────────────────────────── */
-  .pk-grid { display: flex; flex-wrap: wrap; gap: 10px; }
-  .pk-card { flex: 1 1 220px; min-width: 200px; border: 1px solid var(--line-soft);
-    border-radius: 8px; padding: 11px 13px; }
-  .pk-card .who { display: flex; align-items: baseline; gap: 7px; margin-bottom: 7px; }
-  .pk-card .nm { font-weight: 600; font-size: 13px; }
-  .pk-card .realm { font-size: 11px; color: var(--ink-3); font-family: var(--mono); }
-  .pk-card .big { font: 600 24px/1.1 var(--mono); font-variant-numeric: tabular-nums; }
-  .pk-card .sub { font-size: 11.5px; color: var(--ink-3); margin-top: 3px; }
-  .pk-card .mixbar { display: flex; height: 7px; border-radius: 4px; overflow: hidden;
-    margin-top: 8px; background: var(--surface-2); }
-  .pk-card .mixbar i { display: block; height: 100%; }
-  .pk-card .err { color: var(--warn); font-size: 12px; }
-  .pk-legend { display: flex; flex-wrap: wrap; gap: 4px 12px; margin-top: 7px;
-    font-size: 11px; color: var(--ink-3); }
-  .pk-legend span { display: flex; align-items: center; gap: 5px; }
-  .pk-legend i { width: 9px; height: 9px; border-radius: 2px; display: inline-block; }
-  .pk-group-summary td { padding: 7px 11px; background: var(--surface-2); }
-  .pk-group-toggle { width: 100%; padding: 4px 0; border: 0; background: transparent;
-    color: var(--ink-2); text-align: left; }
-  .pk-group-toggle:hover:not(:disabled) { border: 0; color: var(--accent); }
-  .pk-hidden-row[hidden] { display: none; }
-  .pk-hidden-row td { color: var(--ink-3); }
-  .pk-expiry-chart { max-height: 260px; overflow-y: auto; overflow-x: hidden;
-    scrollbar-gutter: stable; scrollbar-width: thin; padding-right: 10px;
-    overscroll-behavior: contain; }
-  .pk-expiry-hdr { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 72px;
-    align-items: center; gap: 9px; margin-bottom: 4px; color: var(--ink-3);
-    font-size: 11px; }
-  .pk-expiry-hdr > b { text-align: right; font-weight: 600; }
-  .pk-expiry-row { display: grid; grid-template-columns: 64px minmax(80px, 1fr) 72px;
-    align-items: center; gap: 9px; min-height: 30px; padding-right: 2px; }
-  .pk-expiry-row > span { color: var(--ink-3); font-size: 11.5px; }
-  .pk-expiry-row > b { text-align: right; font: 600 11.5px var(--mono);
-    font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
-  .pk-expiry-track { display: flex; align-items: stretch; gap: 2px; height: 9px;
-    border-radius: 5px; background: var(--surface-2); overflow: hidden; }
-  .pk-expiry-seg { display: block; min-width: 3px; height: 100%; cursor: default;
-    background: var(--seg-color, var(--accent)); transition: filter .15s, transform .15s; }
-  .pk-expiry-seg:hover { filter: brightness(1.12); transform: scaleY(1.35); }
-  .pk-expiry-legend { display: flex; flex-wrap: wrap; gap: 5px 12px; margin-top: 8px;
-    color: var(--ink-3); font-size: 11px; }
-  .pk-expiry-legend span { display: inline-flex; align-items: center; gap: 5px; }
-  .pk-expiry-legend i { width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px; }
-  .pk-expiry-foot { margin-top: 9px; padding-top: 8px; border-top: 1px solid var(--line-soft);
-    color: var(--ink-3); font-size: 11px; }
-  .pk-expiry-empty { padding: 22px 0; text-align: center; color: var(--ink-3); font-size: 12px; }
-  .pk-card .expirybar { display: flex; height: 5px; border-radius: 3px; overflow: hidden;
-    margin-top: 6px; background: var(--surface-2); }
-  .pk-card .expirybar i { display: block; height: 100%; min-width: 2px; }
-
+@media (max-width: 640px) {
+  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+}
 </style>
 </head>
 <body>
+<a class="skip" id="skipLink" href="#accounts">跳到主内容</a>
 <div class="shell">
-  <nav class="nav">
+  <nav class="nav" aria-label="主导航">
     <div class="brand">
       <div class="name">WorkBuddy2API</div>
       <div class="sub" id="navSub">控制台</div>
     </div>
     <ul>
       <li><a href="#accounts" data-view="accounts" class="on">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="5.5" r="2.6"/><path d="M2.8 13.5c.6-2.6 2.7-4 5.2-4s4.6 1.4 5.2 4"/></svg>
         账号池</a></li>
       <li><a href="#usage" data-view="usage">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2 13.5h12"/><path d="M4.5 13.5V8.2M8 13.5V3.5M11.5 13.5v-3"/></svg>
         用量</a></li>
       <li><a href="#packages" data-view="packages">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.2 5.4 8 2.5l5.8 2.9v5.2L8 13.5l-5.8-2.9z"/><path d="M2.2 5.4 8 8.3l5.8-2.9M8 8.3v5.2"/></svg>
         积分构成</a></li>
       <li><a href="#taskscenter" data-view="taskscenter">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M3 2.5h10v9H8l-3 3v-3H3z"/><path d="M6 6.5h4M6 9h2.5"/></svg>
         任务中心</a></li>
       <li><a href="#models" data-view="models">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M8 1.8 14 5v6L8 14.2 2 11V5z"/><path d="M2 5l6 3.2L14 5M8 8.2v6"/></svg>
         模型与档位</a></li>
       <li><a href="#config" data-view="config">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><circle cx="8" cy="8" r="2.2"/><path d="M8 1.6v1.9M8 12.5v1.9M1.6 8h1.9M12.5 8h1.9M3.5 3.5l1.3 1.3M11.2 11.2l1.3 1.3M12.5 3.5l-1.3 1.3M4.8 11.2l-1.3 1.3"/></svg>
         配置</a></li>
       <li><a href="#logs" data-view="logs">
-        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
+        <svg viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M2.5 3.5h11M2.5 8h11M2.5 12.5h7"/></svg>
         运行日志</a></li>
     </ul>
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
-      <div class="row" style="margin-top:5px"><span id="navVer">v-</span> · <span id="navRedis">-</span></div>
+      <div class="row"><span class="mono" id="navVer">v-</span></div>
     </div>
   </nav>
 
-  <div class="main">
+  <div class="main" id="main" tabindex="-1">
     <div class="topbar">
       <h2 id="ttl">账号池</h2>
       <span class="sep">/</span>
       <span class="meta" id="subMeta">-</span>
       <div class="grow"></div>
-      <button class="icon ghost" id="btnTheme" title="切换明暗（跟随系统 → 浅色 → 深色）" aria-label="切换主题">
-        <svg id="icoTheme" viewBox="0 0 16 16" width="15" height="15" fill="none" stroke="currentColor" stroke-width="1.4"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
+      <button class="icon ghost" id="btnTheme" title="切换明暗（浅色 / 深色）" aria-label="切换主题">
+        <svg id="icoTheme" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true"><path d="M13.2 9.6A5.6 5.6 0 0 1 6.4 2.8a5.6 5.6 0 1 0 6.8 6.8z"/></svg>
       </button>
       <button id="btnRefresh">刷新</button>
       <button class="primary" id="btnAdd">添加账号</button>
@@ -533,10 +738,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         </header>
         <div class="tbl-wrap">
         <table class="acc">
+          <caption class="sr-only">账号池状态：每个账号的健康状态、积分、请求计数与运维操作</caption>
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
-            <th>账号</th><th>状态</th><th>积分</th>
-            <th>成功 / 失败</th><th>在途</th><th>用量</th><th>最近成功</th><th class="c-acts"></th>
+            <th>账号</th><th>状态</th><th class="num">积分</th>
+            <th class="num">成功 / 失败</th><th class="num">在途</th><th class="num">用量</th><th class="num">最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>
@@ -552,7 +758,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="grow"></span>
           <button class="xs" id="btnSchoolVouchers" title="开学季抽奖抽中的第三方券码（活动已结束，历史券码仍可查）">查询券码</button>
           <label class="sel-note">并发
-            <select id="qcConc"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
+            <select id="qcConc" class="auto"><option value="1" selected>1</option><option value="2">2</option><option value="3">3</option></select>
           </label>
           <button class="xs" id="btnScanAll">扫描待办</button>
           <button class="xs primary" id="btnRunQueue">执行全部待办</button>
@@ -562,7 +768,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note" id="qProgText"></span>
         </div>
         <div class="tc-empty" id="tcEmpty">
-          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="2" aria-hidden="true">
+          <svg viewBox="0 0 48 48" fill="none" stroke="currentColor" stroke-width="1.5" aria-hidden="true">
             <rect x="8" y="6" width="24" height="36" rx="3"/>
             <path d="M14 16h12M14 24h12M14 32h7" opacity=".45"/>
             <circle cx="35" cy="33" r="8"/><path d="m40 38 5 5"/>
@@ -578,15 +784,16 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
     <section class="view" id="view-models" hidden>
       <div class="box">
         <header>
-          <h3>模型能力 <span class="hint">max_tokens bug已修复目前可以正常透传最大输出,但是官方返回的最大输出仅为参考，不保证完全正确
-          </span></h3>
+          <h3>模型能力</h3>
           <span class="grow"></span>
           <span class="note" id="mdNote">实时查询上游</span>
           <button class="xs" id="btnModels">重新获取</button>
         </header>
+        <div class="subnote">max_tokens 透传已修复；官方返回的最大输出仅为参考值，不保证完全正确。</div>
         <div class="tbl-wrap">
         <table class="acc md">
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th><th>默认档</th><th>支持的思考档位</th><th>上下文长度</th><th>最大输出</th></tr></thead>
+          <caption class="sr-only">上游模型能力：积分倍率、思考档位、上下文长度与最大输出</caption>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>模型</th><th class="num">积分倍率</th><th>默认档</th><th>支持的思考档位</th><th class="num">上下文长度</th><th class="num">最大输出</th></tr></thead>
           <tbody id="mdBody"></tbody>
         </table>
         </div>
@@ -623,7 +830,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <h3>用量总览</h3>
           <span class="grow"></span>
           <span class="note" id="usNote">—</span>
-          <select id="usWindow" class="xs">
+          <select id="usWindow" class="xs auto">
             <option value="24">近 24 小时</option>
             <option value="72" selected>近 3 天</option>
             <option value="168">近 7 天</option>
@@ -656,6 +863,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="credit-dim-hd">按账号</div>
           <div class="tbl-wrap">
             <table class="acc">
+              <caption class="sr-only">积分扣除历史：按账号</caption>
               <thead><tr>
                 <th class="mark" aria-hidden="true"></th><th>账号</th>
                 <th class="num">请求</th><th class="num">扣除积分</th>
@@ -669,8 +877,9 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <div class="credit-dim-hd">按模型</div>
           <div class="tbl-wrap">
             <table class="acc">
+              <caption class="sr-only">积分扣除历史：按模型</caption>
               <thead><tr>
-                <th class="mark" aria-hidden="true"></th><th>模型</th><th>积分倍率</th>
+                <th class="mark" aria-hidden="true"></th><th>模型</th><th class="num">积分倍率</th>
                 <th class="num">请求</th><th class="num">扣除积分</th>
                 <th class="num">有效样本 Token</th><th class="num">积分 / 1M Token</th>
               </tr></thead>
@@ -685,6 +894,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
           <span class="note">请求数含失败尝试</span></header>
         <div class="tbl-wrap">
           <table class="acc">
+            <caption class="sr-only">用量统计：按账号</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
@@ -700,6 +910,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header><h3>按模型</h3></header>
         <div class="tbl-wrap">
           <table class="acc">
+            <caption class="sr-only">用量统计：按模型</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
@@ -714,6 +925,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header><h3>按域</h3></header>
         <div class="tbl-wrap">
           <table class="acc">
+            <caption class="sr-only">用量统计：按域</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
@@ -736,7 +948,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
                 <input name="listen" placeholder=":7863">
                 <span class="hint">改动需重启进程</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
-                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权">
+                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权" autocomplete="off">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
                 <span class="hint">立即生效（含面板自身）</span></label>
             </div>
@@ -890,7 +1102,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
               <input type="checkbox" name="sanitize_blacklist_fingerprints"></div>
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
-            <div class="hint" style="margin-top:10px">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
+            <div class="hint mt-3">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
           </div>
         </div>
 
@@ -908,8 +1120,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div class="box">
         <header>
           <h3>请求指标</h3>
-          <span class="grow"></span>
           <span class="note" id="reqSummary">—</span>
+          <span class="grow"></span>
           <span class="note" id="reqNote">—</span>
         </header>
         <pre id="reqLogBox"></pre>
@@ -919,7 +1131,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
         <header>
           <h3>运行日志</h3>
           <span class="grow"></span>
-          <span class="chips" id="logChips">
+          <span class="chips" id="logChips" role="group" aria-label="日志频道">
             <button class="xs chip on" data-ch="all">全部</button>
             <button class="xs chip" data-ch="task">任务</button>
             <button class="xs chip" data-ch="chat">对话</button>
@@ -935,17 +1147,18 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 积分任务 -->
-<div class="veil" id="taskVeil">
-  <div class="dlg" style="width:940px">
+<div class="veil" id="taskVeil" role="dialog" aria-modal="true" aria-labelledby="taskVeilTitle">
+  <div class="dlg wide">
     <header>
-      <h3>积分任务 <span class="hint" id="taskWho"></span></h3>
+      <h3 id="taskVeilTitle">积分任务 <span class="hint" id="taskWho"></span></h3>
       <div class="hint">查询上游任务进度；「接受」为报名（幂等），「领取」在进度达标后可用。所有操作走网关，无需外部脚本。</div>
     </header>
     <div class="body">
       <div class="state" id="taskState"><span class="dots">加载中</span></div>
       <div class="tbl-wrap">
         <table class="acc md" id="taskTable" hidden>
-          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th>进度</th><th>奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
+          <caption class="sr-only">该账号的成长任务列表</caption>
+          <thead><tr><th class="mark" aria-hidden="true"></th><th>任务</th><th class="num">进度</th><th class="num">奖励</th><th>状态</th><th class="c-acts"></th></tr></thead>
           <tbody id="taskBody"></tbody>
         </table>
       </div>
@@ -961,11 +1174,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 开学季券码 -->
-<div class="veil" id="vcVeil">
+<div class="veil" id="vcVeil" role="dialog" aria-modal="true" aria-labelledby="vcVeilTitle">
   <div class="dlg">
     <header>
-      <h3>开学季 · 我的券码</h3>
-      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应app/小程序兑换。</div>
+      <h3 id="vcVeilTitle">开学季 · 我的券码</h3>
+      <div class="hint">抽奖抽中的第三方券（KFC / 瑞幸 / 酷狗等），券码到店到对应 app / 小程序兑换。</div>
     </header>
     <div class="body" id="vcBody"></div>
     <footer>
@@ -978,13 +1191,13 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 添加账号 -->
-<div class="veil" id="addVeil">
+<div class="veil" id="addVeil" role="dialog" aria-modal="true" aria-labelledby="addVeilTitle">
   <div class="dlg">
     <header>
-      <h3>添加账号</h3>
-      <div class="tabs" id="addTabs">
-        <button class="tab on" data-tab="login">浏览器登录</button>
-        <button class="tab" data-tab="import">导入 JSON</button>
+      <h3 id="addVeilTitle">添加账号</h3>
+      <div class="tabs" id="addTabs" role="tablist">
+        <button class="tab on" data-tab="login" role="tab" aria-selected="true">浏览器登录</button>
+        <button class="tab" data-tab="import" role="tab" aria-selected="false">导入 JSON</button>
       </div>
     </header>
     <div class="body">
@@ -992,11 +1205,11 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       <div id="addTabLogin" class="tab-panel">
         <div id="addPick">
           <div class="realm-row">
-            <span class="hint" style="font-size:12px">版本：</span>
+            <span class="hint fs-12">版本：</span>
             <label class="realm-opt"><input type="radio" name="addRealm" value="cn" checked> 国内版（CN）</label>
             <label class="realm-opt"><input type="radio" name="addRealm" value="global"> 国际版（Global）</label>
           </div>
-          <div class="hint" style="font-size:12px;margin-top:2px">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
+          <div class="hint fs-12 mt-1">国际版登录后，网关自动完成注册地区、激活与试用额度领取，全程无需手动操作。</div>
         </div>
         <div id="addLoad" class="state" hidden><span class="dots">正在获取授权链接</span></div>
         <div id="addReady" hidden>
@@ -1009,8 +1222,8 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
       </div>
       <!-- 导入 JSON -->
       <div id="addTabImport" class="tab-panel" hidden>
-        <div class="hint" style="margin-bottom:8px">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
-        <input type="file" id="importFile" accept=".json" style="margin-bottom:8px">
+        <div class="hint mb-2">选择 cockpit tools 导出的 JSON 文件，批量导入账号。文件需为账号数组格式。</div>
+        <input type="file" id="importFile" accept=".json" class="mb-2">
         <div id="importDone" class="state ok" hidden></div>
         <div id="importErr" class="state err" hidden></div>
       </div>
@@ -1026,15 +1239,15 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
 </div>
 
 <!-- 密钥 -->
-<div class="veil" id="keyVeil" data-lock="1">
-  <div class="dlg" style="width:420px">
+<div class="veil" id="keyVeil" data-lock="1" role="dialog" aria-modal="true" aria-labelledby="keyVeilTitle">
+  <div class="dlg narrow">
     <header>
-      <h3>需要访问密钥</h3>
+      <h3 id="keyVeilTitle">需要访问密钥</h3>
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
       <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">
-      <div class="state err" id="keyErr" hidden style="margin-top:10px">密钥不正确，请重试。</div>
+      <div class="state err mt-2" id="keyErr" hidden>密钥不正确，请重试。</div>
     </div>
     <footer>
       <span class="grow"></span>
@@ -1043,7 +1256,7 @@ legend { font-size: 12px; color: var(--ink-3); font-weight: 600; padding-bottom:
   </div>
 </div>
 
-<div id="toasts"></div>
+<div id="toasts" aria-live="polite" aria-atomic="false"></div>
 
 <script src="app.js"></script>
 </body>

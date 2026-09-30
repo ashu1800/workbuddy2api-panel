@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strconv"
 	"strings"
 	"testing"
@@ -370,8 +371,70 @@ process.stdout.write(JSON.stringify({
 	if err != nil {
 		t.Fatalf("expiry summary node test failed: %v\n%s", err, out)
 	}
-	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"#4f8cff","colorB":"#25b08b"}`
+	const want = `{"rows":[{"days":1,"credits":50},{"days":7,"credits":70}],"accountCount":3,"unavailable":1,"colorA":"var(--chart-1)","colorB":"var(--chart-2)"}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("expiry summary=%s want %s", out, want)
+	}
+}
+
+// TestIndexLightThemeDefault 面板默认浅色：浅色是主路径，深色为次要模式。
+// 根元素硬编码 data-theme 决定首帧外观（CSP 禁内联脚本，无法在 <head> 提前读
+// localStorage），若这里回落到 dark，浅色用户每次刷新都会看到一帧深色。
+func TestIndexLightThemeDefault(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	if !strings.Contains(body, `<html lang="zh-CN" data-theme="light">`) {
+		t.Error(`index.html must default to data-theme="light"`)
+	}
+}
+
+// TestIndexNoStaticInlineStyle 静态内联样式禁令：颜色/间距/字号等一律走 token 与
+// class，只允许注入 CSS 变量（style="--x:…"）表达动态值（进度条宽度、图段比例）。
+// 旧版有 9 处内联 style（含弹层宽度、字号、色值），是"同一件事有 N 种写法"的来源。
+func TestIndexNoStaticInlineStyle(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, m := range regexp.MustCompile(`style="[^"]*"`).FindAllString(body, -1) {
+		if !strings.HasPrefix(m, `style="--`) {
+			t.Errorf("index.html has a static inline style (use a class or a CSS variable): %s", m)
+		}
+	}
+}
+
+// TestAppJSNoStaticInlineStyle app.js 生成的 HTML 同样只允许变量注入。
+func TestAppJSNoStaticInlineStyle(t *testing.T) {
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, m := range regexp.MustCompile(`(?s)style="([^"]*)"`).FindAllStringSubmatch(string(raw), -1) {
+		if !strings.HasPrefix(m[1], "--") {
+			t.Errorf("app.js has a static inline style (use a class or a CSS variable): %s", m[0])
+		}
+	}
+}
+
+// TestIndexDialogsAccessible 四个弹层必须是可被读屏识别的 dialog，并带标签：
+// 重构前它们只是 div + class，键盘用户既看不到焦点也无法用 Esc 退出。
+func TestIndexDialogsAccessible(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, id := range []string{"taskVeil", "vcVeil", "addVeil", "keyVeil"} {
+		marker := regexp.MustCompile(`<div class="veil" id="` + id + `"[^>]*>`).FindString(body)
+		if marker == "" {
+			t.Errorf("dialog %s not found", id)
+			continue
+		}
+		for _, attr := range []string{`role="dialog"`, `aria-modal="true"`, `aria-labelledby="`} {
+			if !strings.Contains(marker, attr) {
+				t.Errorf("dialog %s missing %s: %s", id, attr, marker)
+			}
+		}
 	}
 }
