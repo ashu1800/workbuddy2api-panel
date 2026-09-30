@@ -226,11 +226,56 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+// overviewAccount 账号状态 + 今日用量。
+// 账号表的「今日调用 / 今日用量 / 成功率」按**自然日**显示，数据取自用量记录器的
+// 今天窗口（与「用量统计 → 今天」同源同口径），而不是 pool.TokenUsage——后者是
+// 累计全量且不按天滚动，两者窗口不同，混用就会重演「历史 token ÷ 新时间」那类错配。
+// 累计值仍在池里，前端放在悬浮提示里对照。
+type overviewAccount struct {
+	pool.Status
+	Today todayUsage `json:"today"`
+}
+
+// todayUsage 今日（服务端本地时区自然日）的按账号汇总。
+type todayUsage struct {
+	Day      string `json:"day"`
+	Requests int64  `json:"requests"`     // 今日尝试次数（含重试/中断）
+	Errors   int64  `json:"errors"`       // 今日失败尝试
+	Tokens   int64  `json:"total_tokens"` // 今日总 token
+}
+
+// mergeTodayUsage 把用量记录器的今日按账号汇总并进账号列表。纯函数便于测试。
+// 今天窗口 = [今天 00:00, now]：记录器窗口是 [当前整点-(hours-1)h, now]，
+// 故调用方传 hours = 当前小时 + 1 恰好从 00:00 起算（与面板「今天」选项同一换算）。
+// 今日无流量的账号补零值——0 是真实值，不能让前端把「没有流量」渲染成「没有数据」。
+func mergeTodayUsage(accts []pool.Status, byUID map[string]usage.KeyedAgg, day string) []overviewAccount {
+	out := make([]overviewAccount, 0, len(accts))
+	for _, s := range accts {
+		oa := overviewAccount{Status: s, Today: todayUsage{Day: day}}
+		if g, ok := byUID[s.UID]; ok {
+			oa.Today.Requests = g.Requests
+			oa.Today.Errors = g.Errors
+			oa.Today.Tokens = g.TotalTokens
+		}
+		out = append(out, oa)
+	}
+	return out
+}
+
 func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
+	}
+	now := time.Now()
+	accts := p.cfg.Pool.List()
+	byUID := map[string]usage.KeyedAgg{}
+	if p.cfg.Usage != nil {
+		// nicks 传 nil：这里只按 uid 取值，不需要昵称。
+		for _, g := range p.cfg.Usage.Snapshot(now.Hour()+1, nil).ByAccount {
+			byUID[g.Key] = g
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
 		"version":         p.cfg.Version,
@@ -243,7 +288,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		"cooling":         cooling,
 		"disabled":        disabled,
 		"in_flight_full":  inFlightFull,
-		"accounts":        p.cfg.Pool.List(),
+		"accounts":        mergeTodayUsage(accts, byUID, now.Format("2006-01-02")),
 	})
 }
 

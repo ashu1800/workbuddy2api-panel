@@ -476,6 +476,13 @@ console.log(JSON.stringify({
   okNoField: okRateOf({ request_count: 10 }),
   okNoAttempts: okRateOf({ request_count: 0, ok_count: 0 }),
   okNull: okRateOf(null),
+  todayRate: todayRateOf({ requests: 100, errors: 1 }),
+  todayFull: todayRateOf({ requests: 100, errors: 0 }),
+  todayAllErr: todayRateOf({ requests: 10, errors: 10 }),
+  todayNoTraffic: todayRateOf({ requests: 0, errors: 0 }),
+  todayErrExceeds: todayRateOf({ requests: 5, errors: 9 }),
+  todayNoErrors: todayRateOf({ requests: 5 }),
+  todayNull: todayRateOf(null),
   tagOk: tagOf(statusTagOf({}, '', [])),
   tagOff: tagOf(statusTagOf({ disabled: true }, '', [])),
   tagCool: tagOf(statusTagOf({}, '限流冷却 · 14分02秒', [])),
@@ -507,6 +514,8 @@ console.log(JSON.stringify({
 	const want = `{"ttfb":400,"ttfbNone":null,"ttfbMissing":null,"ttfbNull":null,` +
 		`"rate":500,"rateNone":null,"rateMissing":null,"rateNull":null,` +
 		`"okRate":99.83060417843026,"okFull":100,"okZero":0,"okNoField":null,"okNoAttempts":null,"okNull":null,` +
+		`"todayRate":99,"todayFull":100,"todayAllErr":0,"todayNoTraffic":null,` +
+		`"todayErrExceeds":0,"todayNoErrors":null,"todayNull":null,` +
 		`"tagOk":"|ok|可用|-","tagOff":"off|bad|已禁用|-","tagCool":"cool|warn|限流冷却 · 14分02秒|T",` +
 		`"tagLimited1":"rl|warn|限流|T","tagLimited2":"rl|warn|限流 · 2 个模型|T",` +
 		`"tagUnavail":"rl|warn|待重探|T","tagMixed":"rl|warn|异常 · 2 个模型|T",` +
@@ -537,7 +546,7 @@ func TestAccountTableColumnCount(t *testing.T) {
 	if len(ths) != wantCols {
 		t.Errorf("accounts table has %d <th>, want %d", len(ths), wantCols)
 	}
-	for _, label := range []string{"调用次数", "用量", "首字", "推理"} {
+	for _, label := range []string{"今日调用", "今日用量", "首字", "推理"} {
 		if !strings.Contains(head, ">"+label+"<") {
 			t.Errorf("header missing column %q", label)
 		}

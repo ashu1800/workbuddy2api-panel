@@ -279,7 +279,8 @@ function avgInferenceRate(tu) {
   return ms > 0 ? ((tu.inference_tokens_sum || 0) * 1000 / ms) : null;
 }
 
-/* okRateOf 成功率 = ok_count ÷ request_count（百分数）。后端在同一次加锁内、按同一个
+/* okRateOf 累计成功率 = ok_count ÷ request_count（百分数）。列里显示的是今日口径，
+   这个用于悬浮提示里的累计对照行。后端在同一次加锁内、按同一个
    事件（一次尝试的最终结果）同时累加这两个计数器，故恒有 ok <= req——成功率在结构上
    不可能超过 100%。
    不能用池的 success_count 当分子：它在「上游 2xx 刚开流」时就 +1，比尝试记账早整个
@@ -290,6 +291,17 @@ function okRateOf(tu) {
   const req = (tu && tu.request_count) || 0;
   if (typeof (tu && tu.ok_count) !== 'number' || req <= 0) return null;
   return tu.ok_count / req * 100;
+}
+
+/* todayRateOf 今日成功率 = (今日尝试 − 今日失败) ÷ 今日尝试（百分数）。
+   两个数来自后端同一次聚合（用量记录器的今天窗口），所以恒有 errors <= requests，
+   成功率不可能超过 100%；也正因为同源同窗口，它与「用量统计 → 今天」的失败数一致。
+   分母为 0（今天没流量）或字段缺失时返回 null，由调用方渲染成 —。 */
+function todayRateOf(td) {
+  const req = (td && td.requests) || 0;
+  if (!td || typeof td.errors !== 'number' || req <= 0) return null;
+  const ok = req - td.errors;
+  return (ok > 0 ? ok : 0) / req * 100;
 }
 
 /* statusTagOf 账号状态结论（纯函数，便于测试）：优先级 = 账号级状态 > 模型级受限 > 可用。
@@ -366,21 +378,37 @@ function renderAccounts(list) {
     }
     const frozen = s.disabled || cool > 0;
     const tu = s.token_usage || {};
-    const req = tu.request_count || 0;
-    const totalTok = formatTokenCount(tu.total_tokens);
-    const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
+    // 「今日调用 / 今日用量 / 成功率」= 自然日口径，取自后端 overview 合并的用量记录器
+    // 今天窗口（与「用量统计 → 今天」同源同口径）。累计全量仍在池里，放进悬浮提示对照。
+    const td = s.today || {};
+    const hasToday = typeof td.requests === 'number';
+    const todayReq = td.requests || 0;
+    const todayErr = typeof td.errors === 'number' ? td.errors : null;
+    const todayTok = formatTokenCount(td.total_tokens);
+    const todayTokUnit = todayTok === '—' ? '' : '<em>tok</em>';
+    const dayLabel = '今天' + (td.day ? '（' + td.day + '）' : '');
+    // 累计对照值
+    const cumTok = formatTokenCount(tu.total_tokens);
+    const cumReq = tu.request_count || 0;
+    const cumOk = typeof tu.ok_count === 'number' ? tu.ok_count : null;
+    const cumRate = okRateOf(tu);
     const latency = formatLatency(tu.last_latency_ms);
-    // 成功率 = ok_count ÷ request_count（见 okRateOf 的口径说明）。
-    const okCount = typeof tu.ok_count === 'number' ? tu.ok_count : null;
-    const okRate = okRateOf(tu);
+    // 成功率 = (今日尝试 − 今日失败) ÷ 今日尝试（见 todayRateOf 的口径说明）。
+    const okRate = todayRateOf(td);
     const rateCls = okRate == null ? 'c-muted' : (okRate >= 99 ? 'c-ok' : (okRate >= 95 ? 'c-warn' : 'c-bad'));
-    const callsTitle = okRate == null
-      ? '尝试 ' + req + ' 次（成功率需 1.13.1 起的数据）'
-      : '尝试 ' + req + ' 次 / 成功 ' + okCount + ' / 失败 ' + (req - okCount) +
-        '\n成功率 = 成功 ÷ 尝试次数（两者同一次记账，故不会超过 100%）';
+    let callsTitle = hasToday
+      ? dayLabel + '尝试 ' + todayReq + ' 次' + (todayErr == null ? '' : ' / 失败 ' + todayErr) +
+        '\n成功率 = (尝试 − 失败) ÷ 尝试（同一次聚合，故不会超过 100%）'
+      : '今日数据需要 1.13.3 起的后端';
+    callsTitle += '\n累计：尝试 ' + cumReq + ' 次' +
+      (cumOk == null ? '' : ' / 成功 ' + cumOk + ' / 失败 ' + (cumReq - cumOk)) +
+      (cumRate == null ? '' : '（' + cumRate.toFixed(2) + '%）');
     const ttfb = avgTTFB(tu);
     const infer = avgInferenceRate(tu);
-    const usageTitle = '累计 ' + totalTok + ' token / 尝试 ' + req + ' 次' +
+    let usageTitle = hasToday
+      ? dayLabel + '用量 ' + todayTok + ' token'
+      : '今日数据需要 1.13.3 起的后端';
+    usageTitle += '\n累计 ' + cumTok + ' token / 尝试 ' + cumReq + ' 次' +
       (latency === '—' ? '' : '\n最近一次总延迟 ' + latency);
     const ttfbTitle = ttfb == null
       ? '暂无首字样本（非流式请求没有首字概念）'
@@ -396,12 +424,12 @@ function renderAccounts(list) {
       '<td>' + tag + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div></td>' +
       '<td class="num calls-cell" title="' + esc(callsTitle) + '">' +
-        '<span class="calls-n"><b>' + req + '</b><em>次</em></span>' +
+        '<span class="calls-n"><b>' + (hasToday ? todayReq : '—') + '</b>' + (hasToday ? '<em>次</em>' : '') + '</span>' +
         '<span class="sep">|</span>' +
         '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line">' +
-        '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
+        '<span class="usage-item usage-total"><b>' + todayTok + '</b>' + todayTokUnit + '</span>' +
       '</span></td>' +
       // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
       '<td class="num ttfb-cell" title="' + esc(ttfbTitle) + '">' +

@@ -621,9 +621,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 		h.cfg.Pool.RecordTokenUsage(uid, delta)
 
-		// 用量时序记录。ok 以「上游是否给了 usage」判定：空 delta 意味着这次尝试
-		// 没拿到任何 token 统计（传输错误 / >=400 / 解析失败），计为失败尝试。
-		// 失败也计入请求数——否则重试放大在「用量」视图里看不见。
+		// 用量时序记录。ok 用本次尝试的最终结果（与 pool 的 ok_count 同一判定）：
+		// 上游 2xx 开流后中途空流/断连/error 帧都算失败尝试，而不是只要给了 usage
+		// 就算成功。失败也计入请求数——否则重试放大在「用量」视图里看不见。
 		if h.cfg.Usage != nil {
 			realm := "cn"
 			if a, ok := h.cfg.Pool.Status(uid); ok && a.Realm != "" {
@@ -643,7 +643,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 				HasLatency:       delta.HasLatencyMs,
 				TokensPerSecond:  delta.TokensPerSecond,
 				HasTPS:           delta.HasTokensPerSecond,
-			}, delta.HasTotalTokens || delta.HasCompletionTokens || delta.HasPromptTokens)
+			}, ok)
 		}
 	}
 
