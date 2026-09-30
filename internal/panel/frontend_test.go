@@ -440,6 +440,108 @@ func TestNavTitlesAreFourChars(t *testing.T) {
 	}
 }
 
+// TestAppJSAvgPerf 首字/推理两列的累计平均换算。后端只暴露原始计数器
+// （ttfb_sum_ms / ttfb_count / inference_ms_sum / completion_tokens），
+// 除法在前端做——除错不会报错，只会让数字静静偏掉，所以用固定输入钉住。
+// 关键口径：推理速度的分子分母必须同一样本集合，否则无 token 的样本会压低速度。
+func TestAppJSAvgPerf(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; JS average check skipped")
+	}
+	raw, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	text := string(raw)
+	start := strings.Index(text, "function avgTTFB")
+	end := strings.Index(text, "function renderAccounts")
+	if start < 0 || end <= start {
+		t.Fatal("avgTTFB slice not found in app.js")
+	}
+	script := text[start:end] + `
+console.log(JSON.stringify({
+  ttfb: avgTTFB({ ttfb_sum_ms: 1200, ttfb_count: 3 }),
+  ttfbNone: avgTTFB({ ttfb_sum_ms: 0, ttfb_count: 0 }),
+  ttfbMissing: avgTTFB({}),
+  ttfbNull: avgTTFB(null),
+  rate: avgInferenceRate({ completion_tokens: 1000, inference_ms_sum: 2000 }),
+  rateNone: avgInferenceRate({ completion_tokens: 1000, inference_ms_sum: 0 }),
+  rateMissing: avgInferenceRate({}),
+  rateNull: avgInferenceRate(null),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "avg-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name()).CombinedOutput()
+	if err != nil {
+		t.Fatalf("avg perf node check failed: %v\n%s", err, out)
+	}
+	const want = `{"ttfb":400,"ttfbNone":null,"ttfbMissing":null,"ttfbNull":null,"rate":500,"rateNone":null,"rateMissing":null,"rateNull":null}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("avg perf=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAccountTableColumnCount 账号表列数必须三处一致：表头 <th>、行内 <td>、
+// 空态的 colspan。任何一处不同步，空态或骨架就会整行错位（表格里最显眼、
+// 又最容易被后续加列时漏掉的地方）。
+func TestAccountTableColumnCount(t *testing.T) {
+	const wantCols = 11
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	head := regexp.MustCompile(`(?s)<table class="acc">.*?</thead>`).FindString(body)
+	if head == "" {
+		t.Fatal("accounts table header not found")
+	}
+	// `<th[ >]` 排除 <thead
+	ths := regexp.MustCompile(`<th[ >]`).FindAllString(head, -1)
+	if len(ths) != wantCols {
+		t.Errorf("accounts table has %d <th>, want %d", len(ths), wantCols)
+	}
+	for _, label := range []string{"调用次数", "用量", "首字", "推理"} {
+		if !strings.Contains(head, ">"+label+"<") {
+			t.Errorf("header missing column %q", label)
+		}
+	}
+	if strings.Contains(head, "成功 / 失败") {
+		t.Error(`header still has the old "成功 / 失败" column`)
+	}
+
+	// 空态 colspan 与表头列数必须一致（在 app.js 里生成）
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := regexp.MustCompile(`账号池是空的`).FindStringIndex(string(js))
+	if m == nil {
+		t.Fatal("accounts empty state not found in app.js")
+	}
+	window := string(js)[maxInt(0, m[0]-160):m[0]]
+	cm := regexp.MustCompile(`colspan="(\d+)"`).FindStringSubmatch(window)
+	if cm == nil {
+		t.Fatal("accounts empty state has no colspan")
+	}
+	if cm[1] != "11" {
+		t.Errorf("accounts empty state colspan=%s, want 11", cm[1])
+	}
+}
+
+func maxInt(a, b int) int {
+	if a > b {
+		return a
+	}
+	return b
+}
+
 // TestIndexDialogsAccessible 四个弹层必须是可被读屏识别的 dialog，并带标签：
 // 重构前它们只是 div + class，键盘用户既看不到焦点也无法用 Esc 退出。
 func TestIndexDialogsAccessible(t *testing.T) {

@@ -31,6 +31,8 @@ func (k CoolKind) String() string {
 }
 
 // TokenUsage 账号聊天请求的累计 token 用量摘要（不包含任何原始凭证）。
+// 首字/推理速度按「累计平均」暴露原始计数器，面板据此算平均值——派生字段不放在
+// 这里，因为本结构体会原样落盘 state.json。
 type TokenUsage struct {
 	RequestCount        int64     `json:"request_count,omitempty"`
 	UsageCount          int64     `json:"usage_count,omitempty"`
@@ -41,6 +43,14 @@ type TokenUsage struct {
 	LastTokensPerSecond *float64  `json:"last_tokens_per_second,omitempty"`
 	LastUsedAt          time.Time `json:"last_used_at,omitempty"`
 	LastModel           string    `json:"last_model,omitempty"`
+	// 首字（TTFB）与生成耗时（总耗时扣掉首字等待）的累计量。
+	// TTFBCount 是「观测到首字」的样本数，与 UsageCount（观测到 token 的样本数）
+	// 不是同一集合：非流式请求没有首字概念，只进后者。
+	TTFBSumMs      int64 `json:"ttfb_sum_ms,omitempty"`
+	TTFBCount      int64 `json:"ttfb_count,omitempty"`
+	InferenceMsSum int64 `json:"inference_ms_sum,omitempty"`
+	// LastTTFBMs 最近一次首字耗时，仅供工具提示与「最近一次」对照。
+	LastTTFBMs int64 `json:"last_ttfb_ms,omitempty"`
 }
 
 // TokenUsageDelta 是一次聊天账号尝试的 usage 增量。
@@ -57,6 +67,10 @@ type TokenUsageDelta struct {
 	LatencyMs           int64
 	HasTokensPerSecond  bool
 	TokensPerSecond     float64
+	// HasTTFBMs 仅流式路径可能为真：首个 data 帧到达耗时。
+	// 非流式（sync）与失败尝试没有首字概念，保持 false。
+	HasTTFBMs bool
+	TTFBMs    int64
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。

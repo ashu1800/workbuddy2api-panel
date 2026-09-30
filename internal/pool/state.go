@@ -267,8 +267,30 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	if known {
 		usage.UsageCount++
 	}
+	if delta.HasTTFBMs && delta.TTFBMs >= 0 {
+		usage.TTFBSumMs += delta.TTFBMs
+		usage.TTFBCount++
+		usage.LastTTFBMs = delta.TTFBMs
+	} else {
+		// 与 LastTokensPerSecond 同语义：最近一次没观测到首字就不展示旧值；
+		// 累计量（平均值）不回退。
+		usage.LastTTFBMs = 0
+	}
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
+		// 生成耗时 = 总耗时 − 首字等待，供面板算「推理速度」的累计平均。
+		// 只在同时拿到 completion_tokens 时累计，保证与 usage.CompletionTokens
+		// 的样本集合一致——否则分母会混入没有 token 的样本，把速度压低。
+		// 首字未知（非流式、失败）或首字 >= 总耗时（时钟粒度/异常上游）时按总耗时
+		// 计：宁可把等待算进去，也不能让分母趋近 0 而算出天文速度把累计均值带偏。
+		// 减法只在 TTFBMs < inferMs 时发生，故结果恒 >= 1ms，无需再钳位。
+		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && delta.LatencyMs > 0 {
+			inferMs := delta.LatencyMs
+			if delta.HasTTFBMs && delta.TTFBMs > 0 && delta.TTFBMs < inferMs {
+				inferMs -= delta.TTFBMs
+			}
+			usage.InferenceMsSum += inferMs
+		}
 	}
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
 		speed := delta.TokensPerSecond

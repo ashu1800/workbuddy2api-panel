@@ -265,6 +265,83 @@ func TestChatStreamPassthrough(t *testing.T) {
 	}
 }
 
+// delayedReader 首次 Read 前先睡 d。用于让流式路径的 TTFB 稳定跨过时钟粒度：
+// 假上游是纯内存 io.Reader，Windows 上 time.Since 可能取到 0，断言会变成偶发失败。
+type delayedReader struct {
+	r     io.Reader
+	d     time.Duration
+	first bool
+}
+
+func (r *delayedReader) Read(p []byte) (int, error) {
+	if !r.first {
+		r.first = true
+		time.Sleep(r.d)
+	}
+	return r.r.Read(p)
+}
+
+// TestChatStreamRecordsTTFB 流式路径必须把首字耗时写进账号累计量。
+// 这是本次改动最容易漏接的一环：stats.TTFB() 本来就算好了（请求日志一直在用），
+// 但只要 recordAttempt 没把它传下去，面板的「首字」列就永远是 —。
+func TestChatStreamRecordsTTFB(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	up.HTTP.Transport = roundTripFunc(func(*http.Request) (*http.Response, error) {
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       io.NopCloser(&delayedReader{r: strings.NewReader(sseOK), d: 20 * time.Millisecond}),
+		}, nil
+	})
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","stream":true,"messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.TTFBCount != 1 || st.TokenUsage.LastTTFBMs < 15 || st.TokenUsage.TTFBSumMs < 15 {
+		t.Errorf("stream ttfb not recorded (want ~20ms, count 1): %+v", st.TokenUsage)
+	}
+	if st.TokenUsage.InferenceMsSum <= 0 {
+		t.Errorf("inference ms not recorded: %+v", st.TokenUsage)
+	}
+}
+
+// TestChatSyncDoesNotRecordTTFB 非流式没有「首字」概念：首字累计量必须保持为空，
+// 否则面板会把整段响应耗时当成首字展示，用户会以为账号首字很慢。
+func TestChatSyncDoesNotRecordTTFB(t *testing.T) {
+	up := newFakeUpstream(t, func(string) (int, string, bool) { return 200, sseOK, true })
+	h := NewHandler(Config{
+		Pool:     testPoolWith(&auth.Auth{UID: "u1", AccessToken: "at1", ExpiresAt: 9999999999}),
+		Upstream: up,
+	})
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest("POST", "/v1/chat/completions",
+		strings.NewReader(`{"model":"glm-5.2","messages":[{"role":"user","content":"hi"}]}`)))
+	if rec.Code != 200 {
+		t.Fatalf("code=%d body=%s", rec.Code, rec.Body)
+	}
+	st, ok := h.cfg.Pool.Status("u1")
+	if !ok {
+		t.Fatal("account status missing")
+	}
+	if st.TokenUsage.TTFBCount != 0 || st.TokenUsage.TTFBSumMs != 0 || st.TokenUsage.LastTTFBMs != 0 {
+		t.Errorf("sync must not record ttfb: %+v", st.TokenUsage)
+	}
+	// 但推理耗时仍要累计（无首字可扣，按总耗时计），否则非流式账号的推理列恒为 —
+	if st.TokenUsage.InferenceMsSum <= 0 {
+		t.Errorf("sync should still accumulate inference ms: %+v", st.TokenUsage)
+	}
+}
+
 func TestChatRecordsCreditForStreamAndSync(t *testing.T) {
 	const sseCredit = "data: {\"id\":\"chatcmpl-credit\",\"object\":\"chat.completion.chunk\",\"created\":1753600000,\"model\":\"glm-5.2\",\"choices\":[{\"index\":0,\"delta\":{\"role\":\"assistant\",\"content\":\"ok\"}}],\"usage\":{\"prompt_tokens\":4,\"completion_tokens\":6,\"total_tokens\":10,\"credit\":1.25}}\n\n" +
 		"data: [DONE]\n\n"

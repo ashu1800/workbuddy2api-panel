@@ -370,7 +370,16 @@ th.num, td.num { text-align: right; }
 }
 .realm-row { display: flex; align-items: center; gap: var(--sp-3); padding: var(--sp-1) 0 var(--sp-2); }
 .realm-opt { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-12); color: var(--ink-2); cursor: pointer; }
-.usage-cell { min-width: 208px; }
+/* 用量 / 首字 / 推理 三列：都只用 `.usage-line` + `.usage-item` 一套 chip，
+   保证三列基线、字号、内边距完全一致。用量是主指标用 accent，首字/推理是性能
+   指标——性能不是状态，不占用琥珀/绿，异常与否交给工具提示。 */
+.usage-cell { min-width: 74px; }
+.ttfb-cell, .speed-cell { min-width: 74px; }
+/* 调用次数：`1771次 | 99.83%`。百分比是这一行唯一的语义色（成功率是状态）。 */
+.calls-cell { min-width: 108px; }
+.calls-cell .calls-n b { font-weight: 600; }
+.calls-cell .calls-n em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
+.calls-cell .sep { margin: 0 var(--sp-1); color: var(--ink-faint); }
 .usage-line {
   display: inline-flex; align-items: center; gap: var(--sp-1); max-width: 100%;
   font: 600 var(--fs-11)/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;
@@ -378,10 +387,7 @@ th.num, td.num { text-align: right; }
 .usage-item { display: inline-flex; align-items: baseline; padding: 2px var(--sp-1); border-radius: var(--r-sm); background: var(--surface-3); }
 .usage-item b { font-weight: 600; }
 .usage-item em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
-.usage-count { color: var(--accent); background: var(--accent-soft); }
 .usage-total { color: var(--accent-ink); background: var(--accent-soft); }
-.usage-latency { color: var(--warn); background: var(--warn-soft); }
-.usage-rate { color: var(--ok); background: var(--ok-soft); }
 /* 限流条：最多两行（超出省略），title 携带全文。单行省略会把「预计 … 恢复」
    这类关键信息整段切掉，三行以上又会把行高撑得参差不齐，两行是折中。 */
 .rate-limits { display: flex; flex-direction: column; gap: 2px; margin-top: var(--sp-1); min-width: 200px; max-width: 340px; }
@@ -752,7 +758,8 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
           <thead><tr>
             <th class="mark" aria-hidden="true"></th>
             <th>账号</th><th>状态</th><th class="num">积分</th>
-            <th class="num">成功 / 失败</th><th class="num">在途</th><th class="num">用量</th><th class="num">最近成功</th><th class="c-acts"></th>
+            <th class="num">调用次数</th><th class="num">在途</th>
+            <th class="num">用量</th><th class="num">首字</th><th class="num">推理</th><th class="num">最近成功</th><th class="c-acts"></th>
           </tr></thead>
           <tbody id="accBody"></tbody>
         </table>

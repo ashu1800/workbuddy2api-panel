@@ -270,10 +270,27 @@ $('skipLink').onclick = () => setTimeout(() => $('main').focus({ preventScroll: 
 go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accounts').slice(1) : 'accounts');
 
 /* ── 账号池 ───────────────────────────────────────────────────────── */
+/* avgTTFB / avgInferenceRate 累计平均在面板侧算：pool.TokenUsage 是要落盘
+   state.json 的原始计数器，派生值不进那个结构体。
+   · 首字 = ttfb_sum_ms / ttfb_count。样本 = 观测到首字的尝试（流式），
+     非流式请求没有首字概念、不计入，所以这个均值天然只反映流式体验。
+   · 推理 = 累计 completion_tokens ÷ 累计生成耗时。分母已扣掉首字等待，
+     且与分子同一样本集合（后端只在拿到 completion_tokens 时才累计生成耗时）。
+   两者都返回 null 表示「无样本」，由调用方决定渲染成 —。 */
+function avgTTFB(tu) {
+  const n = (tu && tu.ttfb_count) || 0;
+  return n > 0 ? ((tu.ttfb_sum_ms || 0) / n) : null;
+}
+
+function avgInferenceRate(tu) {
+  const ms = (tu && tu.inference_ms_sum) || 0;
+  return ms > 0 ? ((tu.completion_tokens || 0) * 1000 / ms) : null;
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
-    tb.innerHTML = '<tr><td colspan="9"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
+    tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
@@ -311,22 +328,47 @@ function renderAccounts(list) {
     const totalTok = formatTokenCount(tu.total_tokens);
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
     const latency = formatLatency(tu.last_latency_ms);
-    const rate = formatRate(tu.last_tokens_per_second);
-    const usageTitle = '最近一次：' + req + ' 次 / ' + totalTok + ' / 延迟 ' + latency + ' / ' + rate;
+    // 成功率分母 = 实际尝试次数（含重试与中断），与「调用次数」同源，口径一致。
+    // 尝试次数 / 成功 / 失败 是三个独立计数器：客户端中断的尝试既不成功也不计失败，
+    // 所以尝试次数可能大于 成功+失败（例：1768+0 对应 1771 次尝试）。
+    const okCount = s.success_count || 0;
+    const errCount = s.err_total || 0;
+    const okRate = req > 0 ? okCount / req * 100 : null;
+    const rateCls = okRate == null ? 'c-muted' : (okRate >= 99 ? 'c-ok' : (okRate >= 95 ? 'c-warn' : 'c-bad'));
+    const callsTitle = '尝试 ' + req + ' 次（含重试与中断）\n成功 ' + okCount + ' / 失败 ' + errCount +
+      '\n成功率 = 成功 ÷ 尝试次数';
+    const ttfb = avgTTFB(tu);
+    const infer = avgInferenceRate(tu);
+    const usageTitle = '累计 ' + totalTok + ' token / 尝试 ' + req + ' 次' +
+      (latency === '—' ? '' : '\n最近一次总延迟 ' + latency);
+    const ttfbTitle = ttfb == null
+      ? '暂无首字样本（非流式请求没有首字概念）'
+      : '累计平均首字 ' + formatLatency(ttfb) + '（样本 ' + tu.ttfb_count + ' 次）' +
+        (tu.last_ttfb_ms ? '\n最近一次 ' + formatLatency(tu.last_ttfb_ms) : '');
+    const inferTitle = infer == null
+      ? '暂无推理样本'
+      : '累计平均推理速度 ' + formatRate(infer) + '（已排除首字等待）' +
+        '\n= 累计 completion token ÷ 累计生成耗时';
     return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
       '<td class="mark" aria-hidden="true"><i></i></td>' +
       '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
       '<td>' + tag + note + rateLimits + '</td>' +
       '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div></td>' +
-      '<td class="num">' + (s.success_count || 0) + ' <span class="c-muted">/</span> <span class="c-bad">' + (s.err_total || 0) + '</span></td>' +
+      '<td class="num calls-cell" title="' + esc(callsTitle) + '">' +
+        '<span class="calls-n"><b>' + req + '</b><em>次</em></span>' +
+        '<span class="sep">|</span>' +
+        '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
-      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line" aria-label="' + esc(usageTitle) + '">' +
-        '<span class="usage-item usage-count"><b>' + req + '</b><em>次</em></span>' +
+      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line">' +
         '<span class="usage-item usage-total"><b>' + totalTok + '</b>' + totalTokUnit + '</span>' +
-        // 无观测值的列不渲染空色块（旧版恒渲染，会留下一个绿色的「—」）
-        (latency === '—' ? '' : '<span class="usage-item usage-latency"><b>' + latency + '</b></span>') +
-        (rate === '—' ? '' : '<span class="usage-item usage-rate"><b>' + rate + '</b></span>') +
       '</span></td>' +
+      // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
+      '<td class="num ttfb-cell" title="' + esc(ttfbTitle) + '">' +
+        (ttfb == null ? '<span class="c-muted">—</span>'
+          : '<span class="usage-line"><span class="usage-item"><b>' + formatLatency(ttfb) + '</b></span></span>') + '</td>' +
+      '<td class="num speed-cell" title="' + esc(inferTitle) + '">' +
+        (infer == null ? '<span class="c-muted">—</span>'
+          : '<span class="usage-line"><span class="usage-item"><b>' + formatRate(infer) + '</b></span></span>') + '</td>' +
       '<td class="num c-muted">' + ago(s.last_success) + '</td>' +
       '<td class="acts">' +
         '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +

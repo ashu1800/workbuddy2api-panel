@@ -1696,6 +1696,76 @@ func TestRecordTokenUsage(t *testing.T) {
 	}
 }
 
+// TestRecordTokenUsageTTFBAndInference 首字与推理耗时的累计口径：
+//   - 首字：TTFBSumMs/TTFBCount 是均值的分子分母，样本集合 =「观测到首字」的尝试；
+//   - 推理耗时：只与「有 completion_tokens」的样本同集合，且要扣掉首字等待——
+//     若分母混入无 token 的样本，面板上的推理速度会被无端压低；
+//   - 最近一次没观测到首字 → LastTTFBMs 归零，但累计均值不回退。
+func TestRecordTokenUsageTTFBAndInference(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	// 两次流式成功：3000/1000 → 生成 2000；2000/500 → 生成 1500
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 100,
+		HasLatencyMs: true, LatencyMs: 3000, HasTTFBMs: true, TTFBMs: 1000,
+	})
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 60,
+		HasLatencyMs: true, LatencyMs: 2000, HasTTFBMs: true, TTFBMs: 500,
+	})
+	st, _ := p.Status("u1")
+	tu := st.TokenUsage
+	if tu.TTFBCount != 2 || tu.TTFBSumMs != 1500 {
+		t.Errorf("ttfb sum/count=%d/%d want 1500/2", tu.TTFBSumMs, tu.TTFBCount)
+	}
+	if tu.InferenceMsSum != 3500 {
+		t.Errorf("inference_ms_sum=%d want 3500 (3000-1000 + 2000-500)", tu.InferenceMsSum)
+	}
+	if tu.LastTTFBMs != 500 {
+		t.Errorf("last_ttfb_ms=%d want 500", tu.LastTTFBMs)
+	}
+	// 面板侧据此算：首字 750ms、推理 160tok/3.5s ≈ 45.71 tok/s
+	if got := float64(tu.TTFBSumMs) / float64(tu.TTFBCount); got != 750 {
+		t.Errorf("avg ttfb=%.1f want 750", got)
+	}
+	if got := float64(tu.CompletionTokens) * 1000 / float64(tu.InferenceMsSum); got < 45.6 || got > 45.8 {
+		t.Errorf("avg inference speed=%.2f want ~45.71", got)
+	}
+
+	// 非流式（无首字）：首字均值不回退，LastTTFBMs 归零；推理耗时按总耗时计
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 40,
+		HasLatencyMs: true, LatencyMs: 1000,
+	})
+	st, _ = p.Status("u1")
+	tu = st.TokenUsage
+	if tu.TTFBCount != 2 || tu.TTFBSumMs != 1500 || tu.LastTTFBMs != 0 {
+		t.Errorf("non-stream must keep ttfb average but clear last: %+v", tu)
+	}
+	if tu.InferenceMsSum != 4500 {
+		t.Errorf("inference_ms_sum=%d want 4500 (含非流式 1000ms)", tu.InferenceMsSum)
+	}
+
+	// 首字 >= 总耗时（时钟粒度/异常上游）：算不出「首字之后的生成时间」，
+	// 保守地按总耗时计——若钳成 1ms 会得出天文速度并把累计均值带偏。
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 5,
+		HasLatencyMs: true, LatencyMs: 200, HasTTFBMs: true, TTFBMs: 200,
+	})
+	st, _ = p.Status("u1")
+	if st.TokenUsage.InferenceMsSum != 4700 {
+		t.Errorf("degenerate ttfb inference_ms_sum=%d want 4700 (按总耗时 200 计)", st.TokenUsage.InferenceMsSum)
+	}
+
+	// 无 completion_tokens 的尝试不进推理分母
+	p.RecordTokenUsage("u1", TokenUsageDelta{HasLatencyMs: true, LatencyMs: 9000})
+	st, _ = p.Status("u1")
+	if st.TokenUsage.InferenceMsSum != 4700 {
+		t.Errorf("token-less attempt must not enter inference denominator: %+v", st.TokenUsage)
+	}
+}
+
 func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	dir := t.TempDir()
 	fp := filepath.Join(dir, "state.json")
@@ -1713,6 +1783,8 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 		LatencyMs:           2300,
 		HasTokensPerSecond:  true,
 		TokensPerSecond:     5.65,
+		HasTTFBMs:           true,
+		TTFBMs:              900,
 	})
 	p.Flush()
 	p2 := New(fp)
@@ -1726,6 +1798,14 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 	if st.TokenUsage.LastLatencyMs != 2300 || st.TokenUsage.LastTokensPerSecond == nil || *st.TokenUsage.LastTokensPerSecond != 5.65 {
 		t.Errorf("latest performance lost after reload: %+v", st.TokenUsage)
+	}
+	// 首字/推理的累计量必须跟着落盘：这是面板两列的唯一数据来源，
+	// 丢了就只剩「最近一次」，重启后历史平均值会凭空缩水。
+	if st.TokenUsage.TTFBSumMs != 900 || st.TokenUsage.TTFBCount != 1 || st.TokenUsage.LastTTFBMs != 900 {
+		t.Errorf("ttfb accumulators lost after reload: %+v", st.TokenUsage)
+	}
+	if st.TokenUsage.InferenceMsSum != 1400 {
+		t.Errorf("inference_ms_sum=%d want 1400 (2300-900)", st.TokenUsage.InferenceMsSum)
 	}
 	raw, err := os.ReadFile(fp)
 	if err != nil {

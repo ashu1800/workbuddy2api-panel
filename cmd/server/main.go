@@ -31,8 +31,8 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-// 1.12.0：面板前端视觉重构（浅色为主 + Radix 语义 token + 无障碍/一致性修复）。
-const appVersion = "1.12.0-panel"
+// 1.13.0：账号表新增首字/推理采集（TTFB 进 pool.TokenUsage），调用次数列含成功率。
+const appVersion = "1.13.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。
