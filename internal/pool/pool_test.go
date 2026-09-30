@@ -1722,6 +1722,9 @@ func TestRecordTokenUsageTTFBAndInference(t *testing.T) {
 	if tu.InferenceMsSum != 3500 {
 		t.Errorf("inference_ms_sum=%d want 3500 (3000-1000 + 2000-500)", tu.InferenceMsSum)
 	}
+	if tu.InferenceTokensSum != 160 {
+		t.Errorf("inference_tokens_sum=%d want 160 (100+60)", tu.InferenceTokensSum)
+	}
 	if tu.LastTTFBMs != 500 {
 		t.Errorf("last_ttfb_ms=%d want 500", tu.LastTTFBMs)
 	}
@@ -1729,7 +1732,9 @@ func TestRecordTokenUsageTTFBAndInference(t *testing.T) {
 	if got := float64(tu.TTFBSumMs) / float64(tu.TTFBCount); got != 750 {
 		t.Errorf("avg ttfb=%.1f want 750", got)
 	}
-	if got := float64(tu.CompletionTokens) * 1000 / float64(tu.InferenceMsSum); got < 45.6 || got > 45.8 {
+	// 回归：用历史全量的 CompletionTokens 当分子会把速度放大几十倍
+	// （1.13.0 线上实况 3096–20677 tok/s）。分子必须与分母同窗口、同条件累计。
+	if got := float64(tu.InferenceTokensSum) * 1000 / float64(tu.InferenceMsSum); got < 45.6 || got > 45.8 {
 		t.Errorf("avg inference speed=%.2f want ~45.71", got)
 	}
 
@@ -1763,6 +1768,36 @@ func TestRecordTokenUsageTTFBAndInference(t *testing.T) {
 	st, _ = p.Status("u1")
 	if st.TokenUsage.InferenceMsSum != 4700 {
 		t.Errorf("token-less attempt must not enter inference denominator: %+v", st.TokenUsage)
+	}
+	if st.TokenUsage.InferenceTokensSum != 205 {
+		t.Errorf("token-less attempt must not enter inference numerator: %+v", st.TokenUsage)
+	}
+}
+
+// TestRecordTokenUsageOKCount 成功率分子必须与尝试次数在同一次记账里累加：
+// 这是「成功率不可能超过 100%」的结构性保证。用 pool 的 success_count 当分子做不到
+// ——它在「上游刚开流」时就 +1，早于尝试记账（线上实况 662次 | 100.15%）。
+func TestRecordTokenUsageOKCount(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	p.RecordTokenUsage("u1", TokenUsageDelta{OK: true})
+	p.RecordTokenUsage("u1", TokenUsageDelta{OK: true})
+	p.RecordTokenUsage("u1", TokenUsageDelta{}) // 失败尝试：只增 RequestCount
+
+	st, _ := p.Status("u1")
+	tu := st.TokenUsage
+	if tu.RequestCount != 3 || tu.OKCount != 2 {
+		t.Errorf("request/ok=%d/%d want 3/2", tu.RequestCount, tu.OKCount)
+	}
+	if tu.OKCount > tu.RequestCount {
+		t.Errorf("ok_count(%d) 不得超过 request_count(%d)：成功率会超过 100%%", tu.OKCount, tu.RequestCount)
+	}
+	// 与 pool 的 success_count 无关：NoteSuccess 不改 token_usage 的分子
+	p.NoteSuccess("u1")
+	st, _ = p.Status("u1")
+	if st.TokenUsage.OKCount != 2 {
+		t.Errorf("NoteSuccess 不得改动 ok_count：%+v", st.TokenUsage)
 	}
 }
 
@@ -1816,6 +1851,108 @@ func TestTokenUsagePersistsAcrossReload(t *testing.T) {
 	}
 	if strings.Contains(string(raw), "AccessToken") || strings.Contains(string(raw), "RefreshToken") {
 		t.Fatalf("state.json contains credential field: %s", raw)
+	}
+}
+
+// TestStateMigrationV1ToV2 stateFileVersion 1→2 的一次性迁移：
+//   - inference_ms_sum 有值但 inference_tokens_sum 为空 → 分母作废（1.13.0 的错配口径）
+//   - ok_count 为空但有尝试次数 → 用 success_count 补种，并按尝试次数封顶（保证 ≤100%）
+//   - 迁移只跑一次：版本升到 2 之后，合法的 0 值不会被再次改写
+func TestStateMigrationV1ToV2(t *testing.T) {
+	dir := t.TempDir()
+	fp := filepath.Join(dir, "state.json")
+
+	// 先用真实代码造一份文件，再退化成 v1 形态（避免手写 schema 与实现漂移）
+	p := New(fp)
+	p.Add(&auth.Auth{UID: "u1"})
+	for i := 0; i < 3; i++ {
+		p.RecordTokenUsage("u1", TokenUsageDelta{
+			OK: true, HasCompletionTokens: true, CompletionTokens: 100, HasLatencyMs: true, LatencyMs: 2000,
+		})
+	}
+	p.NoteSuccess("u1")
+	p.NoteSuccess("u1")
+	p.Flush()
+
+	raw, err := os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "version") // v1 文件没有版本字段
+	acct := m["accounts"].(map[string]any)["u1"].(map[string]any)
+	tu := acct["token_usage"].(map[string]any)
+	delete(tu, "ok_count")
+	delete(tu, "inference_tokens_sum")
+	tu["inference_ms_sum"] = float64(171205) // 1.13.0 遗留：分母有值、分子不存在
+	tu["request_count"] = float64(662)
+	tu["completion_tokens"] = float64(530132)
+	degraded, err := json.Marshal(m)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(fp, degraded, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	p2 := New(fp)
+	p2.Add(&auth.Auth{UID: "u1"})
+	st, _ := p2.Status("u1")
+	got := st.TokenUsage
+	if got.InferenceMsSum != 0 {
+		t.Errorf("inference_ms_sum=%d want 0（1.13.0 的错配分母作废）", got.InferenceMsSum)
+	}
+	if got.OKCount != 2 {
+		t.Errorf("ok_count=%d want 2（按 success_count 补种）", got.OKCount)
+	}
+	if got.RequestCount != 662 || got.CompletionTokens != 530132 {
+		t.Errorf("迁移不得改动其它统计: %+v", got)
+	}
+	if got.OKCount > got.RequestCount {
+		t.Error("补种后 ok_count 仍不得超过 request_count")
+	}
+
+	// 补种封顶：success_count 大于尝试次数时不得超过尝试次数
+	tu["request_count"] = float64(1)
+	degraded, _ = json.Marshal(m)
+	_ = os.WriteFile(fp, degraded, 0o600)
+	p3 := New(fp)
+	p3.Add(&auth.Auth{UID: "u1"})
+	st, _ = p3.Status("u1")
+	if st.TokenUsage.OKCount != 1 {
+		t.Errorf("ok_count=%d want 1（封顶到 request_count）", st.TokenUsage.OKCount)
+	}
+
+	// 迁移只跑一次：落盘后版本为 2，即使 ok_count 合法地等于 0 也不会被重新补种
+	// （Flush 幂等：无变更不写盘，故先记一次尝试把 dirty 置上）
+	p2.RecordTokenUsage("u1", TokenUsageDelta{OK: true})
+	p2.Flush()
+	raw, err = os.ReadFile(fp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"version": 2`) && !strings.Contains(string(raw), `"version":2`) {
+		t.Fatalf("落盘未写入版本号: %s", raw)
+	}
+	var m2 map[string]any
+	if err := json.Unmarshal(raw, &m2); err != nil {
+		t.Fatal(err)
+	}
+	acct2 := m2["accounts"].(map[string]any)["u1"].(map[string]any)
+	tu2 := acct2["token_usage"].(map[string]any)
+	tu2["ok_count"] = float64(0)
+	v2, _ := json.Marshal(m2)
+	if err := os.WriteFile(fp, v2, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	p4 := New(fp)
+	p4.Add(&auth.Auth{UID: "u1"})
+	st, _ = p4.Status("u1")
+	if st.TokenUsage.OKCount != 0 {
+		t.Errorf("ok_count=%d want 0（v2 文件不得再跑迁移）", st.TokenUsage.OKCount)
 	}
 }
 

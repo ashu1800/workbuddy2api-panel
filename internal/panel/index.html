@@ -336,6 +336,8 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
 .acc .mark { width: 3px; min-width: 3px; padding: 0; }
 .acc .mark i { display: block; width: 3px; height: 100%; min-height: 36px; background: var(--seg-color, var(--ok-mark)); }
 .acc tbody tr.cool .mark i { background: var(--warn-mark); }
+/* 账号级正常但有模型受限（限流/待重探）：左色条同样转琥珀，避免「绿条 + 异常标签」打架 */
+.acc tbody tr.rl .mark i { background: var(--warn-mark); }
 .acc tbody tr.off .mark i { background: var(--bad-mark); }
 /* 模型表无色条（健康指示只属于账号表） */
 .acc.md .mark { display: none; }
@@ -380,6 +382,15 @@ th.num, td.num { text-align: right; }
 .calls-cell .calls-n b { font-weight: 600; }
 .calls-cell .calls-n em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
 .calls-cell .sep { margin: 0 var(--sp-1); color: var(--ink-faint); }
+/* 账号表：除「账号」列外，列标题与列内容一律居中。
+   用 #view-accounts 限定作用域，不影响其它表格的右对齐数字列（.num 的全局右对齐
+   在这里被覆盖）。限流条保持整行宽度（-webkit-line-clamp 需要确定宽度才能正确
+   截两行），只把文字居中；积分条用 margin auto 居中。 */
+#view-accounts .acc th, #view-accounts .acc td { text-align: center; }
+#view-accounts .acc th:nth-child(2), #view-accounts .acc td:nth-child(2) { text-align: left; }
+#view-accounts .acc .rate-limit { text-align: center; }
+#view-accounts .acc .cred .bar { margin-left: auto; margin-right: auto; }
+#view-accounts .acc td.acts { justify-content: center; }
 .usage-line {
   display: inline-flex; align-items: center; gap: var(--sp-1); max-width: 100%;
   font: 600 var(--fs-11)/1.25 var(--mono); font-variant-numeric: tabular-nums; white-space: nowrap;

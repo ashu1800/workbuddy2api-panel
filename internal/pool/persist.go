@@ -126,19 +126,48 @@ func (p *Pool) load() {
 	if json.Unmarshal(raw, &sf) != nil {
 		return
 	}
-	p.applyAccountsLocked(sf.Accounts)
+	p.applyAccountsLocked(sf.Accounts, sf.Version)
 }
 
 // applyAccountsLocked 用持久化账号状态覆盖/插入 byUID（placeholder 凭证，Add 时换全）。
 // 本地 load() 与 Redis 快照恢复共用；调用方必须已持有 p.mu。
-func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
+// fromVersion 是被恢复文件的 stateFileVersion：小于当前版本时跑一次性迁移。
+func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount, fromVersion int) {
 	now := time.Now()
+	legacy := fromVersion < stateFileVersion
+	inferRepaired := 0
+	okSeeded := 0
 	for uid, s := range accounts {
 		// err_total 优先；旧文件的 err_count（连续错误）作一次性迁移源映射进来（二者取较大者，
 		// 尽最大可能保留历史观测信号——旧语义下 err_count 也真实发生过错误，不应丢）。
 		errTotal := s.ErrTotal
 		if int64(s.ErrCount) > errTotal {
 			errTotal = int64(s.ErrCount)
+		}
+		// 推理累计口径修复（stateFileVersion 1 → 2）：1.13.0 的分母 inference_ms_sum
+		// 只累计新样本，分子却取账号历史全量的 completion_tokens，比值被放大几十倍
+		// （线上实测 3096–20677 tok/s）。1.13.1 起分子改为同窗口的 inference_tokens_sum，
+		// 故把「只有分母、没有分子」的旧数据清零——那批 ms 从未产出过可用值。
+		tu := s.TokenUsage
+		if legacy && tu.InferenceMsSum > 0 && tu.InferenceTokensSum == 0 {
+			tu.InferenceMsSum = 0
+			inferRepaired++
+		}
+		// 成功率分子补种（同一迁移）：ok_count 是本版本才开始按「尝试最终结果」配对的
+		// 计数器，老数据里没有。留 0 会让成功率长期显示 0%（分母是历史全量尝试）。
+		// 用池的 success_count 作一次性估计并按尝试次数封顶——保证 ≤100%，之后随新
+		// 样本自行收敛到精确值。修好后 ok_count 会随每次尝试增长，不会再次为空，
+		// 加上版本闸门，这段迁移不会重复改写真实数据。
+		if legacy && tu.OKCount == 0 && tu.RequestCount > 0 {
+			seed := s.SuccessCount
+			if seed > tu.RequestCount {
+				seed = tu.RequestCount
+			}
+			if seed < 0 {
+				seed = 0
+			}
+			tu.OKCount = seed
+			okSeeded++
 		}
 		e := &entry{
 			a:                        &auth.Auth{UID: uid}, // placeholder，Add 时会换成完整凭证
@@ -156,7 +185,7 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 			lastErr:                  s.LastErr,
 			lastSuccess:              s.LastSuccess,
 			lastCheckinDay:           s.LastCheckinDay,
-			tokenUsage:               s.TokenUsage,
+			tokenUsage:               tu,
 			softStreak:               s.SoftStreak,
 			sessionDeadFails:         s.SessionDeadFails,
 			consecutiveFails:         s.ConsecutiveFails,
@@ -212,6 +241,10 @@ func (p *Pool) applyAccountsLocked(accounts map[string]stateAccount) {
 		}
 		p.byUID[uid] = e
 	}
+	if inferRepaired > 0 || okSeeded > 0 {
+		log.Printf("pool: state.json 迁移 v%d→v%d：重置 %d 个账号的推理累计口径、补种 %d 个账号的成功率分子",
+			fromVersion, stateFileVersion, inferRepaired, okSeeded)
+	}
 }
 
 // applySnapshotLocked 用 Redis 快照覆盖内存状态（已在择新判定后采用）。调用方必须已持有 p.mu。
@@ -225,7 +258,7 @@ func (p *Pool) adoptSnapshot(s snapshot) {
 }
 func (p *Pool) applySnapshotLocked(s snapshot) {
 	p.byUID = map[string]*entry{}
-	p.applyAccountsLocked(s.Accounts)
+	p.applyAccountsLocked(s.Accounts, s.Version)
 }
 func (p *Pool) saveLocked() {
 	if p.stateFp == "" {
@@ -280,7 +313,7 @@ func (p *Pool) notePersistFail(err error) {
 // stateOverviewLocked 收集当前内存状态为 stateFile（供落盘 + 快照镜像复用）。调用方必须已持 p.mu。
 func (p *Pool) stateOverviewLocked() stateFile {
 	now := time.Now()
-	sf := stateFile{Accounts: map[string]stateAccount{}}
+	sf := stateFile{Version: stateFileVersion, Accounts: map[string]stateAccount{}}
 	for uid, e := range p.byUID {
 		s := stateAccount{
 			Credits:                  e.credits,

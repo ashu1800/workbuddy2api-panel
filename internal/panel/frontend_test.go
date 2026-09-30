@@ -460,15 +460,33 @@ func TestAppJSAvgPerf(t *testing.T) {
 		t.Fatal("avgTTFB slice not found in app.js")
 	}
 	script := text[start:end] + `
+const tagOf = o => o.cls + '|' + o.tone + '|' + o.label + '|' + (o.title ? 'T' : '-');
 console.log(JSON.stringify({
   ttfb: avgTTFB({ ttfb_sum_ms: 1200, ttfb_count: 3 }),
   ttfbNone: avgTTFB({ ttfb_sum_ms: 0, ttfb_count: 0 }),
   ttfbMissing: avgTTFB({}),
   ttfbNull: avgTTFB(null),
-  rate: avgInferenceRate({ completion_tokens: 1000, inference_ms_sum: 2000 }),
-  rateNone: avgInferenceRate({ completion_tokens: 1000, inference_ms_sum: 0 }),
+  rate: avgInferenceRate({ inference_tokens_sum: 1000, inference_ms_sum: 2000 }),
+  rateNone: avgInferenceRate({ inference_tokens_sum: 1000, inference_ms_sum: 0 }),
   rateMissing: avgInferenceRate({}),
   rateNull: avgInferenceRate(null),
+  okRate: okRateOf({ request_count: 1771, ok_count: 1768 }),
+  okFull: okRateOf({ request_count: 10, ok_count: 10 }),
+  okZero: okRateOf({ request_count: 10, ok_count: 0 }),
+  okNoField: okRateOf({ request_count: 10 }),
+  okNoAttempts: okRateOf({ request_count: 0, ok_count: 0 }),
+  okNull: okRateOf(null),
+  tagOk: tagOf(statusTagOf({}, '', [])),
+  tagOff: tagOf(statusTagOf({ disabled: true }, '', [])),
+  tagCool: tagOf(statusTagOf({}, '限流冷却 · 14分02秒', [])),
+  tagLimited1: tagOf(statusTagOf({}, '', [{ model: 'm1', kind: 'rate_limit', detail: '预计 X 解封' }])),
+  tagLimited2: tagOf(statusTagOf({}, '', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }, { model: 'm2', kind: 'rate_limit', detail: 'd2' }])),
+  tagUnavail: tagOf(statusTagOf({}, '', [{ model: 'm1', kind: 'model_unavailable', detail: '等待重新探测' }])),
+  tagMixed: tagOf(statusTagOf({}, '', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }, { model: 'm2', kind: 'model_unavailable', detail: 'd2' }])),
+  tagDisabledWins: tagOf(statusTagOf({ disabled: true }, '', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }])),
+  tagCoolWins: tagOf(statusTagOf({}, '熔断 · 1分', [{ model: 'm1', kind: 'rate_limit', detail: 'd1' }])),
+  tagTitle: statusTagOf({}, '', [{ model: 'MODELX', kind: 'rate_limit', detail: 'DETAILY' }]).title.indexOf('MODELX') >= 0
+    && statusTagOf({}, '', [{ model: 'MODELX', kind: 'rate_limit', detail: 'DETAILY' }]).title.indexOf('DETAILY') >= 0,
 }));`
 	f, err := os.CreateTemp(t.TempDir(), "avg-*.cjs")
 	if err != nil {
@@ -482,7 +500,13 @@ console.log(JSON.stringify({
 	if err != nil {
 		t.Fatalf("avg perf node check failed: %v\n%s", err, out)
 	}
-	const want = `{"ttfb":400,"ttfbNone":null,"ttfbMissing":null,"ttfbNull":null,"rate":500,"rateNone":null,"rateMissing":null,"rateNull":null}`
+	const want = `{"ttfb":400,"ttfbNone":null,"ttfbMissing":null,"ttfbNull":null,` +
+		`"rate":500,"rateNone":null,"rateMissing":null,"rateNull":null,` +
+		`"okRate":99.83060417843026,"okFull":100,"okZero":0,"okNoField":null,"okNoAttempts":null,"okNull":null,` +
+		`"tagOk":"|ok|可用|-","tagOff":"off|bad|已禁用|-","tagCool":"cool|warn|限流冷却 · 14分02秒|-",` +
+		`"tagLimited1":"rl|warn|限流|T","tagLimited2":"rl|warn|限流 · 2 个模型|T",` +
+		`"tagUnavail":"rl|warn|待重探|T","tagMixed":"rl|warn|异常 · 2 个模型|T",` +
+		`"tagDisabledWins":"off|bad|已禁用|-","tagCoolWins":"cool|warn|熔断 · 1分|-","tagTitle":true}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("avg perf=%s want %s", strings.TrimSpace(string(out)), want)
 	}

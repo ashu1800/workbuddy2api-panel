@@ -274,8 +274,10 @@ go((location.hash || '#accounts').slice(1) in TITLES ? (location.hash || '#accou
    state.json 的原始计数器，派生值不进那个结构体。
    · 首字 = ttfb_sum_ms / ttfb_count。样本 = 观测到首字的尝试（流式），
      非流式请求没有首字概念、不计入，所以这个均值天然只反映流式体验。
-   · 推理 = 累计 completion_tokens ÷ 累计生成耗时。分母已扣掉首字等待，
-     且与分子同一样本集合（后端只在拿到 completion_tokens 时才累计生成耗时）。
+   · 推理 = 累计 inference_tokens_sum ÷ 累计 inference_ms_sum。分子分母同窗口、
+     同条件累计（后端在同一个分支里同时加），分母已扣掉首字等待。
+     注意不能用 completion_tokens 当分子：那是账号历史全量，而 ms 只覆盖新样本，
+      窗口不一致会把速度放大几十倍（1.13.0 的线上实况：3096–20677 tok/s）。
    两者都返回 null 表示「无样本」，由调用方决定渲染成 —。 */
 function avgTTFB(tu) {
   const n = (tu && tu.ttfb_count) || 0;
@@ -284,7 +286,44 @@ function avgTTFB(tu) {
 
 function avgInferenceRate(tu) {
   const ms = (tu && tu.inference_ms_sum) || 0;
-  return ms > 0 ? ((tu.completion_tokens || 0) * 1000 / ms) : null;
+  return ms > 0 ? ((tu.inference_tokens_sum || 0) * 1000 / ms) : null;
+}
+
+/* okRateOf 成功率 = ok_count ÷ request_count（百分数）。后端在同一次加锁内、按同一个
+   事件（一次尝试的最终结果）同时累加这两个计数器，故恒有 ok <= req——成功率在结构上
+   不可能超过 100%。
+   不能用池的 success_count 当分子：它在「上游 2xx 刚开流」时就 +1，比尝试记账早整个
+   流式时长，面板轮询必然采到「成功已加、尝试未加」的中间态（线上实况 662次 | 100.15%），
+   而且空流/断连/error 帧这些最终失败的调用也已计入其中。
+   字段缺失（新面板 + 旧后端）返回 null，由调用方渲染成 —，而不是把 0 当成「零成功」。 */
+function okRateOf(tu) {
+  const req = (tu && tu.request_count) || 0;
+  if (typeof (tu && tu.ok_count) !== 'number' || req <= 0) return null;
+  return tu.ok_count / req * 100;
+}
+
+/* statusTagOf 账号状态结论（纯函数，便于测试）：优先级 = 账号级状态 > 模型级受限 > 可用。
+   账号自身可能既没冷却也没熔断，却已经有模型在限流或待重探——这时只显示「可用」会
+   让人以为它完全健康（实测：标签写着可用，下面挂着「预计 10-01 11:14 解封」的琥珀条）。
+   coolText 由调用方格式化（本函数不依赖 dur）；rlMetas 是 rateLimitMeta 的结果数组。
+   返回 {cls, tone, label, title}：cls 供行级样式（左色条），tone 是标签语义色。 */
+function statusTagOf(s, coolText, rlMetas) {
+  if (s.disabled) return { cls: 'off', tone: 'bad', label: '已禁用', title: '' };
+  if (coolText) return { cls: 'cool', tone: 'warn', label: coolText, title: '' };
+  const rl = rlMetas || [];
+  if (rl.length) {
+    const unavail = rl.filter(m => m.kind === 'model_unavailable').length;
+    const limited = rl.length - unavail;
+    // 同质时给出具体状态，混杂时统称异常——两者都要求悬浮能看到具体原因
+    const label = limited && unavail ? '异常' : (unavail ? '待重探' : '限流');
+    return {
+      cls: 'rl',
+      tone: 'warn',
+      label: label + (rl.length > 1 ? ' · ' + rl.length + ' 个模型' : ''),
+      title: rl.length + ' 个模型受限：\n' + rl.map(m => '· ' + m.model + '：' + m.detail).join('\n'),
+    };
+  }
+  return { cls: '', tone: 'ok', label: '可用', title: '' };
 }
 
 function renderAccounts(list) {
@@ -296,19 +335,24 @@ function renderAccounts(list) {
   // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
   const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
   tb.innerHTML = list.map(s => {
-    const bl = (new Date(s.breaker_until || 0) - Date.now()) / 1000;
-    const dg = (new Date(s.degrade_until || 0) - Date.now()) / 1000;
+    const now = Date.now();
+    const bl = (new Date(s.breaker_until || 0) - now) / 1000;
+    const dg = (new Date(s.degrade_until || 0) - now) / 1000;
     const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
-    let cls = '', tag;
-    if (s.disabled) { cls = 'off'; tag = '<span class="tag bad">已禁用</span>'; }
-    else if (cool > 0) {
-      cls = 'cool';
-      const kind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-        : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
-      tag = '<span class="tag warn">' + kind + ' · ' + dur(cool) + '</span>';
-    } else tag = '<span class="tag ok">可用</span>' + (s.in_flight ? '' : '');
+    // 模型级受限（限流 / 待重探）。账号自身可能既没冷却也没熔断，却已有模型不可用——
+    // 这时只显示「可用」会让人以为它完全健康（实测：标签写着可用，下面挂着
+    // 「预计 10-01 11:14 解封」的琥珀条）。
+    const rl = Array.isArray(s.rate_limited_models) ? s.rate_limited_models.filter(m => m && m.model) : [];
+    const rlMetas = rl.map(m => rateLimitMeta(m, now));
+    // 账号级冷却文案（kind 判定沿用原逻辑），与模型级受限一起交给 statusTagOf 定结论
+    const coolKind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+      : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
+    const st = statusTagOf(s, cool > 0 ? coolKind + ' · ' + dur(cool) : '', rlMetas);
+    const cls = st.cls;
+    const tag = '<span class="tag ' + st.tone + '"' +
+      (st.title ? ' title="' + esc(st.title) + '"' : '') + '>' + esc(st.label) + '</span>';
     const note = s.reason ? '<div class="note fs-12 mt-1">' + esc(s.reason) + '</div>' : '';
-    const rateLimits = rateLimitRowsHtml(s.rate_limited_models, Date.now());
+    const rateLimits = rateLimitRowsHtml(rl, now);
     const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
     const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
     const pct = s.credits_total > 0
@@ -328,15 +372,14 @@ function renderAccounts(list) {
     const totalTok = formatTokenCount(tu.total_tokens);
     const totalTokUnit = totalTok === '—' ? '' : '<em>tok</em>';
     const latency = formatLatency(tu.last_latency_ms);
-    // 成功率分母 = 实际尝试次数（含重试与中断），与「调用次数」同源，口径一致。
-    // 尝试次数 / 成功 / 失败 是三个独立计数器：客户端中断的尝试既不成功也不计失败，
-    // 所以尝试次数可能大于 成功+失败（例：1768+0 对应 1771 次尝试）。
-    const okCount = s.success_count || 0;
-    const errCount = s.err_total || 0;
-    const okRate = req > 0 ? okCount / req * 100 : null;
+    // 成功率 = ok_count ÷ request_count（见 okRateOf 的口径说明）。
+    const okCount = typeof tu.ok_count === 'number' ? tu.ok_count : null;
+    const okRate = okRateOf(tu);
     const rateCls = okRate == null ? 'c-muted' : (okRate >= 99 ? 'c-ok' : (okRate >= 95 ? 'c-warn' : 'c-bad'));
-    const callsTitle = '尝试 ' + req + ' 次（含重试与中断）\n成功 ' + okCount + ' / 失败 ' + errCount +
-      '\n成功率 = 成功 ÷ 尝试次数';
+    const callsTitle = okRate == null
+      ? '尝试 ' + req + ' 次（成功率需 1.13.1 起的数据）'
+      : '尝试 ' + req + ' 次 / 成功 ' + okCount + ' / 失败 ' + (req - okCount) +
+        '\n成功率 = 成功 ÷ 尝试次数（两者同一次记账，故不会超过 100%）';
     const ttfb = avgTTFB(tu);
     const infer = avgInferenceRate(tu);
     const usageTitle = '累计 ' + totalTok + ' token / 尝试 ' + req + ' 次' +

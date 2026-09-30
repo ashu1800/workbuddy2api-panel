@@ -34,7 +34,16 @@ func (k CoolKind) String() string {
 // 首字/推理速度按「累计平均」暴露原始计数器，面板据此算平均值——派生字段不放在
 // 这里，因为本结构体会原样落盘 state.json。
 type TokenUsage struct {
-	RequestCount        int64     `json:"request_count,omitempty"`
+	RequestCount int64 `json:"request_count,omitempty"`
+	// OKCount 成功完成的尝试数。它与 RequestCount 在同一次加锁内、按同一个事件
+	// （一次尝试的最终结果）记账，因此恒有 OKCount <= RequestCount——成功率在结构上
+	// 就不可能超过 100%。
+	//
+	// 不能用池的 success_count 当分子：那个计数器在「上游 2xx 刚开流」时就 +1
+	// （handler 的 NoteSuccess），比尝试记账早整个流式时长，面板轮询必然采到
+	// 「成功已加、尝试未加」的中间态（线上实况 662次 | 100.15%）；而且空流、
+	// 客户端断连、error 帧这些最终失败的调用也已经被计入成功。
+	OKCount             int64     `json:"ok_count,omitempty"`
 	UsageCount          int64     `json:"usage_count,omitempty"`
 	PromptTokens        int64     `json:"prompt_tokens,omitempty"`
 	CompletionTokens    int64     `json:"completion_tokens,omitempty"`
@@ -49,6 +58,11 @@ type TokenUsage struct {
 	TTFBSumMs      int64 `json:"ttfb_sum_ms,omitempty"`
 	TTFBCount      int64 `json:"ttfb_count,omitempty"`
 	InferenceMsSum int64 `json:"inference_ms_sum,omitempty"`
+	// InferenceTokensSum 与 InferenceMsSum 必须成对：同窗口、同条件累计。
+	// 不能用 CompletionTokens 当分子——那是账号历史全量，而 MsSum 只覆盖本字段
+	// 开始累计之后的样本，两者窗口不一致会把速度放大几十倍（1.13.0 的线上实况：
+	// 530k 历史 token ÷ 171s 新时间 = 3096 tok/s）。
+	InferenceTokensSum int64 `json:"inference_tokens_sum,omitempty"`
 	// LastTTFBMs 最近一次首字耗时，仅供工具提示与「最近一次」对照。
 	LastTTFBMs int64 `json:"last_ttfb_ms,omitempty"`
 }
@@ -71,6 +85,9 @@ type TokenUsageDelta struct {
 	// 非流式（sync）与失败尝试没有首字概念，保持 false。
 	HasTTFBMs bool
 	TTFBMs    int64
+	// OK 本次尝试是否成功完成（上游正常返回且流/响应完整）。
+	// 由 handler 在调用点按已知结果填入，与 RequestCount 一起记账。
+	OK bool
 }
 
 // Status 单个账号对外暴露的状态（脱敏）。
@@ -494,9 +511,17 @@ type stateModelCost struct {
 }
 
 // stateFile 持久化格式。
+// Version 用于一次性迁移：老文件（缺字段）写进来的 Version 为 0，恢复时据此跑迁移，
+// 落盘后即为当前版本，迁移不会再跑第二遍——否则「合法地等于 0」与「字段尚不存在」
+// 无法区分，会在每次重启时重复改写真实数据。
 type stateFile struct {
+	Version  int                     `json:"version,omitempty"`
 	Accounts map[string]stateAccount `json:"accounts"`
 }
+
+// stateFileVersion 当前持久化格式版本。改动语义需要一次性迁移时 +1。
+//   1 → 2：TokenUsage 增加 ok_count / inference_tokens_sum 的配对口径迁移。
+const stateFileVersion = 2
 
 // flushInterval 后台落盘周期。
 const (

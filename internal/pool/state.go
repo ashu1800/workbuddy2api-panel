@@ -247,6 +247,9 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	}
 	usage := &e.tokenUsage
 	usage.RequestCount++
+	if delta.OK {
+		usage.OKCount++
+	}
 	usage.LastUsedAt = time.Now()
 	if delta.Model != "" {
 		usage.LastModel = delta.Model
@@ -279,8 +282,9 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 	if delta.HasLatencyMs && delta.LatencyMs >= 0 {
 		usage.LastLatencyMs = delta.LatencyMs
 		// 生成耗时 = 总耗时 − 首字等待，供面板算「推理速度」的累计平均。
-		// 只在同时拿到 completion_tokens 时累计，保证与 usage.CompletionTokens
-		// 的样本集合一致——否则分母会混入没有 token 的样本，把速度压低。
+		// 分子 InferenceTokensSum 必须在这里、用同一条件累计，与分母成对：
+		// 改用 usage.CompletionTokens 会把「账号历史全量 token」除以「本字段开始
+		// 累计之后的时间」，比值放大几十倍（1.13.0 的线上实况：3096–20677 tok/s）。
 		// 首字未知（非流式、失败）或首字 >= 总耗时（时钟粒度/异常上游）时按总耗时
 		// 计：宁可把等待算进去，也不能让分母趋近 0 而算出天文速度把累计均值带偏。
 		// 减法只在 TTFBMs < inferMs 时发生，故结果恒 >= 1ms，无需再钳位。
@@ -290,6 +294,7 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 				inferMs -= delta.TTFBMs
 			}
 			usage.InferenceMsSum += inferMs
+			usage.InferenceTokensSum += delta.CompletionTokens
 		}
 	}
 	if delta.HasTokensPerSecond && delta.TokensPerSecond >= 0 {
