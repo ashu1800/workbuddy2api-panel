@@ -234,7 +234,9 @@ $('btnKey').onclick = async () => {
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
-const TITLES = { accounts: '账号池', usage: '用量', packages: '积分构成', taskscenter: '任务中心', models: '模型与档位', config: '配置', logs: '运行日志' };
+/* 视图标题：导航与顶栏共用，统一 4 字（导航栏宽度固定 216px，标题长度一致
+   才能让 7 个条目左对齐成一条竖线）。 */
+const TITLES = { accounts: '账号管理', usage: '用量统计', packages: '积分构成', taskscenter: '任务中心', models: '模型档位', config: '系统配置', logs: '运行日志' };
 /* skeletonRow 表格骨架行：加载态给形状不给文字，避免"正在查询…"把表格塌成一行。 */
 function skeletonRows(cols, n) {
   const w = ['w-1', 'w-2', 'w-3'];

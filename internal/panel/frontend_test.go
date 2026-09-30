@@ -418,6 +418,28 @@ func TestAppJSNoStaticInlineStyle(t *testing.T) {
 	}
 }
 
+// TestNavTitlesAreFourChars 左侧导航标题统一 4 个字：标题长度一致，7 个条目才能
+// 在固定宽度的侧栏里左对齐成一条竖线（长短不一会让文字起始位置参差）。新增视图
+// 时若标题不是 4 字，这里会失败——请改标题而不是放宽断言。
+func TestNavTitlesAreFourChars(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	re := regexp.MustCompile(`(?s)<a href="#[^"]+" data-view="[^"]+"[^>]*>.*?</svg>\s*([^<]+)</a>`)
+	items := re.FindAllStringSubmatch(body, -1)
+	if len(items) != 7 {
+		t.Fatalf("expected 7 nav items, got %d", len(items))
+	}
+	for _, m := range items {
+		label := strings.TrimSpace(m[1])
+		if n := len([]rune(label)); n != 4 {
+			t.Errorf("nav title %q is %d chars, want exactly 4", label, n)
+		}
+	}
+}
+
 // TestIndexDialogsAccessible 四个弹层必须是可被读屏识别的 dialog，并带标签：
 // 重构前它们只是 div + class，键盘用户既看不到焦点也无法用 Esc 退出。
 func TestIndexDialogsAccessible(t *testing.T) {
