@@ -38,7 +38,13 @@ import (
 // 面板按功能重写到本 fork 的设计系统上：模型锁池表、缓存命中率、调用来源 IP/UA、
 // 时间范围控件、暂停/恢复选号入口、配置表单补 credit_floor 与 include_disabled_in_tasks、
 // 积分构成排序切换；同时保留本 fork 的视觉重构、自然日口径、账号表新增列与用量列 7.10M 格式。
-const appVersion = "1.14.0-panel"
+//
+// 1.15.0-panel：账号池**实时推送**。账号管理视图不再 5 秒轮询整表重渲染——服务端每秒比对
+// 一次账号池快照，经同源 WebSocket（internal/wsx 手写最小 RFC6455 服务端 + internal/panel
+// 的 live hub）只推变化字段（一次性票据鉴权、无订阅者零 tick、60 秒兜底全量、慢客户端断开），
+// 前端按 data-uid 定位行、只写变化的单元格（变化值短暂高亮）；WS 不可用时自动回落 5 秒轮询，
+// 侧栏徽标显示「实时 / 轮询」。不新增第三方依赖、不新增配置键、不改 /panel/api/overview。
+const appVersion = "1.15.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

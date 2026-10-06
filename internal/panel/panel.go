@@ -90,6 +90,10 @@ type Panel struct {
 	// 任务中心执行队列（taskcenter.go）。
 	queueOnce sync.Once
 	q         *queueState
+
+	// hub 账号池实时推送中枢（live.go）：订阅者集合 + 变化检测 ticker + 票据池。
+	// 无订阅者时不跑任何 goroutine（首个订阅者启动、最后一个停止）。
+	hub *liveHub
 }
 
 // tryLockAccount 尝试锁定账号的任务执行；已在执行返回 false。
@@ -139,6 +143,7 @@ func New(cfg Config) *Panel {
 		logs:    NewRing(500),
 		logins:  map[string]loginSession{},
 	}
+	p.hub = newLiveHub(p)
 	p.routes()
 	return p
 }
@@ -150,6 +155,11 @@ func (p *Panel) routes() {
 	p.mux.HandleFunc("GET /panel/{$}", p.index)
 	p.mux.HandleFunc("GET /panel/app.js", p.appScript)
 	p.mux.HandleFunc("GET /panel/api/overview", p.withAuth(p.overview))
+	// 实时推送（live.go）：取票走 withAuth（Bearer），升级走一次性票据。
+	// /panel/api/live 故意**不**包 withAuth：浏览器 WebSocket API 不能自定义
+	// 请求头，Authorization 根本发不出去；鉴权在 handler 内部、upgrade 之前完成。
+	p.mux.HandleFunc("GET /panel/api/live/ticket", p.withAuth(p.liveTicket))
+	p.mux.HandleFunc("GET /panel/api/live", p.live)
 	p.mux.HandleFunc("GET /panel/api/logs", p.withAuth(p.logsHandler))
 	p.mux.HandleFunc("GET /panel/api/request_metrics", p.withAuth(p.requestMetrics))
 	p.mux.HandleFunc("GET /panel/api/request_logs", p.withAuth(p.requestLogs))
@@ -229,6 +239,12 @@ func (p *Panel) expiringSoonWindow() time.Duration {
 // ---------------------------------------------------------------------------
 
 // overview 总览：池计数 + 每账号状态 + 面板元信息。
+// 载荷构建已抽到 overviewPayload（HTTP 轮询与 WS 实时推送必须同源，否则
+// "先拉一次 HTTP、再吃 WS 增量"的前端会立刻自相矛盾）。
+func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
+	writeJSON(w, http.StatusOK, p.overviewPayload())
+}
+
 // overviewAccount 账号状态 + 今日用量。
 // 账号表的「今日调用 / 今日用量 / 成功率」按**自然日**显示，数据取自用量记录器的
 // 今天窗口（与「用量统计 → 今天」同源同口径），而不是 pool.TokenUsage——后者是
@@ -265,7 +281,10 @@ func mergeTodayUsage(accts []pool.Status, byUID map[string]usage.KeyedAgg, day s
 	return out
 }
 
-func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
+// overviewPayload 构建总览载荷（即 /panel/api/overview 的响应结构，字段一字不改）。
+// HTTP 轮询与 WS 实时推送共用这一份实现：两条路径各写一份必然漂移，而前端正是
+// "先拉一次 HTTP、再吃 WS 增量"的用法，一旦不同源就会自相矛盾。
+func (p *Panel) overviewPayload() map[string]any {
 	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
@@ -280,7 +299,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 			byUID[g.Key] = g
 		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	return map[string]any{
 		"version":         p.cfg.Version,
 		"uptime_sec":      int(time.Since(p.started).Seconds()),
 		"auth_required":   p.apiKey() != "",
@@ -295,7 +314,7 @@ func (p *Panel) overview(w http.ResponseWriter, r *http.Request) {
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
 		// 与 accounts 的账号池视图互补，前端「模型锁池」表直接渲染。无锁时为 null。
 		"model_locks": p.cfg.Pool.ModelLockView(),
-	})
+	}
 }
 
 // logsHandler 返回日志环形缓冲快照（时间升序，含频道标记 chat/task/sys）。

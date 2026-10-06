@@ -4987,3 +4987,1179 @@ func TestIndexExpiryCardHost(t *testing.T) {
 		}
 	}
 }
+
+// ---------------------------------------------------------------------------
+// 实时推送（WebSocket + 只写变化单元格）
+// ---------------------------------------------------------------------------
+
+// liveStubJS 是 TestAppJSLiveClient / TestAppJSLiveNoWebSocket 共用的 node + DOM 桩骨架：
+// 真的把整个 app.js 跑起来（与 TestAppJSPausedAccountsControl 同源思路），只是把 DOM 换成
+// 一套**会记账**的桩：
+//   - 每个 td 的 className / innerHTML / textContent / title / style.setProperty 分别计数：
+//     本次重构的验收标准是「未变化的单元格一个字节都不写」，只有写次数能证明这件事；
+//   - tbody 的 innerHTML 会被解析成 tr/td 节点树（补丁层按 tr[data-uid] / tr[data-mkey]
+//     找行），appendChild 有真实的「移动」语义（重排时节点身份必须不变）；
+//   - setInterval / setTimeout 换成受控定时器：5s 轮询由测试亲手触发，退避重连的每个
+//     延时都能逐个读出来（真等 30s 的重连没法测）。
+//
+// 环境开关：LIVE_WS=0 时沙箱里没有 WebSocket（纯轮询降级路径）；LIVE_KEY=1 时
+// localStorage 预置 api_key（决定连接 URL 带不带 ?ticket=）。
+// 输出只有一行 JSON（console.warn 被收进 warns 数组，不污染 stdout）。
+const liveStubJS = `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const WITH_WS = process.env.LIVE_WS !== '0';
+
+const nodes = {};
+const warns = [];
+const sandboxConsole = { log() {}, info() {}, error() {}, warn(...a) { warns.push(a.map(x => String(x)).join(' ')); } };
+
+/* ── 会记账的节点桩 ───────────────────────────────────────────────── */
+function mkBar(td) {
+  const m = /<i style="--w:([^"]*)"/.exec(td._html || '');
+  const bar = { width: m ? m[1] : null, setProps: 0 };
+  bar.style = { setProperty(k, v) { if (k === '--w') { bar.setProps++; td.writes.style++; bar.width = String(v); } } };
+  return bar;
+}
+
+function mkTd() {
+  const td = {
+    tagName: 'TD', _cls: '', _title: '', _html: '', _text: null, _bar: null, parent: null,
+    writes: { cls: 0, html: 0, text: 0, title: 0, style: 0 },
+    flashAdds: 0, flashRemoves: 0, dataset: {}, children: [],
+    classList: {
+      add(c) { if (c === 'cell-flash') td.flashAdds++; },
+      remove(c) { if (c === 'cell-flash') td.flashRemoves++; },
+      contains() { return false; }, toggle() {},
+    },
+    addEventListener() {}, removeEventListener() {}, appendChild(c) { td.children.push(c); return c; },
+    querySelector(sel) { if (sel !== 'i') return null; if (!td._bar) td._bar = mkBar(td); return td._bar; },
+    querySelectorAll() { return []; }, closest() { return null; }, remove() {}, focus() {}, click() {},
+    setAttribute(k, v) { if (k.indexOf('data-') === 0) td.dataset[k.slice(5)] = String(v); },
+    removeAttribute(k) { if (k === 'title') { td._title = ''; td.writes.title++; } },
+    getAttribute(k) { return k === 'title' ? (td._title || null) : null; },
+  };
+  Object.defineProperty(td, 'className', { get: () => td._cls, set: v => { td._cls = String(v); td.writes.cls++; } });
+  Object.defineProperty(td, 'innerHTML', { get: () => td._html, set: v => { td._html = String(v); td._bar = null; td.writes.html++; } });
+  Object.defineProperty(td, 'textContent', {
+    get: () => (td._text != null ? td._text : String(td._html).replace(/<[^>]*>/g, '')),
+    set: v => { td._text = String(v); td.writes.text++; },
+  });
+  Object.defineProperty(td, 'title', { get: () => td._title, set: v => { td._title = String(v); td.writes.title++; } });
+  return td;
+}
+
+function mkTr() {
+  const tr = {
+    tagName: 'TR', _cls: '', _title: '', children: [], dataset: {}, parent: null, removed: false,
+    writes: { cls: 0, title: 0 },
+    appendChild(c) { c.parent = tr; tr.children.push(c); return c; },
+    querySelectorAll(sel) { return sel === 'td' ? tr.children.filter(c => c.tagName === 'TD') : []; },
+    querySelector() { return null; }, closest() { return null; }, addEventListener() {},
+    remove() { tr.removed = true; if (tr.parent && tr.parent.detach) tr.parent.detach(tr); tr.parent = null; },
+    setAttribute(k, v) { if (k.indexOf('data-') === 0) tr.dataset[k.slice(5)] = String(v); },
+    removeAttribute() {}, getAttribute(k) { return k.indexOf('data-') === 0 ? (tr.dataset[k.slice(5)] || null) : null; },
+  };
+  Object.defineProperty(tr, 'className', { get: () => tr._cls, set: v => { tr._cls = String(v); tr.writes.cls++; } });
+  Object.defineProperty(tr, 'title', { get: () => tr._title, set: v => { tr._title = String(v); tr.writes.title++; } });
+  return tr;
+}
+
+/* applyAttrs 解析标签属性（class / title / data-*）。解析不是「写入」，计数保持 0。 */
+function applyAttrs(node, attrs) {
+  const re = /([a-zA-Z-]+)="([^"]*)"/g;
+  let m;
+  while ((m = re.exec(attrs))) {
+    const k = m[1], v = m[2];
+    if (k === 'class') node._cls = v;
+    else if (k === 'title') node._title = v;
+    else if (k.indexOf('data-') === 0) node.dataset[k.slice(5)] = v;
+  }
+}
+
+/* parseRows 把 tbody.innerHTML 拆成 tr/td：app.js 的整表渲染只会产出这两种标签
+   （空态也是一个 tr + 一个 td），够用且完全确定。 */
+function parseRows(html, parent) {
+  const rows = [];
+  const res = /<tr([^>]*)>([\s\S]*?)<\/tr>/g;
+  let m;
+  while ((m = res.exec(html))) {
+    const tr = mkTr();
+    applyAttrs(tr, m[1]);
+    const tds = /<td([^>]*)>([\s\S]*?)<\/td>/g;
+    let t;
+    while ((t = tds.exec(m[2]))) {
+      const td = mkTd();
+      applyAttrs(td, t[1]);
+      td._html = t[2];
+      td.parent = tr;
+      tr.children.push(td);
+    }
+    tr.parent = parent || null;
+    rows.push(tr);
+  }
+  return rows;
+}
+
+function mkBody(id) {
+  const body = {
+    id, rows: [], htmlWrites: 0, _html: '',
+    detach(node) { const i = body.rows.indexOf(node); if (i >= 0) body.rows.splice(i, 1); },
+    appendChild(node) { body.detach(node); node.parent = body; body.rows.push(node); return node; },
+    insertBefore(node, ref) {
+      body.detach(node);
+      const i = ref ? body.rows.indexOf(ref) : -1;
+      if (i < 0) body.rows.push(node); else body.rows.splice(i, 0, node);
+      node.parent = body;
+      return node;
+    },
+    querySelectorAll(sel) {
+      if (sel === 'tr[data-uid]') return body.rows.filter(r => r.dataset && r.dataset.uid);
+      if (sel === 'tr[data-mkey]') return body.rows.filter(r => r.dataset && r.dataset.mkey);
+      return [];
+    },
+    querySelector() { return null; }, closest() { return null; },
+    addEventListener(ev, fn) { (this._h || (this._h = {}))[ev] = fn; }, removeEventListener() {},
+    setAttribute() {}, removeAttribute() {}, classList: { add() {}, remove() {}, contains() { return false; } },
+    style: {}, dataset: {},
+  };
+  Object.defineProperty(body, 'innerHTML', {
+    get: () => body._html,
+    set: v => { body._html = String(v); body.htmlWrites++; body.rows = parseRows(String(v), body); },
+  });
+  return body;
+}
+
+function mkEl(id) {
+  const el = {
+    id, innerHTML: '', _text: '', title: '', value: '', checked: false, disabled: false, className: '',
+    hidden: false, dataset: {}, style: {}, children: [], firstElementChild: null, writes: { text: 0 },
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    addEventListener(ev, fn) { (this._h || (this._h = {}))[ev] = fn; },
+    removeEventListener() {},
+    appendChild(c) { this.children.push(c); if (!this.firstElementChild) this.firstElementChild = c; return c; },
+    remove() {}, focus() {}, blur() {}, click() {},
+    setAttribute() {}, removeAttribute() {}, getAttribute() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; }, closest() { return null; },
+    replaceChildren() { this.children = []; this.firstElementChild = null; },
+  };
+  Object.defineProperty(el, 'textContent', { get: () => el._text, set: v => { el._text = String(v); el.writes.text++; } });
+  return el;
+}
+
+const $ = id => (nodes[id] || (nodes[id] = ((id === 'accBody' || id === 'mlBody') ? mkBody(id) : mkEl(id))));
+
+/* ── 受控定时器 ───────────────────────────────────────────────────── */
+const timers = [], intervals = [];
+let timerSeq = 0;
+function fakeSetTimeout(fn, ms) { const t = { id: ++timerSeq, fn: fn, ms: ms, dead: false }; timers.push(t); return t.id; }
+function fakeClearTimeout(id) { for (const t of timers) if (t.id === id) t.dead = true; }
+function fakeSetInterval(fn, ms) { intervals.push({ fn: fn, ms: ms }); return intervals.length; }
+function fakeClearInterval() {}
+const BACKOFF_MS = [1000, 2000, 4000, 8000, 30000];
+const pendingBackoff = () => timers.filter(t => !t.dead && BACKOFF_MS.indexOf(t.ms) >= 0);
+
+/* ── 假 WebSocket ─────────────────────────────────────────────────── */
+const sockets = [];
+const lastSocket = () => (sockets.length ? sockets[sockets.length - 1] : null);
+var WebSocket = function (url) { this.url = String(url); this.readyState = 0; this.closed = false; sockets.push(this); };
+WebSocket.prototype.close = function () { this.readyState = 3; if (!this.closed) { this.closed = true; if (this.onclose) this.onclose({}); } };
+WebSocket.prototype.openFrame = function () { this.readyState = 1; if (this.onopen) this.onopen({}); };
+WebSocket.prototype.frame = function (obj) { if (this.onmessage) this.onmessage({ data: typeof obj === 'string' ? obj : JSON.stringify(obj) }); };
+WebSocket.prototype.drop = function () { this.readyState = 3; if (this.onclose) this.onclose({}); };
+
+/* ── 假后端 ───────────────────────────────────────────────────────── */
+const store = {};
+if (process.env.LIVE_KEY === '1') store['wb2api.key'] = 'test-key';
+const fetchLog = [];
+const payload = { accounts: [], model_locks: null };
+function overviewBody() {
+  return {
+    version: '9.9.9', uptime_sec: 3600, auth_required: true, redis_mode: 'local', sticky_sessions: 0,
+    total: payload.accounts.length, healthy: 1, cooling: 0, disabled: 0, in_flight_full: 0,
+    accounts: payload.accounts, model_locks: payload.model_locks,
+  };
+}
+/* 载荷在 json() 时才构建：fetch 的函数体会在 app.js 顶层 start() 里同步跑到第一个
+   await，若在这里就把 body 拍下来，测试还没赋值账号池就已经定稿了。顺带做一次
+   JSON 往返，避免桩把对象引用直接交给 app.js（真实链路必然是新对象）。 */
+const fetchStub = async (url, opts) => {
+  const u = String(url);
+  fetchLog.push({ url: u, method: (opts && opts.method) || 'GET' });
+  return {
+    status: 200, ok: true,
+    json: async () => {
+      if (u.indexOf('live/ticket') >= 0) return { ticket: 'T-42', expires_in: 30 };
+      if (u.indexOf('overview') >= 0) return JSON.parse(JSON.stringify(overviewBody()));
+      return {};
+    },
+  };
+};
+const overviewFetches = () => fetchLog.filter(c => c.url.indexOf('overview') >= 0).length;
+const ticketFetches = () => fetchLog.filter(c => c.url.indexOf('live/ticket') >= 0).length;
+
+/* ── 沙箱 ─────────────────────────────────────────────────────────── */
+const docHandlers = {}, winHandlers = {};
+const document = {
+  hidden: false,
+  documentElement: mkEl('html'), head: mkEl('head'), body: mkEl('body'),
+  getElementById: $, querySelector: () => null, querySelectorAll: () => [],
+  createElement: tag => {
+    const t = String(tag).toLowerCase();
+    if (t === 'tr') return mkTr();
+    if (t === 'td') return mkTd();
+    return mkEl('created');
+  },
+  contains: () => false, execCommand: () => true, cookie: '',
+  addEventListener(ev, fn) { (docHandlers[ev] || (docHandlers[ev] = [])).push(fn); },
+  removeEventListener() {},
+};
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-28T14:00:00Z');
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const at = s => new RealDate(FIXED + s * 1000).toISOString();
+
+const sandbox = {
+  console: sandboxConsole, JSON, Math, Date: FakeDate, Number, String, Boolean, Object, Array, Promise,
+  Map, Set, RegExp, Error, TypeError, isNaN, isFinite, parseInt, parseFloat,
+  encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+  setTimeout: fakeSetTimeout, clearTimeout: fakeClearTimeout, setInterval: fakeSetInterval, clearInterval: fakeClearInterval,
+  location: { protocol: 'http:', host: 'localhost:1', hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: {
+    getItem: k => (k in store ? store[k] : null),
+    setItem: (k, v) => { store[k] = String(v); },
+    removeItem: k => { delete store[k]; },
+  },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  confirm: () => true, alert() {}, open() {},
+  document: document, fetch: fetchStub,
+  addEventListener(ev, fn) { (winHandlers[ev] || (winHandlers[ev] = [])).push(fn); },
+  removeEventListener() {},
+};
+if (WITH_WS) sandbox.WebSocket = WebSocket;
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__dsh = {' +
+  '\n  live: () => ({ ok: liveOk, boot: liveBoot, rev: liveRev, retry: liveRetry, connected: !!liveWs }),' +
+  '\n  refTimer: () => refTimer,' +
+  '\n  accList: () => accList.map(s => s.uid),' +
+  '\n  accRowKeys: () => Object.keys(accRows),' +
+  '\n};', sandbox, { filename: 'app.js' });
+/* app.js 里的顶层 let/const 挂在沙箱的词法环境上，取不到；这一组 getter 是脚本
+   自己挂到 global 上的观测口（同样的写法见既有测试的 this.__statusTagOf）。 */
+const __dsh = sandbox.__dsh;
+
+/* ── 账号池 / 锁池 fixture（两个场景共用）──────────────────────────── */
+const todayOf = (r, e, t) => ({ day: '2026-09-28', requests: r, errors: e, total_tokens: t });
+const account = (uid, extra) => Object.assign({
+  uid, nickname: '号-' + uid, realm: 'cn', in_flight: 0, checkin_done: false,
+  last_success: '2026-09-28T13:00:00Z',
+  today: todayOf(10, 1, 1000),
+  token_usage: { request_count: 100, ok_count: 99, total_tokens: 5000, last_latency_ms: 1500,
+    ttfb_sum_ms: 1200, ttfb_count: 3, inference_tokens_sum: 1000, inference_ms_sum: 2000 },
+}, extra || {});
+const LOCKS = [
+  { model: 'glm-5.3', realm: 'cn', total: 5, servable: 0, locked: 5, state: 'locked',
+    unlock_at: at(3600), fully_unlock_at: at(9000), reason: '上游 429' },
+  { model: 'gpt-5.2', realm: 'global', total: 3, servable: 2, locked: 1, state: 'partial',
+    unlock_at: at(1800), fully_unlock_at: at(1800) },
+];
+// 第二轮锁池：glm 解锁消失、gpt 两个单元格变化、x-preview 是新行；
+// 摘要从「1 个模型整池不可用」变成「2 个模型部分限流」。
+const LOCKS2 = [
+  { model: 'gpt-5.2', realm: 'global', total: 3, servable: 3, locked: 0, state: 'partial',
+    unlock_at: at(1800), fully_unlock_at: at(1800) },
+  { model: 'x-preview', realm: 'cn', total: 2, servable: 1, locked: 1, state: 'partial' },
+];
+payload.accounts = [
+  account('uid-a', { credits: 10, credits_total: 100, today: todayOf(100, 1, 7100000) }),
+  account('uid-b', { credits: 20, credits_total: 100, today: todayOf(200, 2, 320) }),
+  account('uid-c', { credits: 30, credits_total: 100, today: todayOf(300, 0, 0) }),
+];
+payload.model_locks = LOCKS;
+
+/* ── 断言辅助 ─────────────────────────────────────────────────────── */
+const tick = () => new Promise(r => setTimeout(r, 0));
+const ROW_WRITE_KEYS = ['cls', 'html', 'text', 'title', 'style'];
+function dump(el) {
+  return el.rows.map(r => ({
+    key: r.dataset.uid || r.dataset.mkey || '',
+    rowCls: r.writes.cls,
+    cells: r.children.map(td => ROW_WRITE_KEYS.map(k => td.writes[k])),
+    flash: r.children.map(td => td.flashAdds),
+  }));
+}
+/* delta 按行 key（uid / mkey）对齐，只算**增量**：新增行与 0 比，被删的行不出现。 */
+function delta(before, after) {
+  const base = {};
+  for (const r of before) base[r.key] = r;
+  return after.map(a => {
+    const b = base[a.key] || { rowCls: 0, cells: [], flash: [] };
+    const zero = [0, 0, 0, 0, 0];
+    return {
+      key: a.key,
+      rowCls: a.rowCls - (b.rowCls || 0),
+      cells: a.cells.map((c, j) => {
+        const o = b.cells[j] || zero;
+        return c.reduce((x, y) => x + y, 0) - o.reduce((x, y) => x + y, 0);
+      }),
+      parts: a.cells.map((c, j) => c.map((x, k) => x - (b.cells[j] || zero)[k])),
+      flash: a.flash.map((x, j) => x - (b.flash[j] || 0)),
+    };
+  });
+}
+`
+// liveClientScenarioJS 是 TestAppJSLiveClient 的场景脚本：完整走一遍
+// 「连接 → snapshot → 各类 patch → 降级 → 退避重连」，把每一步的**写次数增量**、
+// 节点身份与协议状态导出成一行 JSON，由 Go 侧断言。
+const liveClientScenarioJS = `
+const totalWrites = el => {
+  let n = el.htmlWrites;
+  for (const r of el.rows) {
+    n += r.writes.cls + r.writes.title;
+    for (const td of r.children) n += ROW_WRITE_KEYS.reduce((a, k) => a + td.writes[k], 0);
+  }
+  return n;
+};
+
+(async () => {
+  const out = {};
+  await tick(); await tick(); await tick();
+
+  const body = $('accBody'), ml = $('mlBody');
+  const ws1 = lastSocket();
+  out.urlWithKey = ws1 ? ws1.url : 'none';
+  ws1.openFrame();
+  out.open = { ok: __dsh.live().ok, badge: $('liveBadge').textContent, pulse: $('livePulse').className };
+
+  /* S1 snapshot：整表渲染一次（对比基数：一次 innerHTML 写 = 33 个单元格重建）。 */
+  const html0 = body.htmlWrites;
+  ws1.frame({ type: 'snapshot', boot: 'b1', rev: 7, at: at(0), data: overviewBody() });
+  out.snap = {
+    uids: body.rows.map(r => r.dataset.uid),
+    htmlWrites: body.htmlWrites - html0,
+    tdPerRow: body.rows.map(r => r.children.length),
+    cellsRendered: (body.innerHTML.match(/<td/g) || []).length,
+    rev: __dsh.live().rev,
+    locks: ml.rows.map(r => r.dataset.mkey),
+    mlHtmlWrites: ml.htmlWrites,
+    mlNote: $('mlNote').textContent,
+    sTotal: $('sTotal').textContent,
+    sCredits: $('sCredits').textContent,
+    accRows: __dsh.accRowKeys(),
+  };
+
+  /* S2 只改 uid-b 的积分：只有该行第 4 格（cred）被写。 */
+  let d0 = dump(body);
+  let sCred0 = $('sCredits').writes.text;
+  let sTot0 = $('sTotal').writes.text;
+  const idS2 = body.rows.slice();
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 8, accounts: { 'uid-b': { credits: 55 } } });
+  out.creditsPatch = {
+    delta: delta(d0, dump(body)),
+    identity: body.rows.map((r, i) => r === idS2[i]),
+    credHtml: body.rows[1].children[3].innerHTML,
+    credBar: body.rows[1].children[3].querySelector('i').width,
+    sCredits: $('sCredits').textContent,
+    sCreditsWrites: $('sCredits').writes.text - sCred0,
+    stotalWrites: $('sTotal').writes.text - sTot0,
+    rev: __dsh.live().rev,
+  };
+
+  /* S2b 只改嵌套字段：token_usage 是深合并，未被提到的累计计数必须留着，
+     而可见的「今日用量」没变 → 只有该格的 title 被写一次。 */
+  const rowOf = uid => body.rows.filter(r => r.dataset.uid === uid)[0];
+  d0 = dump(body);
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 9, accounts: { 'uid-c': { token_usage: { total_tokens: 9999 } } } });
+  out.nestedPatch = {
+    delta: delta(d0, dump(body)),
+    usageTitle: rowOf('uid-c').children[6].title,
+    usageHtml: rowOf('uid-c').children[6].innerHTML,
+  };
+
+  /* S3 幂等：同一份绝对值（rev 递增）再来一次 → 零写入。 */
+  d0 = dump(body);
+  const w0 = totalWrites(body);
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 10, accounts: { 'uid-b': { credits: 55 } } });
+  out.idempotent = { delta: delta(d0, dump(body)), extraWrites: totalWrites(body) - w0, rev: __dsh.live().rev };
+
+  /* S4 rev 重复 / 倒退 → 整帧丢弃。 */
+  d0 = dump(body);
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 10, accounts: { 'uid-b': { credits: 77 } } });
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 3, accounts: { 'uid-b': { credits: 88 } } });
+  out.revGuard = { delta: delta(d0, dump(body)), credHtml: body.rows[1].children[3].innerHTML, rev: __dsh.live().rev };
+
+  /* S5 boot 变化 → rev 重置，帧被接受；rowCls 变化只写 tr.className。 */
+  d0 = dump(body);
+  const cls0 = body.rows.map(r => r.writes.cls);
+  const idS5 = body.rows.slice();
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 1, accounts: { 'uid-b': { disabled: true, reason: '连续 3 次会话失效' } } });
+  out.bootChange = {
+    delta: delta(d0, dump(body)),
+    identity: body.rows.map((r, i) => r === idS5[i]),
+    rowClsWrites: body.rows.map((r, i) => r.writes.cls - cls0[i]),
+    rowCls: body.rows[1].className,
+    actsRevive: body.rows[1].children[10].innerHTML.indexOf('data-a="revive"') >= 0,
+    rev: __dsh.live().rev, boot: __dsh.live().boot,
+  };
+
+  /* S6 added / removed / order：精确增删与重排，未涉及的节点身份不变。 */
+  d0 = dump(body);
+  const idS6 = body.rows.slice();
+  const sCred1 = $('sCredits').writes.text;
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 2,
+    added: [account('uid-d', { credits: 40, credits_total: 100 })],
+    removed: ['uid-a'], order: ['uid-c', 'uid-b', 'uid-d'] });
+  out.structure = {
+    uids: body.rows.map(r => r.dataset.uid),
+    delta: delta(d0, dump(body)),
+    identity: [body.rows[0] === idS6[2], body.rows[1] === idS6[1],
+      body.rows[2] !== idS6[0] && body.rows[2] !== idS6[1] && body.rows[2] !== idS6[2]],
+    removedNode: idS6[0].removed === true,
+    accList: __dsh.accList(),
+    sCredits: $('sCredits').textContent,
+    sCreditsWrites: $('sCredits').writes.text - sCred1,
+  };
+
+  /* S6b 新 uid 插到最前：insertBefore 精确落位，既有节点一个都不重建。 */
+  const idS6b = body.rows.slice();
+  d0 = dump(body);
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 3,
+    added: [account('uid-e', { credits: 5, credits_total: 100 })],
+    order: ['uid-e', 'uid-c', 'uid-b', 'uid-d'] });
+  out.insert = {
+    uids: body.rows.map(r => r.dataset.uid),
+    identity: [body.rows[1] === idS6b[0], body.rows[2] === idS6b[1], body.rows[3] === idS6b[2]],
+    delta: delta(d0, dump(body)),
+  };
+
+  /* S7 锁池行级补丁：gpt 行原地改 2 格，glm 行删除，x-preview 新行。 */
+  const m0 = dump(ml);
+  const note0 = $('mlNote').writes.text;
+  const sTotal0 = $('sTotal').writes.text;
+  const gptRow = ml.rows[1], glmRow = ml.rows[0];
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 4, model_locks: LOCKS2 });
+  out.locksPatch = {
+    keys: ml.rows.map(r => r.dataset.mkey),
+    delta: delta(m0, dump(ml)),
+    identity: [ml.rows[0] === gptRow, glmRow.removed === true],
+    note: $('mlNote').textContent,
+    noteWrites: $('mlNote').writes.text - note0,
+    sTotalWrites: $('sTotal').writes.text - sTotal0,
+  };
+
+  /* S7b 锁全解：服务端把字段消失编码成显式 null，前端必须回到空态。 */
+  const note1 = $('mlNote').writes.text;
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 5, model_locks: null });
+  out.locksEmpty = {
+    html: ml.innerHTML,
+    keys: ml.rows.map(r => r.dataset.mkey || ''),
+    note: $('mlNote').textContent,
+    noteWrites: $('mlNote').writes.text - note1,
+  };
+
+  /* S8 坏 JSON：收敛成 console.warn，不抛异常、不动 DOM。 */
+  const warns0 = warns.length;
+  ws1.frame('{oops not json');
+  out.badFrame = { warns: warns.length - warns0, rev: __dsh.live().rev, uids: body.rows.map(r => r.dataset.uid) };
+
+  /* S9 降级：liveOk 时 5s 轮询不打 overview；断开后立刻恢复轮询。 */
+  const poll = intervals.filter(i => i.ms === 5000)[0];
+  out.poll = { registered: !!poll, refTimer: __dsh.refTimer() != null };
+  let f0 = overviewFetches();
+  poll.fn(); await tick(); await tick();
+  out.poll.fetchesWhileLive = overviewFetches() - f0;
+  ws1.drop();
+  out.poll.ok = __dsh.live().ok;
+  out.poll.badge = $('liveBadge').textContent;
+  out.poll.pulse = $('livePulse').className;
+  f0 = overviewFetches();
+  poll.fn(); await tick(); await tick();
+  out.poll.fetchesAfterDrop = overviewFetches() - f0;
+
+  /* S10 退避表：1 → 2 → 4 → 8 → 30 → 30（封顶）。 */
+  const delays = [];
+  for (let i = 0; i < 6; i++) {
+    const pend = pendingBackoff();
+    if (!pend.length) break;
+    const t = pend[pend.length - 1];
+    t.dead = true;
+    delays.push(t.ms);
+    t.fn();
+    await tick(); await tick(); await tick();
+    const ws = lastSocket();
+    if (!ws || ws === ws1) break;
+    ws.drop();
+  }
+  out.backoff = delays;
+  out.backoffRetry = __dsh.live().retry;
+
+  /* S11 生命周期：隐藏 → 断开且不排重连；可见 → 立即重连。 */
+  // 先把挂起的重连跑掉，让连接回到「在线」状态，隐藏的才是真的活连接。
+  const pendR = pendingBackoff().filter(t => !t.dead);
+  if (pendR.length) { const t = pendR[pendR.length - 1]; t.dead = true; t.fn(); }
+  await tick(); await tick(); await tick();
+  const wsLive = lastSocket();
+  wsLive.openFrame();
+  document.hidden = true;
+  (docHandlers.visibilitychange || []).forEach(fn => fn());
+  out.visibility = {
+    closed: wsLive.closed === true,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+    handlers: (docHandlers.visibilitychange || []).length,
+  };
+  document.hidden = false;
+  (docHandlers.visibilitychange || []).forEach(fn => fn());
+  await tick(); await tick(); await tick();
+  const wsVis = lastSocket();
+  out.visibility.identity = [wsVis !== wsLive && wsVis !== null];
+  out.visibility.badge = $('liveBadge').textContent;
+
+  /* S12 api_key 为空 → 不带 ?ticket=，也不再申请人票据。 */
+  wsVis.openFrame();
+  out.visibility.ok = __dsh.live().ok;
+  out.visibility.badge = $('liveBadge').textContent;
+  delete store['wb2api.key'];
+  const tk0 = ticketFetches();
+  wsVis.drop();
+  const pend2 = pendingBackoff().filter(t => !t.dead);
+  out.noKey = { pending: pend2.length };
+  if (pend2.length) { const t = pend2[pend2.length - 1]; t.dead = true; t.fn(); }
+  await tick(); await tick(); await tick();
+  const wsNoKey = lastSocket();
+  out.noKey.url = wsNoKey ? wsNoKey.url : 'none';
+  out.noKey.ticketFetches = ticketFetches() - tk0;
+
+  /* S13 bye：服务端要求下线 → 断开 + 退避重连。 */
+  wsNoKey.openFrame();
+  wsNoKey.frame({ type: 'bye', reason: 'ticket_expired' });
+  out.bye = {
+    closed: wsNoKey.closed === true,
+    ok: __dsh.live().ok,
+    badge: $('liveBadge').textContent,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+  };
+
+  /* S14 beforeunload：关闭连接且不再重连。 */
+  for (const t of pendingBackoff()) t.dead = true;
+  (winHandlers.beforeunload || []).forEach(fn => fn());
+  await tick(); await tick();
+  out.unload = { closed: lastSocket().closed === true, pending: pendingBackoff().filter(t => !t.dead).length };
+
+  out.warns = warns.slice();
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { process.stderr.write('SCENARIO FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// liveNoWSScenarioJS 是 TestAppJSLiveNoWebSocket 的场景：沙箱里没有 WebSocket，
+// 前端必须保持纯轮询（不抛异常、不建连接、5s 轮询照旧打 overview）。
+// 这是 TestAppJSTopLevelSmoke 的同类守卫——冒烟沙箱同样没有 WebSocket。
+const liveNoWSScenarioJS = `
+(async () => {
+  const out = { hasWS: typeof sandbox.WebSocket, badgeWrites: $('liveBadge').writes.text };
+  await tick(); await tick();
+  out.ok = __dsh.live().ok;
+  out.connected = __dsh.live().connected;
+  out.sockets = sockets.length;
+  out.visHandlers = (docHandlers.visibilitychange || []).length;
+  out.refTimer = __dsh.refTimer() != null;
+  const poll = intervals.filter(i => i.ms === 5000)[0];
+  out.pollRegistered = !!poll;
+  const f0 = overviewFetches();
+  if (poll) poll.fn();
+  await tick(); await tick();
+  out.overviewFetches = overviewFetches() - f0;
+  out.uids = $('accBody').rows.map(r => r.dataset.uid);
+  out.warns = warns.slice();
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { process.stderr.write('SCENARIO FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// liveRowWritesJS 一次补丁里单行/单格（模型锁池表同样是 8 列）的写次数增量。
+// cells[i] 是该格所有被写属性（class/html/text/title/style）的次数之和；
+// parts[i] 是它的拆解；flash[i] 是 .cell-flash 高亮次数。
+type liveRowWritesJS struct {
+	Key   string  `json:"key"`
+	RowCls int    `json:"rowCls"`
+	Cells []int   `json:"cells"`
+	Parts [][]int `json:"parts"`
+	Flash []int   `json:"flash"`
+}
+
+// liveProbeJS 一个阶段的观测结果（只填该阶段用到的字段，其余为零值）。
+type liveProbeJS struct {
+	Delta          []liveRowWritesJS `json:"delta"`
+	Identity       []bool            `json:"identity"`
+	RowClsWrites   []int             `json:"rowClsWrites"`
+	RowCls         string            `json:"rowCls"`
+	Uids           []string          `json:"uids"`
+	Keys           []string          `json:"keys"`
+	AccList        []string          `json:"accList"`
+	CredHTML       string            `json:"credHtml"`
+	CredBar        string            `json:"credBar"`
+	UsageHTML      string            `json:"usageHtml"`
+	UsageTitle     string            `json:"usageTitle"`
+	SCredits       string            `json:"sCredits"`
+	SCreditsWrites int               `json:"sCreditsWrites"`
+	STotalWrites   int               `json:"stotalWrites"`
+	Note           string            `json:"note"`
+	NoteWrites     int               `json:"noteWrites"`
+	ExtraWrites    int               `json:"extraWrites"`
+	RemovedNode    bool              `json:"removedNode"`
+	ActsRevive     bool              `json:"actsRevive"`
+	Warns          int               `json:"warns"`
+	FetchesLive    int               `json:"fetchesWhileLive"`
+	FetchesAfter   int               `json:"fetchesAfterDrop"`
+	Registered     bool              `json:"registered"`
+	RefTimer       bool              `json:"refTimer"`
+	OK             bool              `json:"ok"`
+	Closed         bool              `json:"closed"`
+	Pending        int               `json:"pending"`
+	Badge          string            `json:"badge"`
+	Pulse          string            `json:"pulse"`
+	Handlers       int               `json:"handlers"`
+	TicketFetches  int               `json:"ticketFetches"`
+	Rev            float64           `json:"rev"`
+	Boot           string            `json:"boot"`
+	URL            string            `json:"url"`
+}
+
+// runLiveScenario 跑一遍 liveStubJS + scenario 并解析出 JSON（node 缺失时跳过）。
+func runLiveScenario(t *testing.T, scenario string, env ...string) map[string]json.RawMessage {
+	t.Helper()
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; live client test skipped")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "live-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(liveStubJS + scenario); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cmd := exec.Command(node, f.Name(), "app.js")
+	cmd.Dir = "." // 测试工作目录 = internal/panel
+	cmd.Env = append(os.Environ(), env...)
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("live scenario node 运行失败: %v\n%s", err, out)
+	}
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("live scenario 输出不是 JSON: %v\n%s", err, out)
+	}
+	return got
+}
+
+// livePhase 把某个阶段解成 liveProbeJS（缺字段按零值）。
+func livePhase(t *testing.T, raw map[string]json.RawMessage, key string) liveProbeJS {
+	t.Helper()
+	var p liveProbeJS
+	if b, ok := raw[key]; ok {
+		if err := json.Unmarshal(b, &p); err != nil {
+			t.Fatalf("阶段 %s 解析失败: %v", key, err)
+		}
+	}
+	return p
+}
+
+// TestAppJSLiveClient 实时推送客户端的全部前端契约：
+//   - 连接 URL：有 api_key 时带 ?ticket=（票据来自 /panel/api/live/ticket），
+//     没有时**不带**参数（服务端 api_key 为空是「免票据免参数」模式）；
+//   - snapshot → 整表渲染一次；随后的 patch **只写变化的单元格**——这是本次重构的
+//     验收核心，用「写次数」证明：改一个账号的积分，其它 10 格与其它两行写次数必须为 0，
+//     行节点身份不变；同一份绝对量再应用一次写次数必须仍是 0（幂等）；
+//   - added / removed / order：精确增删与重排，未涉及的节点身份不变；
+//   - rev 重复/倒退丢弃、boot 变化接受（服务端重启后 rev 从头开始）；
+//   - 坏 JSON 收敛成 console.warn，不炸页面；
+//   - 降级：liveOk 时 5s 轮询不打 overview，onclose 后轮询立刻恢复；
+//   - 生命周期：隐藏页面断开、可见立即重连、bye/卸载断开，退避 1→2→4→8→30s 封顶。
+func TestAppJSLiveClient(t *testing.T) {
+	raw := runLiveScenario(t, liveClientScenarioJS, "LIVE_WS=1", "LIVE_KEY=1")
+
+	// 连接 URL 带票据（api_key 存在时）。
+	var url string
+	if err := json.Unmarshal(raw["urlWithKey"], &url); err != nil {
+		t.Fatalf("urlWithKey 解析失败: %v", err)
+	}
+	if url != "ws://localhost:1/panel/api/live?ticket=T-42" {
+		t.Errorf("带 api_key 的连接 URL=%q，want ws://localhost:1/panel/api/live?ticket=T-42", url)
+	}
+	var open struct {
+		OK    bool   `json:"ok"`
+		Badge string `json:"badge"`
+		Pulse string `json:"pulse"`
+	}
+	if err := json.Unmarshal(raw["open"], &open); err != nil {
+		t.Fatalf("open 解析失败: %v", err)
+	}
+	if !open.OK || open.Badge != "实时" || open.Pulse != "pulse" {
+		t.Errorf("onopen 后应显示实时（ok=%v badge=%q pulse=%q）", open.OK, open.Badge, open.Pulse)
+	}
+
+	// snapshot：整表渲染一次（11 列 × 3 行），行锚是 data-uid，锁池行锚是 data-mkey。
+	var snap struct {
+		Uids          []string `json:"uids"`
+		HTMLWrites    int      `json:"htmlWrites"`
+		TDPerRow      []int    `json:"tdPerRow"`
+		CellsRendered int      `json:"cellsRendered"`
+		Rev           float64  `json:"rev"`
+		Locks         []string `json:"locks"`
+		MLHTMLWrites  int      `json:"mlHtmlWrites"`
+		MLNote        string   `json:"mlNote"`
+		STotal        string   `json:"sTotal"`
+		SCredits      string   `json:"sCredits"`
+		AccRows       []string `json:"accRows"`
+	}
+	if err := json.Unmarshal(raw["snap"], &snap); err != nil {
+		t.Fatalf("snap 解析失败: %v", err)
+	}
+	if strings.Join(snap.Uids, ",") != "uid-a,uid-b,uid-c" {
+		t.Errorf("snapshot 后行顺序=%v", snap.Uids)
+	}
+	for i, n := range snap.TDPerRow {
+		if n != 11 {
+			t.Errorf("第 %d 行有 %d 个 td，账号表是 11 列", i, n)
+		}
+	}
+	if snap.HTMLWrites != 1 || snap.CellsRendered != 33 {
+		t.Errorf("snapshot 应整表渲染一次（tbody innerHTML 写 %d 次，重建 %d 个单元格），want 1 / 33",
+			snap.HTMLWrites, snap.CellsRendered)
+	}
+	if snap.Rev != 7 {
+		t.Errorf("snapshot 后 liveRev=%v want 7", snap.Rev)
+	}
+	if strings.Join(snap.Locks, ",") != "glm-5.3|cn,gpt-5.2|global" {
+		t.Errorf("锁池行锚=%v", snap.Locks)
+	}
+	if snap.MLNote != "1 个模型整池不可用" {
+		t.Errorf("锁池摘要=%q", snap.MLNote)
+	}
+	if snap.SCredits != "60 / 300" || snap.STotal != "3" {
+		t.Errorf("统计卡 积分=%q 总数=%q，want 60 / 300 与 3", snap.SCredits, snap.STotal)
+	}
+	if len(snap.AccRows) != 3 {
+		t.Errorf("accRows 缓存条数=%d want 3", len(snap.AccRows))
+	}
+
+	// ── 写次数证据 ①：只改一个账号的积分 ──────────────────────────────
+	// 该格两处确实变了：内容（innerHTML）与悬浮提示（title）——除此之外
+	// 全表 33 个单元格的写次数必须为 0，且行节点身份不变。
+	p := livePhase(t, raw, "creditsPatch")
+	if len(p.Delta) != 3 {
+		t.Fatalf("creditsPatch delta 行数=%d want 3", len(p.Delta))
+	}
+	for _, row := range p.Delta {
+		switch row.Key {
+		case "uid-b":
+			if row.Cells[3] != 2 {
+				t.Errorf("uid-b 的 cred 单元格写次数=%d want 2（innerHTML + title，整个 delta=%v）", row.Cells[3], row.Cells)
+			}
+			if parts := row.Parts[3]; parts[1] != 1 || parts[3] != 1 {
+				t.Errorf("uid-b 的 cred 单元格应只写 innerHTML 与 title，实际拆解=%v", parts)
+			}
+			for i, n := range row.Cells {
+				if i != 3 && n != 0 {
+					t.Errorf("uid-b 第 %d 格不该被写（写次数 %d，delta=%v）", i+1, n, row.Cells)
+				}
+			}
+			if row.RowCls != 0 {
+				t.Errorf("uid-b 的 tr.className 被写 %d 次（状态没变）", row.RowCls)
+			}
+			if row.Flash[3] != 1 {
+				t.Errorf("uid-b 的 cred 单元格应有一次 .cell-flash 高亮，实际 %v", row.Flash)
+			}
+			for i, n := range row.Flash {
+				if i != 3 && n != 0 {
+					t.Errorf("uid-b 第 %d 格不该有高亮（%v）", i+1, row.Flash)
+				}
+			}
+		case "uid-a", "uid-c":
+			for i, n := range row.Cells {
+				if n != 0 {
+					t.Errorf("%s 第 %d 格被写了 %d 次（本次补丁与它无关）", row.Key, i+1, n)
+				}
+			}
+			if row.RowCls != 0 {
+				t.Errorf("%s 的 tr.className 被写 %d 次", row.Key, row.RowCls)
+			}
+		default:
+			t.Errorf("意外的行锚 %q", row.Key)
+		}
+	}
+	for i, same := range p.Identity {
+		if !same {
+			t.Errorf("第 %d 行的节点身份变了（补丁必须复用节点）", i)
+		}
+	}
+	if !strings.Contains(p.CredHTML, `55<span class="of">/100</span>`) ||
+		!strings.Contains(p.CredHTML, `style="--w:55%"`) {
+		t.Errorf("uid-b 积分列内容不对：%s", p.CredHTML)
+	}
+	if p.CredBar != "55%" {
+		t.Errorf("uid-b 进度条宽度=%q want 55%%", p.CredBar)
+	}
+	if p.SCredits != "95 / 300" || p.SCreditsWrites != 1 {
+		t.Errorf("积分统计卡=%q（写 %d 次），want 95 / 300 且只写 1 次", p.SCredits, p.SCreditsWrites)
+	}
+	if p.STotalWrites != 0 {
+		t.Errorf("账号总数与本次补丁无关，却被写了 %d 次", p.STotalWrites)
+	}
+
+	// ── 写次数证据 ②：嵌套字段的深合并 ────────────────────────────────
+	// token_usage 只发了变化的那一个键：累计计数不能被清空，可见的「今日用量」没变
+	// 时只有该格的 title 被写一次（悬浮提示里的累计值变了）。
+	np := livePhase(t, raw, "nestedPatch")
+	if !strings.Contains(np.UsageTitle, "累计 10.00K token") || !strings.Contains(np.UsageTitle, "尝试 100 次") {
+		t.Errorf("深合并丢了未被提到的累计字段（title=%q）", np.UsageTitle)
+	}
+	for _, row := range np.Delta {
+		for i, n := range row.Cells {
+			if row.Key == "uid-c" {
+				if i != 6 && n != 0 {
+					t.Errorf("uid-c 第 %d 格不该被写（%v）", i+1, row.Cells)
+				}
+				continue
+			}
+			if n != 0 {
+				t.Errorf("%s 第 %d 格被写了 %d 次", row.Key, i+1, n)
+			}
+		}
+		if row.Key == "uid-c" {
+			if row.Cells[6] != 1 || row.Parts[6][3] != 1 {
+				t.Errorf("uid-c 用量格应只写一次 title，实际 %v（拆解 %v）", row.Cells, row.Parts[6])
+			}
+		}
+	}
+
+	// ── 写次数证据 ③：幂等（同一份绝对量再应用一次 = 0 写入）────────────
+	idem := livePhase(t, raw, "idempotent")
+	if idem.ExtraWrites != 0 {
+		t.Errorf("同一份补丁再应用一次产生了 %d 次 DOM 写入，want 0", idem.ExtraWrites)
+	}
+	for _, row := range idem.Delta {
+		for i, n := range row.Cells {
+			if n != 0 || row.RowCls != 0 {
+				t.Errorf("幂等补丁仍写了 %s 第 %d 格 %d 次（rowCls=%d）", row.Key, i+1, n, row.RowCls)
+			}
+		}
+	}
+
+	// ── 守卫：rev 重复 / 倒退整帧丢弃 ────────────────────────────────
+	guard := livePhase(t, raw, "revGuard")
+	if guard.Rev != 10 {
+		t.Errorf("rev 倒退不应推进 liveRev，实际 %v want 10", guard.Rev)
+	}
+	if !strings.Contains(guard.CredHTML, "55") || strings.Contains(guard.CredHTML, "77") || strings.Contains(guard.CredHTML, "88") {
+		t.Errorf("rev 重复/倒退的帧被应用了：%s", guard.CredHTML)
+	}
+	for _, row := range guard.Delta {
+		for i, n := range row.Cells {
+			if n != 0 {
+				t.Errorf("被丢弃的帧改写了 %s 第 %d 格", row.Key, i+1)
+			}
+		}
+	}
+
+	// ── boot 变化 → rev 重置并接受；rowCls 变化只写 tr.className ──────
+	boot := livePhase(t, raw, "bootChange")
+	if boot.Rev != 1 || boot.Boot != "b2" {
+		t.Errorf("boot 变化后应接受新 rev（rev=%v boot=%q）", boot.Rev, boot.Boot)
+	}
+	if boot.RowCls != "off" || !boot.ActsRevive {
+		t.Errorf("禁用后行 class=%q、操作列含解冻=%v", boot.RowCls, boot.ActsRevive)
+	}
+	if len(boot.RowClsWrites) != 3 || boot.RowClsWrites[1] != 1 || boot.RowClsWrites[0] != 0 || boot.RowClsWrites[2] != 0 {
+		t.Errorf("rowCls 写入次数=%v（只有 uid-b 该变）", boot.RowClsWrites)
+	}
+	for _, row := range boot.Delta {
+		if row.Key == "uid-b" {
+			// 状态标签 + 操作列（禁用按钮换解冻、暂停按钮消失）变了；积分/用量等没变。
+			if row.Cells[2] != 1 || row.Cells[10] != 1 {
+				t.Errorf("uid-b 状态列/操作列写次数=%v %v，want 1 / 1", row.Cells[2], row.Cells[10])
+			}
+			for _, i := range []int{0, 3, 4, 5, 6, 7, 8, 9} {
+				if row.Cells[i] != 0 {
+					t.Errorf("uid-b 第 %d 格不该被写（%v）", i+1, row.Cells)
+				}
+			}
+		} else {
+			for i, n := range row.Cells {
+				if n != 0 {
+					t.Errorf("%s 第 %d 格被写了 %d 次", row.Key, i+1, n)
+				}
+			}
+		}
+	}
+	for i, same := range boot.Identity {
+		if !same {
+			t.Errorf("boot 变化后第 %d 行的节点身份变了", i)
+		}
+	}
+
+	// ── added / removed / order ──────────────────────────────────────
+	st := livePhase(t, raw, "structure")
+	if strings.Join(st.Uids, ",") != "uid-c,uid-b,uid-d" {
+		t.Errorf("增删排序后行顺序=%v want [uid-c uid-b uid-d]", st.Uids)
+	}
+	if strings.Join(st.AccList, ",") != "uid-c,uid-b,uid-d" {
+		t.Errorf("accList 顺序=%v（必须与 DOM 同序）", st.AccList)
+	}
+	if len(st.Identity) != 3 || !st.Identity[0] || !st.Identity[1] || !st.Identity[2] {
+		t.Errorf("重排/增删后未涉及的行节点身份必须不变，identity=%v", st.Identity)
+	}
+	if !st.RemovedNode {
+		t.Error("被移除的 uid-a 行没有从 DOM 摘掉")
+	}
+	for _, row := range st.Delta {
+		if row.Key == "uid-c" || row.Key == "uid-b" {
+			for i, n := range row.Cells {
+				if n != 0 || row.RowCls != 0 {
+					t.Errorf("重排不该改写 %s（第 %d 格写了 %d 次）", row.Key, i+1, n)
+				}
+			}
+		}
+	}
+	if st.SCredits != "125 / 300" || st.SCreditsWrites != 1 {
+		t.Errorf("移除账号后积分统计=%q（写 %d 次），want 125 / 300 且 1 次", st.SCredits, st.SCreditsWrites)
+	}
+
+	// ── 模型锁池行级补丁 ─────────────────────────────────────────────
+	ins := livePhase(t, raw, "insert")
+	if strings.Join(ins.Uids, ",") != "uid-e,uid-c,uid-b,uid-d" {
+		t.Errorf("新 uid 插入后行顺序=%v want [uid-e uid-c uid-b uid-d]", ins.Uids)
+	}
+	if len(ins.Identity) != 3 || !ins.Identity[0] || !ins.Identity[1] || !ins.Identity[2] {
+		t.Errorf("插入新行不该重建既有行，identity=%v", ins.Identity)
+	}
+	for _, row := range ins.Delta {
+		if row.Key == "uid-e" {
+			continue
+		}
+		for i, n := range row.Cells {
+			if n != 0 || row.RowCls != 0 {
+				t.Errorf("插入/重排不该改写 %s（第 %d 格写了 %d 次）", row.Key, i+1, n)
+			}
+		}
+	}
+
+	lk := livePhase(t, raw, "locksPatch")
+	if strings.Join(lk.Keys, ",") != "gpt-5.2|global,x-preview|cn" {
+		t.Errorf("锁池行锚=%v want [gpt-5.2|global x-preview|cn]", lk.Keys)
+	}
+	if len(lk.Identity) != 2 || !lk.Identity[0] || !lk.Identity[1] {
+		t.Errorf("锁池：gpt 行应复用原节点、glm 行应被摘掉，identity=%v", lk.Identity)
+	}
+	for _, row := range lk.Delta {
+		if row.Key != "gpt-5.2|global" {
+			continue
+		}
+		if row.Cells[3] != 1 || row.Cells[4] != 1 {
+			t.Errorf("gpt 行只该改「可选/总数」与「锁定账号」两格，实际 %v", row.Cells)
+		}
+		for i, n := range row.Cells {
+			if i != 3 && i != 4 && n != 0 {
+				t.Errorf("gpt 行第 %d 格被写了 %d 次（%v）", i+1, n, row.Cells)
+			}
+		}
+	}
+	if lk.Note != "2 个模型部分限流" || lk.NoteWrites != 1 {
+		t.Errorf("锁池摘要=%q（写 %d 次）", lk.Note, lk.NoteWrites)
+	}
+	if lk.STotalWrites != 0 {
+		t.Errorf("锁池补丁不该动账号总数（写了 %d 次）", lk.STotalWrites)
+	}
+
+	// 服务端把「锁全解」编码成显式 null（字段消失语义）：必须回到空态，否则过期的
+	// 锁池行会一直挂到 60s 后的兜底 snapshot 才被纠正。
+	var locksEmpty struct {
+		HTML       string   `json:"html"`
+		Keys       []string `json:"keys"`
+		Note       string   `json:"note"`
+		NoteWrites int      `json:"noteWrites"`
+	}
+	if err := json.Unmarshal(raw["locksEmpty"], &locksEmpty); err != nil {
+		t.Fatalf("locksEmpty 解析失败: %v", err)
+	}
+	if !strings.Contains(locksEmpty.HTML, `colspan="8"`) || !strings.Contains(locksEmpty.HTML, "所有模型均可选") {
+		t.Errorf("model_locks=null 应回到空态：%s", locksEmpty.HTML)
+	}
+	if locksEmpty.Note != "" || locksEmpty.NoteWrites != 1 {
+		t.Errorf("空态摘要应为空串且只写一次（note=%q writes=%d）", locksEmpty.Note, locksEmpty.NoteWrites)
+	}
+
+	// ── 坏 JSON ──────────────────────────────────────────────────────
+	bad := livePhase(t, raw, "badFrame")
+	if bad.Warns != 1 {
+		t.Errorf("坏帧应产生 1 条 console.warn，实际 %d", bad.Warns)
+	}
+	if bad.Rev != 5 {
+		t.Errorf("坏帧不该推进 liveRev，实际 %v", bad.Rev)
+	}
+	if strings.Join(bad.Uids, ",") != "uid-e,uid-c,uid-b,uid-d" {
+		t.Errorf("坏帧之后表被改坏了：%v", bad.Uids)
+	}
+
+	// ── 降级：轮询兜底 ───────────────────────────────────────────────
+	pl := livePhase(t, raw, "poll")
+	if !pl.Registered || !pl.RefTimer {
+		t.Errorf("5s 轮询必须始终注册（registered=%v refTimer=%v）", pl.Registered, pl.RefTimer)
+	}
+	if pl.FetchesLive != 0 {
+		t.Errorf("实时连接正常时 5s 轮询不该再打 overview（打了 %d 次）", pl.FetchesLive)
+	}
+	if pl.OK || pl.Badge != "轮询" || pl.Pulse != "pulse warn" {
+		t.Errorf("onclose 后应回落轮询（ok=%v badge=%q pulse=%q）", pl.OK, pl.Badge, pl.Pulse)
+	}
+	if pl.FetchesAfter != 1 {
+		t.Errorf("onclose 后 5s 轮询应恢复打 overview（实际 %d 次）", pl.FetchesAfter)
+	}
+
+	// ── 退避表 ───────────────────────────────────────────────────────
+	var backoff []int
+	if err := json.Unmarshal(raw["backoff"], &backoff); err != nil {
+		t.Fatalf("backoff 解析失败: %v", err)
+	}
+	want := []int{1000, 2000, 4000, 8000, 30000, 30000}
+	if len(backoff) != len(want) {
+		t.Fatalf("退避序列=%v want %v", backoff, want)
+	}
+	for i := range want {
+		if backoff[i] != want[i] {
+			t.Fatalf("退避序列=%v want %v", backoff, want)
+		}
+	}
+
+	// ── 生命周期：隐藏 / 可见 / 卸载 ─────────────────────────────────
+	vis := livePhase(t, raw, "visibility")
+	if !vis.Closed || vis.Pending != 0 {
+		t.Errorf("页面隐藏应断开且不排重连（closed=%v pending=%d）", vis.Closed, vis.Pending)
+	}
+	if vis.Handlers != 1 {
+		t.Errorf("visibilitychange 监听数=%d want 1", vis.Handlers)
+	}
+	if len(vis.Identity) != 1 || !vis.Identity[0] {
+		t.Errorf("页面可见后应立刻重连出新 socket，identity=%v", vis.Identity)
+	}
+	if vis.Badge != "实时" || !vis.OK {
+		t.Errorf("重连并 open 后应为实时（badge=%q ok=%v）", vis.Badge, vis.OK)
+	}
+
+	// ── api_key 为空 → 不带 ?ticket= ─────────────────────────────────
+	nk := livePhase(t, raw, "noKey")
+	if nk.URL != "ws://localhost:1/panel/api/live" {
+		t.Errorf("无 api_key 时连接 URL=%q，want 不带 ?ticket= 的 ws://localhost:1/panel/api/live", nk.URL)
+	}
+	if nk.TicketFetches != 0 {
+		t.Errorf("无 api_key 时不该再申请票据（申请了 %d 次）", nk.TicketFetches)
+	}
+	if nk.Pending != 1 {
+		t.Errorf("断线后应排一次重连，实际 %d", nk.Pending)
+	}
+
+	// ── bye / beforeunload ───────────────────────────────────────────
+	bye := livePhase(t, raw, "bye")
+	if !bye.Closed || bye.OK || bye.Badge != "轮询" || bye.Pending != 1 {
+		t.Errorf("bye 后应关闭并排一次重连（closed=%v ok=%v badge=%q pending=%d）",
+			bye.Closed, bye.OK, bye.Badge, bye.Pending)
+	}
+	un := livePhase(t, raw, "unload")
+	if !un.Closed || un.Pending != 0 {
+		t.Errorf("beforeunload 后应关闭且不再重连（closed=%v pending=%d）", un.Closed, un.Pending)
+	}
+}
+
+// TestAppJSLiveNoWebSocket 没有 WebSocket 的环境（旧浏览器 / 冒烟沙箱）必须完全
+// 退化成轮询：不抛异常、不建连接、不挂 visibilitychange 监听、5s 轮询照旧工作。
+// 这条同时守住 TestAppJSTopLevelSmoke（它的沙箱里也没有 WebSocket）。
+func TestAppJSLiveNoWebSocket(t *testing.T) {
+	raw := runLiveScenario(t, liveNoWSScenarioJS, "LIVE_WS=0", "LIVE_KEY=1")
+	var got struct {
+		HasWS          string   `json:"hasWS"`
+		BadgeWrites    int      `json:"badgeWrites"`
+		OK             bool     `json:"ok"`
+		Connected      bool     `json:"connected"`
+		Sockets        int      `json:"sockets"`
+		VisHandlers    int      `json:"visHandlers"`
+		RefTimer       bool     `json:"refTimer"`
+		PollRegistered bool     `json:"pollRegistered"`
+		OverviewFetch  int      `json:"overviewFetches"`
+		Uids           []string `json:"uids"`
+		Warns          []string `json:"warns"`
+	}
+	if err := json.Unmarshal(raw["hasWS"], &got.HasWS); err != nil {
+		t.Fatalf("hasWS 解析失败: %v", err)
+	}
+	if got.HasWS != "undefined" {
+		t.Errorf("测试前提不成立：沙箱里存在 WebSocket（%v）", got.HasWS)
+	}
+	// 其余字段从顶层直接解（场景输出是平铺对象）。
+	flat := raw
+	for _, kv := range []struct {
+		key string
+		dst any
+	}{
+		{"ok", &got.OK}, {"connected", &got.Connected}, {"sockets", &got.Sockets},
+		{"visHandlers", &got.VisHandlers}, {"refTimer", &got.RefTimer},
+		{"pollRegistered", &got.PollRegistered}, {"overviewFetches", &got.OverviewFetch},
+		{"badgeWrites", &got.BadgeWrites}, {"uids", &got.Uids}, {"warns", &got.Warns},
+	} {
+		if b, ok := flat[kv.key]; ok {
+			if err := json.Unmarshal(b, kv.dst); err != nil {
+				t.Fatalf("%s 解析失败: %v", kv.key, err)
+			}
+		}
+	}
+	if strings.Join(got.Uids, ",") != "uid-a,uid-b,uid-c" {
+		t.Errorf("无 WebSocket 时账号表仍应由轮询渲染：%v", got.Uids)
+	}
+	if got.OK || got.Connected || got.Sockets != 0 {
+		t.Errorf("没有 WebSocket 时不该建立连接（ok=%v connected=%v sockets=%d）", got.OK, got.Connected, got.Sockets)
+	}
+	if got.VisHandlers != 0 {
+		t.Errorf("没有 WebSocket 时不该挂 visibilitychange 监听（%d 个）", got.VisHandlers)
+	}
+	if got.BadgeWrites != 0 {
+		t.Errorf("没有 WebSocket 时不该改徽标（写了 %d 次）", got.BadgeWrites)
+	}
+	if !got.RefTimer || !got.PollRegistered {
+		t.Error("没有 WebSocket 时 5s 轮询必须照旧注册")
+	}
+	if got.OverviewFetch != 1 {
+		t.Errorf("没有 WebSocket 时轮询应照常打 overview（%d 次）", got.OverviewFetch)
+	}
+	if len(got.Warns) != 0 {
+		t.Errorf("降级路径不该有 console.warn：%v", got.Warns)
+	}
+
+	// 徽标与高亮的静态形态：初始状态是「轮询 + 琥珀」，.cell-flash 只用既有 token，
+	// 且在 prefers-reduced-motion 下关断（写次数之外的回归红线）。
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{
+		`<span class="pulse warn" id="livePulse"></span><span id="liveBadge">轮询</span>`,
+		`.acc tbody td.cell-flash { animation: cell-flash calc(var(--t-base) * 3) ease-out; }`,
+		`@keyframes cell-flash { from { background: var(--accent-soft); } to { background: var(--surface); } }`,
+		`.acc tbody td.cell-flash { animation: none; }`,
+	} {
+		if !strings.Contains(string(html), want) {
+			t.Errorf("index.html 缺少实时推送的静态形态：%s", want)
+		}
+	}
+	if strings.Contains(string(html), "cell-flash") &&
+		!strings.Contains(string(html), "@media (prefers-reduced-motion: reduce)") {
+		t.Error("缺 prefers-reduced-motion 关断块")
+	}
+}
+

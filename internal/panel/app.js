@@ -556,139 +556,545 @@ function tokenChipHTML(value) {
   return esc(m[1]) + '<span class="usage-unit">' + esc(m[2]) + '</span>';
 }
 
+/* ── 账号表：单元格视图模型（VM）+ 补丁层 ─────────────────────────────
+   旧版是「5 秒轮询 + 整表 tbody.innerHTML 重渲染」：一次刷新把 40 行 × 11 列
+   全部节点拆掉重建，滚动位置、hover、按钮焦点一起丢；而其中真正变化的往往
+   只有一个积分数字。这里把它拆成两层：
+     · accountVM(s, ctx)   纯函数：一条账号 → 11 个单元格的视图模型；
+     · renderAccounts      首屏整表 innerHTML（保持既有形态与列数断言不变）；
+     · patchAccounts       增量补丁：比 VM 只写变化的单元格，未变化的单元格
+                           一个字节都不写（这是本次重构的验收核心）。
+   两条渲染路径共用 accCells()/accCellHTML() 生成的同一份形状，补丁才可能
+   对同一份数据做到「零写入」——两边各写一套的话，多一个空格都会导致全表重写。 */
+
+/* accRows 是 uid → { tr, cells, bar, vm, cs } 的行缓存。
+   故意用 null 原型对象而不是 Map：既有切片测试把 app.js 的一小段抽出来，
+   在只给了固定几个全局的沙箱里跑（TestAppJSModelLocks 的 ctx 里没有 Map），
+   顶层出现 new Map() 会让那段测试直接 ReferenceError。uid 是服务端下发的
+   字符串，null 原型也顺带挡掉 __proto__ / constructor 这类键。 */
+let accRows = Object.create(null);
+let accList = [];        // 当前 DOM 对应的源账号对象，顺序 = DOM 顺序
+let poolState = null;    // 账号池统计卡的当前值（overview / pool 补丁合并而来）
+
+function accountVM(s, ctx) {
+  // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
+  const maxCred = (ctx && ctx.maxCred) || 1;
+  const now = Date.now();
+  const bl = (new Date(s.breaker_until || 0) - now) / 1000;
+  const dg = (new Date(s.degrade_until || 0) - now) / 1000;
+  const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
+  // 模型级受限（限流 / 待重探）。账号自身可能既没冷却也没熔断，却已有模型不可用——
+  // 这时只显示「可用」会让人以为它完全健康（实测：标签写着可用，下面挂着
+  // 「预计 10-01 11:14 解封」的琥珀条）。
+  const rl = Array.isArray(s.rate_limited_models) ? s.rate_limited_models.filter(m => m && m.model) : [];
+  const rlMetas = rl.map(m => rateLimitMeta(m, now));
+  // 账号级冷却文案（kind 判定沿用原逻辑），与模型级受限一起交给 statusTagOf 定结论
+  const coolKind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
+    : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
+  const st = statusTagOf(s, cool > 0 ? coolKind + ' · ' + dur(cool) : '', rlMetas);
+  const cls = st.cls;
+  // 状态列只放这一个标签：原因（模型限流明细 / 禁用原因）在 title 里，悬浮才显示。
+  const tag = '<span class="tag ' + st.tone + '"' +
+    (st.title ? ' title="' + esc(st.title) + '"' : '') + '>' + esc(st.label) + '</span>';
+  const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
+  const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
+  const pct = s.credits_total > 0
+    ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
+    : Math.round((s.credits || 0) / maxCred * 100);
+  // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
+  // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
+  let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+  const costs = (s.model_costs || []).filter(c => c.model);
+  if (costs.length) {
+    credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
+      '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+  }
+  const frozen = s.disabled || cool > 0;
+  const tu = s.token_usage || {};
+  // 「今日调用 / 今日用量 / 成功率」= 自然日口径，取自后端 overview 合并的用量记录器
+  // 今天窗口（与「用量统计 → 今天」同源同口径）。累计全量仍在池里，放进悬浮提示对照。
+  const td = s.today || {};
+  const hasToday = typeof td.requests === 'number';
+  const todayReq = td.requests || 0;
+  const todayErr = typeof td.errors === 'number' ? td.errors : null;
+  const todayTok = formatTokenCount(td.total_tokens);
+  const dayLabel = '今天' + (td.day ? '（' + td.day + '）' : '');
+  // 累计对照值
+  const cumTok = formatTokenCount(tu.total_tokens);
+  const cumReq = tu.request_count || 0;
+  const cumOk = typeof tu.ok_count === 'number' ? tu.ok_count : null;
+  const cumRate = okRateOf(tu);
+  const latency = formatLatency(tu.last_latency_ms);
+  // 成功率 = (今日尝试 − 今日失败) ÷ 今日尝试（见 todayRateOf 的口径说明）。
+  const okRate = todayRateOf(td);
+  const rateCls = okRate == null ? 'c-muted' : (okRate >= 99 ? 'c-ok' : (okRate >= 95 ? 'c-warn' : 'c-bad'));
+  let callsTitle = hasToday
+    ? dayLabel + '尝试 ' + todayReq + ' 次' + (todayErr == null ? '' : ' / 失败 ' + todayErr) +
+      '\n成功率 = (尝试 − 失败) ÷ 尝试（同一次聚合，故不会超过 100%）'
+    : '今日数据需要 1.13.3 起的后端';
+  callsTitle += '\n累计：尝试 ' + cumReq + ' 次' +
+    (cumOk == null ? '' : ' / 成功 ' + cumOk + ' / 失败 ' + (cumReq - cumOk)) +
+    (cumRate == null ? '' : '（' + cumRate.toFixed(2) + '%）');
+  const ttfb = avgTTFB(tu);
+  const infer = avgInferenceRate(tu);
+  let usageTitle = hasToday
+    ? dayLabel + '用量 ' + todayTok + ' token'
+    : '今日数据需要 1.13.3 起的后端';
+  usageTitle += '\n累计 ' + cumTok + ' token / 尝试 ' + cumReq + ' 次' +
+    (latency === '—' ? '' : '\n最近一次总延迟 ' + latency);
+  const ttfbTitle = ttfb == null
+    ? '暂无首字样本（非流式请求没有首字概念）'
+    : '累计平均首字 ' + formatLatency(ttfb) + '（样本 ' + tu.ttfb_count + ' 次）' +
+      (tu.last_ttfb_ms ? '\n最近一次 ' + formatLatency(tu.last_ttfb_ms) : '');
+  const inferTitle = infer == null
+    ? '暂无推理样本'
+    : '累计平均推理速度 ' + formatRate(infer) + '（已排除首字等待）' +
+      '\n= 累计 completion token ÷ 累计生成耗时';
+  return {
+    rowCls: cls,
+    rowTitle: 'uid: ' + s.uid,
+    mark: '<i></i>',
+    who: '<div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>',
+    status: { html: tag, title: st.title || '' },
+    cred: {
+      html: '<div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div>',
+      title: credTip, pct: pct,
+    },
+    calls: {
+      html: '<span class="calls-n"><b>' + (hasToday ? todayReq : '—') + '</b>' + (hasToday ? '<em>次</em>' : '') + '</span>' +
+        '<span class="sep">|</span>' +
+        '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span>',
+      title: callsTitle,
+    },
+    inflight: s.in_flight || 0,
+    usage: {
+      html: '<span class="usage-line">' +
+        '<span class="usage-item usage-total"><b>' + tokenChipHTML(todayTok) + '</b></span>' +
+      '</span>',
+      title: usageTitle,
+    },
+    // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
+    ttfb: {
+      html: (ttfb == null ? '<span class="c-muted">—</span>'
+        : '<span class="usage-line"><span class="usage-item"><b>' + formatLatency(ttfb) + '</b></span></span>'),
+      title: ttfbTitle,
+    },
+    speed: {
+      html: (infer == null ? '<span class="c-muted">—</span>'
+        : '<span class="usage-line"><span class="usage-item"><b>' + formatRate(infer) + '</b></span></span>'),
+      title: inferTitle,
+    },
+    last: ago(s.last_success),
+    acts: {
+      html:
+      '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
+      '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
+      '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+      (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
+              : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+      /* 暂停 / 恢复选号（上游 paused 合并过来的操作）：「解冻/禁用」旁并列的第二个开关，
+         与 disable 正交且不能互相替代——pause 只退出选号，签到 / 活跃上报 / 保活 /
+         刷新余额照常；disable 默认连保号任务一起停（include_disabled_in_tasks 才是例外）。
+         也不与冷却互斥：冷却中的号同样可以主动让位，已暂停的号在冷却期间也应能立刻恢复
+         （意图立即生效，不必等冷却走完），故这一个按钮不看 frozen，只看 paused。
+         已禁用账号不渲染它：禁用已含「不参与选号」，两个按钮并列会让人以为效果能叠加，
+         也容易误以为禁用号的任务还能靠暂停挽回（本 fork 的 include_disabled_in_tasks
+         是全局开关，不是账号级补救）。 */
+      (s.disabled ? ''
+        : (s.paused
+            ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+      '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
+    },
+  };
+}
+
+/* accCells(vm) 把 VM 摊平成 11 个单元格描述符，顺序与 index.html 的表头一一对应
+   （mark / who / 状态 / 积分 / 今日调用 / 在途 / 今日用量 / 首字 / 推理 / 最近成功 / 操作）。
+   描述符是整表 HTML 与增量补丁唯一的共同来源：补丁比较的就是这里生成的形状。
+   · text  —— 纯文本单元格（在途、最近成功），补丁走 textContent；
+   · html  —— 结构化单元格，补丁走 innerHTML；
+   · pct   —— 只有积分列的进度条宽度（CSS 变量 --w），走 style.setProperty；
+   · title —— 悬浮提示原文（未转义，写 DOM 时用属性赋值，拼 HTML 时才 esc）。 */
+function accCells(vm) {
+  return [
+    { cls: 'mark', aria: true, html: vm.mark, title: '' },
+    { cls: 'who', html: vm.who, title: '' },
+    { cls: '', html: vm.status.html, title: '' },
+    { cls: 'cred', title: vm.cred.title, html: vm.cred.html, pct: vm.cred.pct },
+    { cls: 'num calls-cell', title: vm.calls.title, html: vm.calls.html },
+    { cls: 'num', text: String(vm.inflight), title: '' },
+    { cls: 'num usage-cell', title: vm.usage.title, html: vm.usage.html },
+    { cls: 'num ttfb-cell', title: vm.ttfb.title, html: vm.ttfb.html },
+    { cls: 'num speed-cell', title: vm.speed.title, html: vm.speed.html },
+    { cls: 'num c-muted', text: String(vm.last), title: '' },
+    { cls: 'acts', html: vm.acts.html, title: '' },
+  ];
+}
+
+/* accCellHTML 单个 <td>：属性顺序（class → aria-hidden → title）与原实现逐字节一致，
+   空 class 不写属性（旧版「状态」列就是裸 <td>，补一个 class="" 会改到 HTML 字节）。 */
+function accCellHTML(c) {
+  let h = '<td';
+  if (c.cls) h += ' class="' + c.cls + '"';
+  if (c.aria) h += ' aria-hidden="true"';
+  if (c.title) h += ' title="' + esc(c.title) + '"';
+  h += '>';
+  h += c.text != null ? esc(c.text) : c.html;
+  return h + '</td>';
+}
+
+/* accRowHTML 整行。data-uid 是补丁层的行锚（自定义属性不会被 CSS 命中，故不影响外观）。 */
+function accRowHTML(uid, vm) {
+  return '<tr class="' + vm.rowCls + '" data-uid="' + esc(uid) + '" title="' + esc(vm.rowTitle) + '">' +
+    accCells(vm).map(accCellHTML).join('') + '</tr>';
+}
+
+/* accBarOf 积分进度条里的 <i>（宽度由 --w 变量驱动）。取不到就退化为不上色，
+   绝不要让「拿不到子节点」把整条补丁链打断。 */
+function accBarOf(td) {
+  return (td && typeof td.querySelector === 'function') ? td.querySelector('i') : null;
+}
+
+/* accRegister 登记一行：tr、11 个 td、进度条 <i>、当前 VM 与「已写状态」cs。
+   cs 是 VM 摊平后的描述符：补丁层拿新描述符与它逐字段比，只有不同才动 DOM。 */
+function accRegister(uid, tr, vm) {
+  const cells = [];
+  if (tr && typeof tr.querySelectorAll === 'function') {
+    const list = tr.querySelectorAll('td');
+    for (let i = 0; i < list.length; i++) cells.push(list[i]);
+  }
+  accRows[uid] = { tr: tr, cells: cells, bar: cells[3] ? accBarOf(cells[3]) : null, vm: vm, cs: accCells(vm) };
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
-  if (!list.length) {
+  if (!tb) return;
+  accList = Array.isArray(list) ? list : [];
+  accRows = Object.create(null);
+  if (!accList.length) {
+    // 空池：整块空态（colspan 与表头 11 列一致），行缓存一并清空。
     tb.innerHTML = '<tr><td colspan="11"><div class="empty"><div class="big">账号池是空的</div>点击右上角「添加账号」，用浏览器登录一个 WorkBuddy 账号</div></td></tr>';
     return;
   }
-  // 有总额度（credits_total）→ 进度条按自身 剩余/总额 百分比；旧数据无总额 → 退回池内最高=100%
-  const maxCred = Math.max(1, ...list.map(s => s.credits || 0));
-  tb.innerHTML = list.map(s => {
-    const now = Date.now();
-    const bl = (new Date(s.breaker_until || 0) - now) / 1000;
-    const dg = (new Date(s.degrade_until || 0) - now) / 1000;
-    const cool = Math.max(s.cool_remaining_sec || 0, bl > 0 ? bl : 0, dg > 0 ? dg : 0);
-    // 模型级受限（限流 / 待重探）。账号自身可能既没冷却也没熔断，却已有模型不可用——
-    // 这时只显示「可用」会让人以为它完全健康（实测：标签写着可用，下面挂着
-    // 「预计 10-01 11:14 解封」的琥珀条）。
-    const rl = Array.isArray(s.rate_limited_models) ? s.rate_limited_models.filter(m => m && m.model) : [];
-    const rlMetas = rl.map(m => rateLimitMeta(m, now));
-    // 账号级冷却文案（kind 判定沿用原逻辑），与模型级受限一起交给 statusTagOf 定结论
-    const coolKind = bl > Math.max(s.cool_remaining_sec || 0, dg > 0 ? dg : 0) ? '熔断'
-      : (dg > (s.cool_remaining_sec || 0) ? '连败降权' : (s.cool_kind === 'hard_credit' ? '积分冷却' : '限流冷却'));
-    const st = statusTagOf(s, cool > 0 ? coolKind + ' · ' + dur(cool) : '', rlMetas);
-    const cls = st.cls;
-    // 状态列只放这一个标签：原因（模型限流明细 / 禁用原因）在 title 里，悬浮才显示。
-    const tag = '<span class="tag ' + st.tone + '"' +
-      (st.title ? ' title="' + esc(st.title) + '"' : '') + '>' + esc(st.label) + '</span>';
-    const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-    const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
-    const pct = s.credits_total > 0
-      ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-      : Math.round((s.credits || 0) / maxCred * 100);
-    // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
-    // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-    let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
-    const costs = (s.model_costs || []).filter(c => c.model);
-    if (costs.length) {
-      credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
-        '  ' + c.model + '：' + (c.cost_per_1k <= 0 ? '免费' : c.cost_per_1k)).join('\n');
+  const ctx = accCtx();
+  const vms = accList.map(s => accountVM(s, ctx));
+  tb.innerHTML = accList.map((s, i) => accRowHTML(s.uid, vms[i])).join('');
+  // 登记行缓存。浏览器里 tbody 一定有 querySelectorAll；切片测试用的极简 DOM 桩
+  // 没有它——那种环境只需要 innerHTML 结果（补丁层也只会在真实 DOM 上跑）。
+  if (typeof tb.querySelectorAll !== 'function') return;
+  const trs = tb.querySelectorAll('tr[data-uid]');
+  for (let i = 0; i < accList.length && i < trs.length; i++) accRegister(accList[i].uid, trs[i], vms[i]);
+}
+
+/* accCtx 补丁重算 VM 用的整池上下文。进度条的相对基准是「池内最高积分」，
+   单看一条账号算不出来，所以每次补丁都要整池过一遍——也正因如此，别人的积分
+   变化会（正确地）让没有 credits_total 的行的百分比跟着变。 */
+function accCtx() {
+  let max = 1;
+  for (const s of accList) { const c = s.credits || 0; if (c > max) max = c; }
+  return { maxCred: max };
+}
+
+/* mergeAccount 把补丁里的绝对新值深合并进现有账号对象。嵌套对象（token_usage /
+   today / …）只发了变化的那几个键，浅合并会把整块替换成残缺对象（累计计数、
+   ttfb 样本一起消失），故对纯对象递归、对数组与标量整体替换。 */
+function mergeAccount(dst, src) {
+  if (!dst || !src || typeof src !== 'object') return dst;
+  for (const k of Object.keys(src)) {
+    const v = src[k];
+    if (v === undefined) continue;
+    const cur = dst[k];
+    if (v && typeof v === 'object' && !Array.isArray(v) &&
+        cur && typeof cur === 'object' && !Array.isArray(cur)) {
+      mergeAccount(cur, v);
+    } else {
+      dst[k] = v;
     }
-    const frozen = s.disabled || cool > 0;
-    const tu = s.token_usage || {};
-    // 「今日调用 / 今日用量 / 成功率」= 自然日口径，取自后端 overview 合并的用量记录器
-    // 今天窗口（与「用量统计 → 今天」同源同口径）。累计全量仍在池里，放进悬浮提示对照。
-    const td = s.today || {};
-    const hasToday = typeof td.requests === 'number';
-    const todayReq = td.requests || 0;
-    const todayErr = typeof td.errors === 'number' ? td.errors : null;
-    const todayTok = formatTokenCount(td.total_tokens);
-    const dayLabel = '今天' + (td.day ? '（' + td.day + '）' : '');
-    // 累计对照值
-    const cumTok = formatTokenCount(tu.total_tokens);
-    const cumReq = tu.request_count || 0;
-    const cumOk = typeof tu.ok_count === 'number' ? tu.ok_count : null;
-    const cumRate = okRateOf(tu);
-    const latency = formatLatency(tu.last_latency_ms);
-    // 成功率 = (今日尝试 − 今日失败) ÷ 今日尝试（见 todayRateOf 的口径说明）。
-    const okRate = todayRateOf(td);
-    const rateCls = okRate == null ? 'c-muted' : (okRate >= 99 ? 'c-ok' : (okRate >= 95 ? 'c-warn' : 'c-bad'));
-    let callsTitle = hasToday
-      ? dayLabel + '尝试 ' + todayReq + ' 次' + (todayErr == null ? '' : ' / 失败 ' + todayErr) +
-        '\n成功率 = (尝试 − 失败) ÷ 尝试（同一次聚合，故不会超过 100%）'
-      : '今日数据需要 1.13.3 起的后端';
-    callsTitle += '\n累计：尝试 ' + cumReq + ' 次' +
-      (cumOk == null ? '' : ' / 成功 ' + cumOk + ' / 失败 ' + (cumReq - cumOk)) +
-      (cumRate == null ? '' : '（' + cumRate.toFixed(2) + '%）');
-    const ttfb = avgTTFB(tu);
-    const infer = avgInferenceRate(tu);
-    let usageTitle = hasToday
-      ? dayLabel + '用量 ' + todayTok + ' token'
-      : '今日数据需要 1.13.3 起的后端';
-    usageTitle += '\n累计 ' + cumTok + ' token / 尝试 ' + cumReq + ' 次' +
-      (latency === '—' ? '' : '\n最近一次总延迟 ' + latency);
-    const ttfbTitle = ttfb == null
-      ? '暂无首字样本（非流式请求没有首字概念）'
-      : '累计平均首字 ' + formatLatency(ttfb) + '（样本 ' + tu.ttfb_count + ' 次）' +
-        (tu.last_ttfb_ms ? '\n最近一次 ' + formatLatency(tu.last_ttfb_ms) : '');
-    const inferTitle = infer == null
-      ? '暂无推理样本'
-      : '累计平均推理速度 ' + formatRate(infer) + '（已排除首字等待）' +
-        '\n= 累计 completion token ÷ 累计生成耗时';
-    return '<tr class="' + cls + '" title="uid: ' + esc(s.uid) + '">' +
-      '<td class="mark" aria-hidden="true"><i></i></td>' +
-      '<td class="who"><div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div></td>' +
-      '<td>' + tag + '</td>' +
-      '<td class="cred" title="' + esc(credTip) + '"><div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div></td>' +
-      '<td class="num calls-cell" title="' + esc(callsTitle) + '">' +
-        '<span class="calls-n"><b>' + (hasToday ? todayReq : '—') + '</b>' + (hasToday ? '<em>次</em>' : '') + '</span>' +
-        '<span class="sep">|</span>' +
-        '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span></td>' +
-      '<td class="num">' + (s.in_flight || 0) + '</td>' +
-      '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line">' +
-        '<span class="usage-item usage-total"><b>' + tokenChipHTML(todayTok) + '</b></span>' +
-      '</span></td>' +
-      // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
-      '<td class="num ttfb-cell" title="' + esc(ttfbTitle) + '">' +
-        (ttfb == null ? '<span class="c-muted">—</span>'
-          : '<span class="usage-line"><span class="usage-item"><b>' + formatLatency(ttfb) + '</b></span></span>') + '</td>' +
-      '<td class="num speed-cell" title="' + esc(inferTitle) + '">' +
-        (infer == null ? '<span class="c-muted">—</span>'
-          : '<span class="usage-line"><span class="usage-item"><b>' + formatRate(infer) + '</b></span></span>') + '</td>' +
-      '<td class="num c-muted">' + ago(s.last_success) + '</td>' +
-      '<td class="acts">' +
-        '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
-        '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-        '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
-        (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
-                : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
-        /* 暂停 / 恢复选号（上游 paused 合并过来的操作）：「解冻/禁用」旁并列的第二个开关，
-           与 disable 正交且不能互相替代——pause 只退出选号，签到 / 活跃上报 / 保活 /
-           刷新余额照常；disable 默认连保号任务一起停（include_disabled_in_tasks 才是例外）。
-           也不与冷却互斥：冷却中的号同样可以主动让位，已暂停的号在冷却期间也应能立刻恢复
-           （意图立即生效，不必等冷却走完），故这一个按钮不看 frozen，只看 paused。
-           已禁用账号不渲染它：禁用已含「不参与选号」，两个按钮并列会让人以为效果能叠加，
-           也容易误以为禁用号的任务还能靠暂停挽回（本 fork 的 include_disabled_in_tasks
-           是全局开关，不是账号级补救）。 */
-        (s.disabled ? ''
-          : (s.paused
-              ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-              : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
-        '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
-      '</td></tr>';
-  }).join('');
+  }
+  return dst;
+}
+
+/* accWriteCell 把一个单元格描述符写进真实 td，并同步「已写状态」cur。
+   返回值 = 实际写入 DOM 的属性/内容次数：0 就是这个单元格一个字节都没动。 */
+function accWriteCell(row, i, next) {
+  const td = row.cells[i], cur = row.cs[i];
+  if (!td || !cur) return 0;
+  let n = 0;
+  const cls = next.cls || '';
+  if (cur.cls !== cls) { td.className = cls; cur.cls = cls; n++; }
+  if (next.text != null) {
+    if (cur.text !== next.text) { td.textContent = next.text; cur.text = next.text; n++; }
+  } else if (cur.html !== next.html) {
+    td.innerHTML = next.html; cur.html = next.html; n++;
+    // innerHTML 重写会重建整棵子树：进度条的 <i> 引用随之失效，必须重新抓，
+    // 并把新宽度一起记为已写（新 HTML 里已经带着 --w，不能再补一次 setProperty）。
+    if (i === 3) { row.bar = accBarOf(td); cur.pct = next.pct; }
+  }
+  const title = next.title == null ? '' : next.title;
+  if (cur.title !== title) {
+    if (title) td.title = title;
+    else if (typeof td.removeAttribute === 'function') td.removeAttribute('title');
+    cur.title = title; n++;
+  }
+  if (next.pct != null && cur.pct !== next.pct) {
+    // 只有「自身数字没变、池内基准变了」才会走到这里：整块 innerHTML 重写不值得，
+    // 直接改 CSS 变量（进度条宽度是它与 HTML 唯一的差异）。
+    if (row.bar && row.bar.style && typeof row.bar.style.setProperty === 'function') {
+      row.bar.style.setProperty('--w', next.pct + '%');
+    }
+    cur.pct = next.pct; n++;
+  }
+  return n;
+}
+
+/* accFlash 给刚被写的单元格加 600ms 高亮（CSS 的 .cell-flash，reduced-motion 下
+   由样式表关断动画）。定时器句柄挂在节点自身上：既省一张 Map，也避免同一格
+   连续两次补丁时叠出两个定时器。 */
+function accFlash(td) {
+  if (!td || !td.classList || typeof td.classList.add !== 'function') return;
+  td.classList.add('cell-flash');
+  if (td.__flashTimer) clearTimeout(td.__flashTimer);
+  td.__flashTimer = setTimeout(() => {
+    td.__flashTimer = null;
+    if (td.classList && typeof td.classList.remove === 'function') td.classList.remove('cell-flash');
+  }, 600);
+}
+
+/* accMakeTd / accMakeRow 生成新行（added 的新账号）：走 createElement + 描述符，
+   与整表 HTML 用同一份 accCells，形状不会漂。 */
+function accMakeTd(c) {
+  const td = document.createElement('td');
+  if (c.cls) td.className = c.cls;
+  if (c.aria && typeof td.setAttribute === 'function') td.setAttribute('aria-hidden', 'true');
+  if (c.title) td.title = c.title;
+  if (c.text != null) td.textContent = c.text; else td.innerHTML = c.html;
+  return td;
+}
+
+function accMakeRow(uid, vm) {
+  const tr = document.createElement('tr');
+  tr.className = vm.rowCls;
+  tr.title = vm.rowTitle;
+  if (typeof tr.setAttribute === 'function') tr.setAttribute('data-uid', uid);
+  const cells = accCells(vm);
+  for (let i = 0; i < cells.length; i++) tr.appendChild(accMakeTd(cells[i]));
+  return tr;
+}
+
+/* accInsertRef 新行该插在谁前面：order 里排在它后面的第一个「已在表里」的行。
+   没有 order（服务端数组顺序 = 追加）或找不到参照时返回 null → 追加到末尾。 */
+function accInsertRef(tb, uid, order) {
+  if (!Array.isArray(order) || typeof tb.insertBefore !== 'function') return null;
+  const at = order.indexOf(uid);
+  if (at < 0) return null;
+  for (let i = at + 1; i < order.length; i++) {
+    const row = accRows[order[i]];
+    if (row && row.tr) return row.tr;
+  }
+  return null;
+}
+
+/* patchAccounts 实时补丁：只写变化的单元格。
+   · accounts：uid → 变化字段（绝对新值，深合并）；
+   · added / removed：新增完整账号对象 / 移除 uid；
+   · order：显示顺序（仅在变化时下发）。
+   幂等：同一份绝对量再应用一次，不会产生任何 DOM 写入——这正是它存在的前提，
+   服务端 60s 兜底快照与实时补丁交错到达时不会互相打架。 */
+function patchAccounts(p) {
+  const tb = $('accBody');
+  if (!tb || !p) return;
+  const index = Object.create(null);
+  for (const s of accList) index[s.uid] = s;
+
+  const changed = (p.accounts && typeof p.accounts === 'object') ? p.accounts : null;
+  if (changed) for (const uid of Object.keys(changed)) {
+    const s = index[uid];
+    if (s) mergeAccount(s, changed[uid]);
+  }
+  if (Array.isArray(p.added)) for (const s of p.added) {
+    if (!s || typeof s.uid !== 'string') continue;
+    // 已在池里的 uid 按「变化字段」处理：服务端重发同一条不该长出第二行。
+    if (index[s.uid]) { mergeAccount(index[s.uid], s); continue; }
+    accList.push(s);
+    index[s.uid] = s;
+  }
+  if (Array.isArray(p.removed)) for (const uid of p.removed) {
+    const i = accList.findIndex(a => a && a.uid === uid);
+    if (i >= 0) accList.splice(i, 1);
+    delete index[uid];
+    const row = accRows[uid];
+    if (row) {
+      if (row.tr && typeof row.tr.remove === 'function') row.tr.remove();
+      delete accRows[uid];
+    }
+  }
+
+  if (!accList.length) { renderAccounts(accList); paintPool(); return; }
+  // 行缓存不可用（极简 DOM 桩 / 首屏渲染失败）：退回整表渲染，宁可多写也不要显示错。
+  if (!Object.keys(accRows).length) { renderAccounts(accList); paintPool(); return; }
+
+  const ctx = accCtx();
+  for (const s of accList) {
+    const row = accRows[s.uid];
+    if (!row) {
+      // 新 uid：VM → 新 <tr>，按 order 插到正确位置（没有 order 就追加，
+      // 与服务端数组顺序一致）；同一条补丁若带 order，末尾还会统一重排一次。
+      const vm = accountVM(s, ctx);
+      const tr = accMakeRow(s.uid, vm);
+      const ref = accInsertRef(tb, s.uid, p.order);
+      if (ref) tb.insertBefore(tr, ref);
+      else if (tb.appendChild) tb.appendChild(tr);
+      accRegister(s.uid, tr, vm);
+      continue;
+    }
+    const vm = accountVM(s, ctx);
+    if (row.vm.rowCls !== vm.rowCls && row.tr) row.tr.className = vm.rowCls;
+    const next = accCells(vm);
+    for (let i = 0; i < next.length; i++) {
+      if (accWriteCell(row, i, next[i])) accFlash(row.cells[i]);
+    }
+    row.vm = vm;
+  }
+
+  if (Array.isArray(p.order)) {
+    // 重排用 appendChild 复用同一批节点（不重建 → 滚动位置、hover、按钮焦点都不动）。
+    const seq = [];
+    const seen = Object.create(null);
+    for (const uid of p.order) {
+      const row = accRows[uid];
+      if (row && !seen[uid]) { seen[uid] = 1; seq.push(row); }
+    }
+    // order 里没提到的行追加在末尾：宁可位置不完美，也不能把它们藏起来。
+    for (const s of accList) {
+      const row = accRows[s.uid];
+      if (row && !seen[s.uid]) { seen[s.uid] = 1; seq.push(row); }
+    }
+    if (typeof tb.appendChild === 'function') for (const row of seq) tb.appendChild(row.tr);
+    // 源数组同步成同一顺序，维持「accList 顺序 = DOM 顺序」这一不变量。
+    const byUid = Object.create(null);
+    for (const s of accList) byUid[s.uid] = s;
+    const ordered = [];
+    for (const uid of p.order) { const s = byUid[uid]; if (s) { ordered.push(s); byUid[uid] = null; } }
+    for (const s of accList) if (byUid[s.uid]) ordered.push(s);
+    accList.length = 0;
+    for (const s of ordered) accList.push(s);
+  }
+  paintPool();
+}
+
+/* paintPool 账号池统计卡：所有写入都先比后写，所以「整包 overview」与「只带一个
+   字段的 pool 补丁」走同一条路径——补丁不可能把没变的数字再写一遍。
+   sCredits 的口径与旧版 loadOverview 完全一致（Σ剩余 / Σ总额，总额为 0 只显示剩余），
+   只是数据源换成当前 accList，故积分补丁后这张卡不会停在旧值上。 */
+function paintPool() {
+  const p = poolState || {};
+  setPoolText($('sTotal'), p.total);
+  setPoolText($('sHealthy'), p.healthy);
+  setPoolText($('sCooling'), p.cooling);
+  setPoolText($('sDisabled'), p.disabled);
+  let remSum = 0, totSum = 0;
+  for (const s of accList) { remSum += (s.credits || 0); totSum += (s.credits_total || 0); }
+  setPoolText($('sCredits'), totSum > 0 ? remSum + ' / ' + totSum : remSum);
+  setPoolText($('sSticky'), p.sticky_sessions);
+  setPoolText($('accNote'), p.in_flight_full ? p.in_flight_full + ' 个账号在途占满' : '');
+  setPoolText($('navState'), p.healthy > 0 ? '服务正常' : (p.total ? '无可用账号' : '待添加账号'));
+  const np = $('navPulse');
+  if (np) {
+    const cls = 'pulse' + (p.healthy > 0 ? '' : (p.total ? ' warn' : ' bad'));
+    if (np.className !== cls) np.className = cls;
+  }
+}
+
+/* setPoolText 只在文本真的变了才写（null / undefined 记为空串：实时补丁可能只带
+   部分字段，缺字段不该把卡片刷成 "undefined"）。 */
+function setPoolText(el, v) {
+  if (!el) return;
+  const s = v == null ? '' : String(v);
+  if (el.textContent !== s) el.textContent = s;
+}
+
+/* POOL_KEYS 是统计卡与侧栏状态涉及的全部池字段（与 overview 顶层同名字段一一对应）。 */
+const POOL_KEYS = ['total', 'healthy', 'cooling', 'disabled', 'sticky_sessions', 'in_flight_full'];
+
+/* patchPool 应用 pool 补丁（只带变化字段，值是绝对新值），随后由 paintPool 决定
+   真正要写的节点——没变的统计数字一个字节都不动。 */
+function patchPool(changed) {
+  if (!changed || typeof changed !== 'object') return;
+  const p = poolState || (poolState = {});
+  for (const k of POOL_KEYS) if (k in changed) p[k] = changed[k];
+  paintPool();
 }
 
 // renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
 // 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
 // 本 fork 的改写：域复用账号表的 .realm-tag、状态复用 .tag 体系（不另起平行徽标），
 // 倒计时复用 dur()（绝对时刻进 title——列里塞长日期会把表顶宽），空态复用 .empty 卡。
+// 实时模式下同一份渲染逻辑还要支持「按行补丁」，故拆出 mlKey/mlVM/mlCells/mlRowHTML
+// 四个纯构件：首屏整表与补丁共用，行用 data-mkey（model + 域）锚定。
+const ML_STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+
+/* mlKey 行锚：同一个模型可以在两个域各有一行，故 model 必须与域一起当键。 */
+function mlKey(r) { return String(r.model) + '|' + (r.realm === 'global' ? 'global' : 'cn'); }
+
+/* mlLeft 解锁时刻：列里只放「还剩多久」（倒计时才是运维要判断的量），绝对时刻进 title。 */
+function mlLeft(iso) {
+  const ms = parseAPITime(iso);
+  if (!ms) return { t: '—', title: '无明确解锁时刻' };
+  const sec = Math.max(0, Math.round((ms - Date.now()) / 1000));
+  return {
+    t: dur(sec),
+    title: '解锁于 ' + fmtLocalDateTime(ms) + (sec > 0 ? '（' + dur(sec) + '后）' : '（已到点，等待下一轮探测）'),
+  };
+}
+
+function mlVM(r) {
+  const st = ML_STATE[r.state] || ['mute', esc(r.state || '—')];
+  const realm = r.realm === 'global' ? '国际版' : '国内版';
+  // 最早解锁兜底用全池解锁：后端两字段同时给出，缺一列也不至于空着。
+  const first = mlLeft(r.unlock_at || r.fully_unlock_at);
+  const full = mlLeft(r.fully_unlock_at);
+  return {
+    model: esc(r.model),
+    realm: realm,
+    stateCls: st[0], stateLabel: st[1],
+    servable: (r.servable || 0) + ' <span class="c-muted">/</span> ' + (r.total || 0),
+    locked: String(r.locked || 0),
+    first: first, full: full,
+    reason: r.reason ? esc(r.reason) : '<span class="c-muted">—</span>',
+  };
+}
+
+/* mlCells 八列描述符，顺序与 index.html 的模型锁池表头一致。
+   title 一律显式给出（哪怕为空串）：描述符是补丁的「已写状态」，缺键会让
+   undefined 与 '' 相比为「变了」，首屏之后第一帧补丁就会把没标题的列全写一遍。 */
+function mlCells(vm) {
+  return [
+    { cls: '', html: vm.model, title: '' },
+    { cls: '', html: '<span class="realm-tag">' + vm.realm + '</span>', title: '' },
+    { cls: '', html: '<span class="tag ' + vm.stateCls + '">' + vm.stateLabel + '</span>', title: '' },
+    { cls: 'num', html: vm.servable, title: '' },
+    { cls: 'num', text: vm.locked, title: '' },
+    { cls: 'num', title: vm.first.title, text: vm.first.t },
+    { cls: 'num', title: vm.full.title, text: vm.full.t },
+    { cls: 'reason', html: vm.reason, title: '' },
+  ];
+}
+
+function mlRowHTML(r, vm) {
+  return '<tr data-mkey="' + esc(mlKey(r)) + '">' + mlCells(vm).map(accCellHTML).join('') + '</tr>';
+}
+
+// mlRows 行缓存：mkey → { tr, cells, vm, cs }（与 accRows 同理，用 null 原型对象
+// 而不是 Map——切片测试的沙箱里没有 Map）。
+let mlRows = Object.create(null);
+
 function renderModelLocks(rows) {
   const tb = $('mlBody');
   if (!tb) return;
   const note = $('mlNote');
   const list = Array.isArray(rows) ? rows.filter(r => r && r.model) : [];
+  mlRows = Object.create(null);
   if (!list.length) {
     // 无锁时不渲染空表：空 tbody 只剩表头，看着像功能坏了，给一句结论。
     tb.innerHTML = '<tr><td colspan="8"><div class="empty">' +
@@ -697,64 +1103,105 @@ function renderModelLocks(rows) {
     if (note) note.textContent = '';
     return;
   }
-  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
-  // 解锁时刻：列里只放「还剩多久」（倒计时才是运维要判断的量），绝对时刻进 title。
-  const left = iso => {
-    const ms = parseAPITime(iso);
-    if (!ms) return { t: '—', title: '无明确解锁时刻' };
-    const sec = Math.max(0, Math.round((ms - Date.now()) / 1000));
-    return {
-      t: dur(sec),
-      title: '解锁于 ' + fmtLocalDateTime(ms) + (sec > 0 ? '（' + dur(sec) + '后）' : '（已到点，等待下一轮探测）'),
-    };
-  };
-  tb.innerHTML = list.map(r => {
-    const st = STATE[r.state] || ['mute', esc(r.state || '—')];
-    const realm = r.realm === 'global' ? '国际版' : '国内版';
-    // 最早解锁兜底用全池解锁：后端两字段同时给出，缺一列也不至于空着。
-    const first = left(r.unlock_at || r.fully_unlock_at);
-    const full = left(r.fully_unlock_at);
-    return '<tr>' +
-      '<td>' + esc(r.model) + '</td>' +
-      '<td><span class="realm-tag">' + realm + '</span></td>' +
-      '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
-      '<td class="num">' + (r.servable || 0) + ' <span class="c-muted">/</span> ' + (r.total || 0) + '</td>' +
-      '<td class="num">' + (r.locked || 0) + '</td>' +
-      '<td class="num" title="' + esc(first.title) + '">' + first.t + '</td>' +
-      '<td class="num" title="' + esc(full.title) + '">' + full.t + '</td>' +
-      '<td class="reason">' + (r.reason ? esc(r.reason) : '<span class="c-muted">—</span>') + '</td>' +
-      '</tr>';
-  }).join('');
-  if (note) {
-    const bad = list.filter(r => r.state === 'locked' || r.state === 'starved').length;
-    note.textContent = bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流';
+  const vms = list.map(mlVM);
+  tb.innerHTML = list.map((r, i) => mlRowHTML(r, vms[i])).join('');
+  if (note) paintMLNote(list, note);
+  if (typeof tb.querySelectorAll !== 'function') return;
+  const trs = tb.querySelectorAll('tr[data-mkey]');
+  for (let i = 0; i < list.length && i < trs.length; i++) mlRegister(mlKey(list[i]), trs[i], vms[i]);
+}
+
+function mlRegister(key, tr, vm) {
+  mlRows[key] = { tr: tr, cells: cellsList(tr), vm: vm, cs: mlCells(vm) };
+}
+
+/* paintMLNote 表头摘要（几个模型整池不可用 / 部分限流）。只在文案变化时写。 */
+function paintMLNote(list, note) {
+  const bad = list.filter(r => r.state === 'locked' || r.state === 'starved').length;
+  const text = bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流';
+  if (note.textContent !== text) note.textContent = text;
+}
+
+/* patchModelLocks 模型锁池的行级补丁：message 里的 model_locks 是「当前应有的完整
+   一组行」，据此按 mkey 增/删/改/排序——更新的行只写变化单元格，未涉及的行节点不动。
+   空数组 = 锁全解了，回到与 renderModelLocks 完全一致的空态文案。 */
+function patchModelLocks(rows) {
+  const tb = $('mlBody');
+  if (!tb) return;
+  const note = $('mlNote');
+  const list = Array.isArray(rows) ? rows.filter(r => r && r.model) : [];
+  if (!Object.keys(mlRows).length) { renderModelLocks(list); return; }
+  if (!list.length) { renderModelLocks(list); return; }
+  const seen = Object.create(null);
+  const seq = [];
+  for (const r of list) {
+    const key = mlKey(r);
+    seen[key] = 1;
+    const vm = mlVM(r);
+    const row = mlRows[key];
+    if (!row || !row.tr) {
+      const tr = document.createElement('tr');
+      if (typeof tr.setAttribute === 'function') tr.setAttribute('data-mkey', key);
+      const cells = mlCells(vm);
+      for (let i = 0; i < cells.length; i++) tr.appendChild(accMakeTd(cells[i]));
+      if (typeof tb.appendChild === 'function') tb.appendChild(tr);
+      mlRows[key] = { tr: tr, cells: cellsList(tr), vm: vm, cs: cells };
+      seq.push(mlRows[key]);
+      continue;
+    }
+    const next = mlCells(vm);
+    for (let i = 0; i < next.length; i++) {
+      if (accWriteCell(row, i, next[i])) accFlash(row.cells[i]);
+    }
+    row.vm = vm;
+    seq.push(row);
   }
+  // 服务端没再提到的行就是解了锁：删行 + 删缓存。
+  for (const key of Object.keys(mlRows)) {
+    if (seen[key]) continue;
+    const row = mlRows[key];
+    if (row && row.tr && typeof row.tr.remove === 'function') row.tr.remove();
+    delete mlRows[key];
+  }
+  // 顺序按服务端给定（它已按「整池不可用 → 没号可用 → 部分限流」排好），
+  // appendChild 复用同一批节点，不重建。
+  if (typeof tb.appendChild === 'function') for (const row of seq) tb.appendChild(row.tr);
+  if (note) paintMLNote(list, note);
+}
+
+/* cellsList <tr> → td 数组（新建行的登记用；老行直接用缓存）。 */
+function cellsList(tr) {
+  const cells = [];
+  if (tr && typeof tr.querySelectorAll === 'function') {
+    const list = tr.querySelectorAll('td');
+    for (let i = 0; i < list.length; i++) cells.push(list[i]);
+  }
+  return cells;
+}
+
+function applyOverview(d) {
+  if (!d || typeof d !== 'object') return;
+  overviewData = d;
+  // 版本只在侧栏底栏展示一次：旧版品牌区与底栏重复显示同一版本号，观感冗余。
+  // 品牌区改展示部署形态（本地内存 / Redis 镜像），信息不重复。
+  $('navSub').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
+  $('navVer').textContent = 'v' + d.version;
+  const up = Math.floor(d.uptime_sec);
+  $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
+  renderAccounts(d.accounts || []);
+  renderModelLocks(d.model_locks);
+  // poolState 与 accList 都到位后再刷统计卡：sCredits 要的是整池求和后的结果。
+  poolState = {
+    total: d.total, healthy: d.healthy, cooling: d.cooling, disabled: d.disabled,
+    sticky_sessions: d.sticky_sessions, in_flight_full: d.in_flight_full,
+  };
+  paintPool();
 }
 
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
-    overviewData = d;
-    $('sTotal').textContent = d.total;
-    $('sHealthy').textContent = d.healthy;
-    $('sCooling').textContent = d.cooling;
-    $('sDisabled').textContent = d.disabled;
-    const remSum = (d.accounts || []).reduce((a, s) => a + (s.credits || 0), 0);
-    const totSum = (d.accounts || []).reduce((a, s) => a + (s.credits_total || 0), 0);
-    $('sCredits').textContent = totSum > 0 ? remSum + ' / ' + totSum : remSum;
-    $('sSticky').textContent = d.sticky_sessions;
-    // 版本只在侧栏底栏展示一次：旧版品牌区与底栏重复显示同一版本号，观感冗余。
-    // 品牌区改展示部署形态（本地内存 / Redis 镜像），信息不重复。
-    $('navSub').textContent = d.redis_mode === 'upstash' ? 'Redis 镜像' : '本地内存';
-    $('navVer').textContent = 'v' + d.version;
-    $('navState').textContent = d.healthy > 0 ? '服务正常' : (d.total ? '无可用账号' : '待添加账号');
-    const p = $('navPulse');
-    p.className = 'pulse' + (d.healthy > 0 ? '' : (d.total ? ' warn' : ' bad'));
-    $('accNote').textContent = d.in_flight_full ? d.in_flight_full + ' 个账号在途占满' : '';
-    const up = Math.floor(d.uptime_sec);
-    $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
-    renderAccounts(d.accounts || []);
-    renderModelLocks(d.model_locks);
+    applyOverview(d);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 
@@ -1697,16 +2144,152 @@ $('btnRefresh').onclick = async () => {
 };
 
 /* ── 轮询 ─────────────────────────────────────────────────────────── */
+/* 账号视图的 5s 轮询是**兜底**：WebSocket 通了就由推送更新（只写变化单元格），
+   断了或浏览器不支持时才退回整表刷新。其余视图的轮询口径不变。 */
 function refreshVisible() {
-  if (view === 'accounts') loadOverview(true);
+  if (view === 'accounts') { if (!liveOk) loadOverview(true); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
 }
+
+/* ── 实时推送（WebSocket）─────────────────────────────────────────────
+   旧链路：每 5s 拉一次 overview，整表 tbody.innerHTML 重渲染——40 个账号时
+   每秒上百个节点被无谓重建，滚动位置、hover、按钮焦点一起丢。
+   新链路：连接时服务端发一次 snapshot（与 /panel/api/overview 同构，直接喂
+   applyOverview），之后只发 patch（绝对新值 + 变化字段），由
+   patchAccounts / patchPool / patchModelLocks 只写真正变化的单元格；
+   60s 还会兜底重发一次 snapshot 纠正任何漂移。
+   降级策略：拿不到票据、握手失败、浏览器没有 WebSocket（含测试沙箱）都不影响
+   可用性——liveOk 始终为 false，refreshVisible 里的 5s 轮询照旧跑。 */
+let liveWs = null, liveOk = false, liveBoot = '', liveRev = 0, liveRetry = 0, liveTimer = null;
+let liveClosed = false;   // 主动断开（页面隐藏 / 卸载）时置位，避免 onclose 又排一次重连
+
+/* 退避表 1→2→4→8→30s 封顶。面板常常挂在旁边盯一整天：失败即 1s 快速探活，
+   长期失败后退到 30s，既不会把服务端打满，也不会让人等太久才发现服务恢复了。 */
+const LIVE_BACKOFF = [1000, 2000, 4000, 8000, 30000];
+
+/* liveBadge 侧栏签名区的「实时 / 轮询」徽标。绿色 = 实时推送在跑，琥珀 = 兜底轮询
+   （复用既有 .pulse 语义色，不新增配色）。只在文案/类名真的变化时写。 */
+function liveBadge() {
+  const t = $('liveBadge');
+  if (t) { const s = liveOk ? '实时' : '轮询'; if (t.textContent !== s) t.textContent = s; }
+  const p = $('livePulse');
+  if (p) { const cls = 'pulse' + (liveOk ? '' : ' warn'); if (p.className !== cls) p.className = cls; }
+}
+
+/* liveSchedule 排一次重连。liveTimer 既做「已有待执行重连」的去重，也保证
+   onerror 与 onclose 前后脚到达时不会连排两次、把退避表跳着走。 */
+function liveSchedule() {
+  if (liveTimer || liveClosed) return;
+  const delay = LIVE_BACKOFF[Math.min(liveRetry, LIVE_BACKOFF.length - 1)];
+  liveRetry++;
+  liveTimer = setTimeout(() => { liveTimer = null; liveConnect(); }, delay);
+}
+
+/* liveClose 主动断开：页面隐藏、卸载、服务端 bye 都走这里。liveClosed 置位后
+   onclose 不再排重连（否则隐藏的页面会在后台一直重连）。 */
+function liveClose() {
+  liveClosed = true;
+  if (liveTimer) { clearTimeout(liveTimer); liveTimer = null; }
+  const ws = liveWs;
+  liveWs = null;
+  liveOk = false;
+  liveBadge();
+  if (ws) { try { ws.close(); } catch (e) { /* 已经断了：忽略 */ } }
+}
+
+async function liveConnect() {
+  if (typeof WebSocket !== 'function' || liveClosed) return;
+  // 半开连接兜底：上一次只报了 error 却没触发 close 时，liveWs 会一直占着位置，
+  // 重连就被挡在门外、退避链永远停在原地。readyState=CLOSED(3) 说明它已经死了。
+  if (liveWs && liveWs.readyState === 3) liveWs = null;
+  if (liveWs) return;
+  let ticket = '';
+  /* 票据只在本地存有 api_key 时才申请：服务端 api_key 为空时是「免票据免参数」的
+     模式，那时带上 ?ticket= 属于另一种（不该出现的）形态。取票失败也照连——
+     拿不到票据不该让人看不到数据，收不收由服务端决定。 */
+  if (localStorage.getItem(LS_KEY)) {
+    try { const r = await api('live/ticket'); ticket = (r && r.ticket) || ''; }
+    catch (e) { ticket = ''; }
+  }
+  // 取票是异步的：这期间页面可能已被隐藏（liveClosed），或已经连上了。
+  if (liveClosed || liveWs) return;
+  const url = (location.protocol === 'https:' ? 'wss:' : 'ws:') + '//' + location.host +
+    '/panel/api/live' + (ticket ? '?ticket=' + encodeURIComponent(ticket) : '');
+  let ws;
+  try { ws = new WebSocket(url); }
+  catch (e) { console.warn('live: WebSocket 建立失败', e); liveSchedule(); return; }
+  liveWs = ws;
+  ws.onopen = () => { liveOk = true; liveRetry = 0; liveBadge(); };
+  ws.onmessage = ev => {
+    let msg;
+    try { msg = JSON.parse(ev && ev.data); }
+    catch (e) { console.warn('live: 坏帧已丢弃', e); return; }
+    // 一帧坏数据绝不能把页面打挂：应用阶段的异常一样收敛成 warn。
+    try { applyLive(msg); } catch (e) { console.warn('live: 补丁应用失败', e); }
+  };
+  ws.onerror = () => { liveOk = false; liveBadge(); liveSchedule(); };
+  ws.onclose = () => {
+    liveOk = false;
+    if (liveWs === ws) liveWs = null;
+    liveBadge();
+    if (!liveClosed) liveSchedule();
+  };
+}
+
+/* applyLive 处理一帧服务端消息（心跳是 WS 控制帧 PING，浏览器自动回 PONG，这里不用管）：
+   · boot 变化 = 服务端重启过，rev 序列从头发起，旧 rev 不能用来丢弃新帧；
+   · rev <= liveRev = 重放 / 乱序，整帧丢弃；
+   · snapshot 走整表渲染（与 /panel/api/overview 同一函数），patch 只写变化。
+   字段缺失一律跳过：补丁只带变化的东西，没提到的就是没变。 */
+function applyLive(msg) {
+  if (!msg || typeof msg !== 'object') return;
+  if (msg.boot != null && msg.boot !== liveBoot) { liveBoot = String(msg.boot); liveRev = 0; }
+  const type = String(msg.type || '');
+  if (type === 'bye') {
+    // 服务端要求下线（密钥轮换 / 票据失效）：断开后按退避重连，不无限打。
+    const ws = liveWs;
+    liveWs = null; liveOk = false; liveBadge();
+    if (ws) { try { ws.close(); } catch (e) { /* 已经断了：忽略 */ } }
+    liveSchedule();
+    return;
+  }
+  const hasRev = typeof msg.rev === 'number';
+  if (hasRev && msg.rev <= liveRev) return;
+  if (type === 'snapshot') {
+    if (msg.data && typeof msg.data === 'object') applyOverview(msg.data);
+  } else if (type === 'patch') {
+    // 顺序有讲究：账号 → 锁池 → 池统计卡。sCredits 是整池求和的结果，
+    // 先落账号再刷卡片，卡片才不会停在补丁前的旧值上。
+    if (msg.accounts || msg.added || msg.removed || msg.order) patchAccounts(msg);
+    // 用 in 判存在而不是真值：服务端把「字段消失」编码成显式 null（锁全解时
+    // model_locks 就是 null），当成"没带这段"会一直挂着过期的锁池行。
+    if ('model_locks' in msg) patchModelLocks(msg.model_locks);
+    if (msg.pool) patchPool(msg.pool);
+  } else {
+    return;   // 未知类型：不认识就不动，也不推进 rev
+  }
+  if (hasRev) liveRev = msg.rev;
+}
+
+/* liveStart 只在真有 WebSocket 时才挂生命周期监听：没有它（旧浏览器 / 测试沙箱）
+   就是纯轮询，连监听都不必注册。 */
+function liveStart() {
+  if (typeof WebSocket !== 'function') return;
+  document.addEventListener('visibilitychange', () => {
+    if (document.hidden) liveClose();          // 后台页面不占连接
+    else { liveClosed = false; liveRetry = 0; liveConnect(); }
+  });
+  addEventListener('beforeunload', () => liveClose());
+  liveConnect();
+}
+
 function start() {
   loadOverview(true);
   if (refTimer) clearInterval(refTimer);
   refTimer = setInterval(refreshVisible, 5000);
   checkAuthGate();
+  liveStart();
 }
 async function checkAuthGate() {
   try { await api('overview'); }

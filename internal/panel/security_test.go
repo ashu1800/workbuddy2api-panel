@@ -1,6 +1,7 @@
 package panel
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -18,8 +19,10 @@ func TestSecurityHeadersOnAllPanelResponses(t *testing.T) {
 	paths := []struct{ method, path string }{
 		{"GET", "/panel/"},
 		{"GET", "/panel/app.js"},
-		{"GET", "/panel/api/overview"}, // 401（未提供 key）
-		{"POST", "/panel/api/config"},  // 401
+		{"GET", "/panel/api/overview"},      // 401（未提供 key）
+		{"POST", "/panel/api/config"},       // 401
+		{"GET", "/panel/api/live"},          // 401（无票据，鉴权在升级之前）
+		{"GET", "/panel/api/live/ticket"},   // 401（未提供 key）
 		{"GET", "/panel/api/nonexistent"},
 	}
 	for _, c := range paths {
@@ -143,4 +146,81 @@ func TestAuthLayerBehavior(t *testing.T) {
 	if rec2.Code == http.StatusUnauthorized {
 		t.Error("valid key must pass the auth layer")
 	}
+}
+
+// checkSecurityHeaders 断言统一安全响应头齐全（供新增端点复用）。
+func checkSecurityHeaders(t *testing.T, h http.Header, label string) {
+	t.Helper()
+	if got := h.Get("Content-Security-Policy"); got == "" {
+		t.Errorf("%s: missing CSP", label)
+	}
+	if h.Get("X-Content-Type-Options") != "nosniff" {
+		t.Errorf("%s: X-Content-Type-Options=%q", label, h.Get("X-Content-Type-Options"))
+	}
+	if h.Get("X-Frame-Options") != "DENY" {
+		t.Errorf("%s: X-Frame-Options=%q", label, h.Get("X-Frame-Options"))
+	}
+	if h.Get("Referrer-Policy") != "no-referrer" {
+		t.Errorf("%s: Referrer-Policy=%q", label, h.Get("Referrer-Policy"))
+	}
+}
+
+// 实时推送端点（live.go）：升级端点无票据必须 401 且带全套安全头（浏览器里
+// 直接打开 /panel/api/live 看到的是 JSON，同样要吃 CSP）；取票端点走 withAuth，
+// 无 key 401、带 key 200 且真的给出票据。
+func TestLiveEndpointsAuthAndSecurityHeaders(t *testing.T) {
+	p := newTestPanel() // APIKey = "test-key"，Pool 为 nil（401 路径不会碰池）
+
+	// 1) 无票据升级 → 401 invalid_ticket（且不能升级：没有 101 的任何痕迹）。
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/api/live", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("live 无票据: code=%d want 401", rec.Code)
+	}
+	if !strings.Contains(rec.Body.String(), "invalid_ticket") {
+		t.Errorf("live 无票据响应体=%q，want invalid_ticket", rec.Body.String())
+	}
+	if rec.Header().Get("Sec-WebSocket-Accept") != "" {
+		t.Error("鉴权失败不该带回任何升级相关响应头")
+	}
+	checkSecurityHeaders(t, rec.Header(), "GET /panel/api/live")
+
+	// 2) 错票据同样 401（票据是唯一的通行凭证）。
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/api/live?ticket=nope", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("live 错票据: code=%d want 401", rec.Code)
+	}
+	checkSecurityHeaders(t, rec.Header(), "GET /panel/api/live?ticket=nope")
+
+	// 3) 取票端点：无 key 401 + 安全头。
+	rec = httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/api/live/ticket", nil))
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("ticket 无 key: code=%d want 401", rec.Code)
+	}
+	checkSecurityHeaders(t, rec.Header(), "GET /panel/api/live/ticket (401)")
+
+	// 4) 取票端点：带 key 200，且返回票据与 TTL。
+	rec = httptest.NewRecorder()
+	req := httptest.NewRequest("GET", "/panel/api/live/ticket", nil)
+	req.Header.Set("Authorization", "Bearer test-key")
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ticket 带 key: code=%d want 200 (body=%s)", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Ticket    string `json:"ticket"`
+		ExpiresIn int    `json:"expires_in"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("解析取票响应: %v", err)
+	}
+	if got.Ticket == "" {
+		t.Error("取票响应没有 ticket")
+	}
+	if got.ExpiresIn != 30 {
+		t.Errorf("expires_in=%d want 30", got.ExpiresIn)
+	}
+	checkSecurityHeaders(t, rec.Header(), "GET /panel/api/live/ticket (200)")
 }

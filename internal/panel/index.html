@@ -125,6 +125,9 @@ body {
 *::-webkit-scrollbar-track { background: transparent; }
 @media (prefers-reduced-motion: reduce) {
   * { transition: none !important; animation: none !important; }
+  /* 变化单元格的高亮是纯装饰：动画关断后 .cell-flash 不留任何静态痕迹
+     （这个 class 只承载动画，本身没有其它样式）。 */
+  .acc tbody td.cell-flash { animation: none; }
 }
 /* 屏幕阅读器专用文本 / 跳转链接 */
 .sr-only {
@@ -308,6 +311,11 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
 .pulse { width: 7px; height: 7px; border-radius: 50%; background: var(--ok-mark); flex: none; }
 .pulse.warn { background: var(--warn-mark); }
 .pulse.bad { background: var(--bad-mark); }
+/* 实时补丁的「变化单元格」提示：只有真的被写过的单元格才会挂上 .cell-flash
+   （app.js 在写完后 600ms 摘掉），底色用既有 --accent-soft 渐隐回 --surface，
+   时长复用 --t-base 的倍数——不新增配色与时间常量。 */
+@keyframes cell-flash { from { background: var(--accent-soft); } to { background: var(--surface); } }
+.acc tbody td.cell-flash { animation: cell-flash calc(var(--t-base) * 3) ease-out; }
 
 .empty { padding: var(--sp-8) var(--sp-5); text-align: center; color: var(--ink-2); font-size: var(--fs-13); }
 .empty .big { font-size: var(--fs-14); font-weight: 500; color: var(--ink); margin-bottom: var(--sp-1); }
@@ -855,6 +863,12 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
     </ul>
     <div class="sig">
       <div class="row"><span class="pulse" id="navPulse"></span><span id="navState">连接中</span></div>
+      <!-- 实时 / 轮询徽标：WebSocket 通了显示「实时」，断开（或浏览器不支持、票据拿不到）
+           回落「轮询」——那时账号表仍由 5s 轮询兜底。沿用 .pulse 的语义色（绿=实时 /
+           琥珀=轮询），不新增配色；文案由 app.js 的 liveBadge() 维护。 -->
+      <div class="row" title="实时 = WebSocket 推送，只更新变化的单元格；轮询 = 每 5 秒兜底刷新整表">
+        <span class="pulse warn" id="livePulse"></span><span id="liveBadge">轮询</span>
+      </div>
       <div class="row"><span class="mono" id="navVer">v-</span></div>
     </div>
   </nav>
