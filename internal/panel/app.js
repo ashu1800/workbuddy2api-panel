@@ -720,10 +720,21 @@ function renderRequestMetrics(m, entries) {
       (a.last_error ? ' · 错误：' + a.last_error : '')
     : '仅内存指标，JSONL 归档已关闭';
 
-  $('reqLogBox').innerHTML = (entries || []).map(requestLogLine).join('') ||
+  const rows = entries || [];
+  $('reqLogBox').innerHTML = rows.map(requestLogLine).join('') ||
     '<span class="c-muted">暂无请求记录</span>';
+  // 调用来源是增量字段：开关关闭（logging.request_client_info=false）或读到功能上线前
+  // 写入的归档行时，整页都不会有来源。这时在归档状态旁点名原因，否则每行缺的那段
+  // 会被当成 reqlog 解析坏了。
+  const hasSource = rows.some(e => e && (e.client_ip || e.user_agent));
+  if (rows.length && !hasSource) $('reqNote').textContent += ' · 来源未记录';
 }
 
+/* requestLogText 生成请求记录行（本 fork 的行式日志，渲染进 #reqLogBox 的 .ln 行）。
+   字段顺序是本 fork 的既有约定（请求 ID 收尾），本批只加两段，且都要求「有观测才
+   显示」：缓存命中率（token 口径指标，紧跟 credit）与调用来源（沿用 stdout 流水行
+   的 `src=… ua=…` 写法）。两者都没有的老归档行因此保持原样，不会凭空多出
+   「命中 —」「src=- ua=-」这类看着像坏了的占位。 */
 function requestLogText(e) {
   const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
   const outcomeLabel = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' };
@@ -734,7 +745,7 @@ function requestLogText(e) {
     const value = Number(e.credit);
     if (Number.isFinite(value)) credit = String(Number(value.toFixed(2))) + ' credit';
   }
-  return [
+  const out = [
     when,
     String(e && e.status || '—') + ' ' + (outcomeLabel[e && e.outcome] || (e && e.outcome) || '—'),
     e && e.model || '—',
@@ -742,8 +753,102 @@ function requestLogText(e) {
     fmtMs(e && e.duration_ms),
     fmtTok(token) + ' tok',
     credit,
-    e && e.request_id || '—',
-  ].join(' | ');
+  ];
+  const rate = cacheRateText(e && e.cache_hit_tokens, e && e.cache_miss_tokens);
+  if (rate !== '—') out.push('命中 ' + rate + '（' + fmtTok(e && e.cache_hit_tokens) + ' tok）');
+  const src = requestSourceText(e);
+  if (src) out.push(src);
+  out.push(e && e.request_id || '—');
+  return out.join(' | ');
+}
+
+/* requestSourceText 调用来源片段（客户端 IP + User-Agent 短标签）。
+   与 internal/server/logging.go 的 stdout 流水行同款：两者都没采集时返回空串（不追加，
+   旧行格式不变）；只缺一侧时该侧写 `-`，绝不拿别的字段顶替。IP 用裸值便于 grep，
+   UA 加引号（短标签里可能含空格）。 */
+function requestSourceText(e) {
+  const ip = String(e && e.client_ip || '').trim();
+  const ua = shortUA(e && e.user_agent);
+  if (!ip && !ua) return '';
+  return 'src=' + (ip || '-') + ' ua=' + (ua ? '"' + ua + '"' : '-');
+}
+
+/* cacheRateText 前缀缓存命中率（上游 prompt cache，issue #92）。命中率 = 命中 ÷
+   （命中 + 未命中）；无观测（两者都是 0/缺字段）返回 '—' 而不是 '0%'——把「没有
+   样本」显示成 0% 会被读成「缓存完全失效」，那是误导。统计卡、明细表、请求行共用
+   这一个口径，避免三处各算一遍后漂移。自包含（不依赖 trimFixed），便于切片测试。 */
+function cacheRateText(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '—';
+  return String(Math.round(h / total * 1000) / 10) + '%';
+}
+
+/* cacheRateTone 命中率健康度分档：≥90% 绿 / 80–90% 琥珀 / <80% 红 / 无样本无色。
+   上游用内联 style 上色，本 fork 禁静态内联样式，这里只回档位名，由调用方接既有
+   语义色类（卡片 .stat.good|warn|bad、表格 .c-ok|warn|bad）。 */
+function cacheRateTone(hit, miss) {
+  const h = Number(hit || 0), m = Number(miss || 0), total = h + m;
+  if (!total) return '';
+  const pct = h / total * 100;
+  return pct >= 90 ? 'ok' : (pct >= 80 ? 'warn' : 'bad');
+}
+
+/* cacheRateCell 明细表里的命中率单元格：绝对值（命中/未命中 tok）进 title，供逐项
+   核对——只有百分比时无法区分「1k 命中 90%」和「1M 命中 90%」。 */
+function cacheRateCell(hit, miss) {
+  const tone = cacheRateTone(hit, miss);
+  if (!tone) return '<span class="c-muted">—</span>';
+  return '<span class="c-' + tone + '" title="命中 ' + fmtTok(hit) + ' / 未命中 ' + fmtTok(miss) + ' tok">' +
+    cacheRateText(hit, miss) + '</span>';
+}
+
+/* cacheRateStat 用量总览的命中率统计卡：与明细表共用 tone 口径，只把档位映射到
+   .stat 的语义色类（卡片用的是 good，不是 ok）。 */
+function cacheRateStat(hit, miss) {
+  const tone = cacheRateTone(hit, miss);
+  return usStat(cacheRateText(hit, miss), '缓存命中率', tone === 'ok' ? 'good' : tone);
+}
+
+/* shortUA 是后端 internal/logfmt.ShortUA 的等价实现。面板从 reqlog 拿到的是完整 UA
+   （最长 200 字节），浏览器 UA 动辄 120+ 字符，直接铺进行式日志会把整行挤爆；而
+   「Mozilla/5.0 (Windows NT …) AppleWebKit/537.36 …」里对「这是什么客户端」有用的
+   只有 Chrome/120.0.0.0。取第一个 name/version 形态且 name 不是渲染引擎的 token；
+   没有就回落整串截断。口径与 stdout 流水行的 ua= 一致，两处看到的标签才不打架。 */
+const SHORT_UA_MAX = 40;
+const UA_ENGINES = {
+  mozilla: 1, applewebkit: 1, gecko: 1, khtml: 1, like: 1, safari: 1, compatible: 1, msie: 1, trident: 1,
+};
+function shortUA(ua) {
+  const s = String(ua == null ? '' : ua).trim();
+  if (!s) return '';
+  for (const raw of s.split(/\s+/)) {
+    const tok = raw.replace(/^[(),;]+/, '').replace(/[(),;]+$/, '');
+    const slash = tok.indexOf('/');
+    if (slash <= 0) continue;
+    if (UA_ENGINES[tok.slice(0, slash).toLowerCase()]) continue;
+    return truncBytes(tok, SHORT_UA_MAX);
+  }
+  return truncBytes(s, SHORT_UA_MAX);
+}
+
+/* truncBytes 按 UTF-8 字节上限截断（对齐后端 logfmt.Truncate：切点落在多字节字符
+   中间时整个让出该字符）。UA 里混中文时按字符数截会超字节上限，按字节截又会切出
+   半个字符，故逐个码点累加。 */
+function truncBytes(s, n) {
+  let used = 0, out = '';
+  for (const ch of String(s)) {
+    const b = utf8Len(ch);
+    if (used + b > n) break;
+    used += b; out += ch;
+  }
+  return out;
+}
+function utf8Len(ch) {
+  const c = ch.codePointAt(0);
+  if (c < 0x80) return 1;
+  if (c < 0x800) return 2;
+  if (c < 0x10000) return 3;
+  return 4;
 }
 
 function requestLogLine(e) {
@@ -788,6 +893,9 @@ const CFG_MAP = {
   prompt_mode: ['prompt', 'mode'], prompt_file: ['prompt', 'file'],
   sanitize_blacklist_fingerprints: ['features', 'sanitize_blacklist_fingerprints'],
   session_sticky_enabled: ['session_sticky', 'enabled'],
+  // 调用来源（客户端 IP / UA）开关：比 token 计数敏感，共享部署可一键关掉。
+  // 后端缺省 true、热生效（无需重启），面板只负责回填/保存这一个布尔值。
+  request_client_info: ['logging', 'request_client_info'],
 };
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
@@ -1628,7 +1736,9 @@ function usBar(prompt, completion, total) {
 }
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
-   withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。 */
+   withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。
+   缓存命中率紧跟在「合计」之后：它是 token 口径的构成指标，与三张表都同序，
+   加列时表头（index.html）、本函数、空态 colspan 三处必须一起改。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -1639,6 +1749,7 @@ function usRow(name, sub, a, mid, withPerf) {
     '<td class="num">' + fmtTok(a.prompt_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.completion_tokens) + '</td>' +
     '<td class="num">' + fmtTok(a.total_tokens) + '</td>' +
+    '<td class="num">' + cacheRateCell(a.cache_hit_tokens, a.cache_miss_tokens) + '</td>' +
     (withPerf
       ? '<td class="num">' + fmtMs(a.avg_latency_ms) + '</td>' +
         '<td class="num">' + fmtRate(a.avg_tokens_per_second) + '</td>'
@@ -1648,6 +1759,8 @@ function usRow(name, sub, a, mid, withPerf) {
 
 function renderUsage(d) {
   const t = d.totals || {};
+  // 第七张卡：缓存命中率（无样本时 cacheRateStat 自己回 '—'）。statsHTML 会把不足
+  // 列数的空位补成 .blank（6 的倍数），所以多一张卡不会漏出容器底色。
   $('usStats').innerHTML = statsHTML([
     usStat(fmtTok(t.requests), '请求数'),
     usStat(fmtTok(t.total_tokens), '总 token'),
@@ -1655,6 +1768,7 @@ function renderUsage(d) {
     usStat(fmtTok(t.completion_tokens), 'completion'),
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : ''),
     usStat(fmtMs(t.avg_latency_ms), '平均延迟'),
+    cacheRateStat(t.cache_hit_tokens, t.cache_miss_tokens),
   ]);
 
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
@@ -1670,13 +1784,13 @@ function renderUsage(d) {
   $('usAccBody').innerHTML = (d.by_account || []).map(x =>
     usRow(x.key.slice(0, 8), x.extra || '', x,
       '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="10" class="empty">暂无数据</td></tr>';
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
 
   $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="7" class="empty">暂无数据</td></tr>';
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
 
   renderCreditDimensions(d);
   renderUsageChart(d.series || []);

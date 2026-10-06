@@ -848,3 +848,397 @@ process.stdout.write(JSON.stringify({ locks, note, emptyNull, emptyNote, emptyAr
 		t.Errorf("模型锁池表有 %d 个 <th>，空态 colspan=8", len(ths))
 	}
 }
+
+// TestAppJSRequestLogSourceAndCache 请求行的「调用来源 + 缓存命中率」两段增量（本批从
+// 上游移植，形态适配本 fork 的行式日志）：
+//   - 来源段与 stdout 流水行同款（`src=IP ua="客户端标签"`），且**只有采集到才追加**：
+//     两者皆空时整段不出现，功能上线前写入的老归档行保持原格式（不凭空多出占位）；
+//     只缺一侧时该侧写 `-`，不拿别的字段顶替。
+//   - UA 走后端 internal/logfmt.ShortUA 的等价实现：跳过 Mozilla/AppleWebKit 这类渲染
+//     引擎 token 取 Chrome/120.0.0.0；没有 name/version 就回落整串；一律截到 40 字节
+//     （UA 是客户端可控自由文本，不设上限会把整行挤爆）。
+//   - 命中率只在有观测（命中+未命中 > 0）时出现，并带命中 token 绝对值——只有百分比
+//     区分不出「2k 命中 98%」和「2M 命中 98%」。
+func TestAppJSRequestLogSourceAndCache(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; request source formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const fmtStart = src.indexOf('function fmtTok(');
+const fmtEnd = src.indexOf('function usStat(');
+const reqStart = src.indexOf('function requestLogText');
+const reqEnd = src.indexOf('function fmtBytes');
+if ([escStart, escEnd, fmtStart, fmtEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('request log helpers not found');
+const ctx = { Date, Number, String, Math, RegExp, isNaN };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + src.slice(fmtStart, fmtEnd) + src.slice(reqStart, reqEnd) +
+  '\nthis.requestLogText=requestLogText; this.requestLogLine=requestLogLine; this.shortUA=shortUA;',
+  ctx
+);
+const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+const base = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12 };
+const plain = { ...base, request_id: 'req-1' };
+const full = { ...base, request_id: 'req-2', client_ip: '203.0.113.7', cache_hit_tokens: 2257, cache_miss_tokens: 43,
+  user_agent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36' };
+const missOnly = { ...base, request_id: 'req-3', user_agent: 'curl/8.4.0', cache_hit_tokens: 0, cache_miss_tokens: 2000 };
+const ipOnly = { ...base, request_id: 'req-4', client_ip: '198.51.100.9' };
+const productOnly = { ...base, request_id: 'req-5', user_agent: 'node' };
+const enginesOnly = { ...base, request_id: 'req-6', user_agent: 'Mozilla/5.0 AppleWebKit/537.36' };
+const longUA = { ...base, request_id: 'req-7', user_agent: 'VeryLongClientNameThatKeepsGoingAndGoing/1.2.3' };
+const cjkUA = { ...base, request_id: 'req-8', user_agent: 'Mozilla/5.0 中文客户端名称特别长特别长特别长特别长/1.2.3' };
+const htmlUA = { ...base, request_id: 'req-9', client_ip: '<b>10.0.0.1</b>', user_agent: 'Mozilla/5.0 Chrome/1.0<b>' };
+process.stdout.write(JSON.stringify({
+  plain: ctx.requestLogText(plain),
+  fullLine: ctx.requestLogLine(full),
+  fullUA: ctx.shortUA(full.user_agent),
+  missOnly: ctx.requestLogText(missOnly),
+  ipOnly: ctx.requestLogText(ipOnly),
+  productOnly: ctx.requestLogText(productOnly),
+  enginesOnly: ctx.requestLogText(enginesOnly),
+  longUA: ctx.requestLogText(longUA),
+  cjkUA: ctx.requestLogText(cjkUA),
+  htmlUA: ctx.requestLogLine(htmlUA),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "request-source-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("request source formatting node test failed: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("request source formatting output is not JSON: %v\n%s", err, out)
+	}
+	const head = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit"
+	for _, tc := range []struct{ key, want string }{
+		// 无来源无命中观测：与旧格式逐字节一致（本批是纯增量）。
+		{"plain", head + " | req-1"},
+		{"fullUA", "Chrome/120.0.0.0"},
+		{"fullLine", `<span class="ln">` + head + ` | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;Chrome/120.0.0.0&quot; | req-2</span>`},
+		// 命中 0 但确有观测（整段未命中）：显示 0%，而不是被当成「没样本」吞掉。
+		{"missOnly", head + ` | 命中 0%（0 tok） | src=- ua="curl/8.4.0" | req-3`},
+		{"ipOnly", head + " | src=198.51.100.9 ua=- | req-4"},
+		{"productOnly", head + ` | src=- ua="node" | req-5`},
+		{"enginesOnly", head + ` | src=- ua="Mozilla/5.0 AppleWebKit/537.36" | req-6`},
+		{"longUA", head + ` | src=- ua="VeryLongClientNameThatKeepsGoingAndGoing" | req-7`},
+		// 中文 UA 按 UTF-8 字节截断（对齐后端 logfmt.Truncate 的 rune 边界回退）：
+		// 13 个汉字 = 39 字节，第 14 个会越过 40 字节上限，整个让出（不切出半个字符）。
+		{"cjkUA", head + ` | src=- ua="中文客户端名称特别长特别长" | req-8`},
+		// 来源与正文同走 esc：UA 是客户端可控文本，不能让它闭合属性/注入标签。
+		{"htmlUA", `<span class="ln">` + head + ` | src=&lt;b&gt;10.0.0.1&lt;/b&gt; ua=&quot;Chrome/1.0&lt;b&gt;&quot; | req-9</span>`},
+	} {
+		if got[tc.key] != tc.want {
+			t.Errorf("%s=%q\nwant %q", tc.key, got[tc.key], tc.want)
+		}
+	}
+}
+
+// TestAppJSCacheRateFormatting 缓存命中率三种呈现（统计卡 / 明细表单元格 / 请求行）必须
+// 同一口径：命中率 = 命中 ÷（命中 + 未命中），无样本回 '—'——显示成 0% 会被读成「缓存
+// 完全失效」，那是误导。分档 ≥90% 绿 / 80–90% 琥珀 / <80% 红，全部走 index.html 既有
+// 语义色类（.stat.good|warn|bad、.c-ok|warn|bad）：上游用内联 style 上色，本 fork 的
+// TestAppJSNoStaticInlineStyle 禁止这种写法，故改为类名映射。
+func TestAppJSCacheRateFormatting(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; cache rate formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const escStart = src.indexOf('function esc(');
+const escEnd = src.indexOf('function ago(');
+const usStart = src.indexOf('function fmtTok(');
+const usEnd = src.indexOf('function parsePointTime');
+const reqStart = src.indexOf('function requestLogText');
+const reqEnd = src.indexOf('function fmtBytes');
+if ([escStart, escEnd, usStart, usEnd, reqStart, reqEnd].some(v => v < 0)) throw new Error('cache rate helpers not found');
+const ctx = { Date, Number, String, Math, RegExp, isNaN };
+vm.createContext(ctx);
+vm.runInContext(
+  src.slice(escStart, escEnd) + src.slice(usStart, usEnd) + src.slice(reqStart, reqEnd) +
+  '\nthis.cacheRateText=cacheRateText; this.cacheRateCell=cacheRateCell; this.cacheRateStat=cacheRateStat;',
+  ctx
+);
+process.stdout.write(JSON.stringify({
+  text: ctx.cacheRateText(2257, 43),
+  noSamples: ctx.cacheRateText(0, 0),
+  missing: ctx.cacheRateText(undefined, null),
+  allMiss: ctx.cacheRateText(0, 2000),
+  allHit: ctx.cacheRateText(100, 0),
+  boundary90: ctx.cacheRateText(900, 100),
+  boundary80: ctx.cacheRateText(80, 20),
+  rounded: ctx.cacheRateText(1, 2),
+  cellNone: ctx.cacheRateCell(0, 0),
+  cellOk: ctx.cacheRateCell(95, 5),
+  cellWarn: ctx.cacheRateCell(85, 15),
+  cellBad: ctx.cacheRateCell(50, 50),
+  cellBig: ctx.cacheRateCell(2257, 43),
+  statOk: ctx.cacheRateStat(95, 5),
+  statNone: ctx.cacheRateStat(0, 0),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "cache-rate-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("cache rate formatting node test failed: %v\n%s", err, out)
+	}
+	const want = `{"text":"98.1%","noSamples":"—","missing":"—","allMiss":"0%","allHit":"100%",` +
+		`"boundary90":"90%","boundary80":"80%","rounded":"33.3%",` +
+		`"cellNone":"<span class=\"c-muted\">—</span>",` +
+		`"cellOk":"<span class=\"c-ok\" title=\"命中 95 / 未命中 5 tok\">95%</span>",` +
+		`"cellWarn":"<span class=\"c-warn\" title=\"命中 85 / 未命中 15 tok\">85%</span>",` +
+		`"cellBad":"<span class=\"c-bad\" title=\"命中 50 / 未命中 50 tok\">50%</span>",` +
+		`"cellBig":"<span class=\"c-ok\" title=\"命中 2.3k / 未命中 43 tok\">98.1%</span>",` +
+		`"statOk":"<div class=\"stat good\"><div class=\"v\">95%</div><div class=\"k\">缓存命中率</div></div>",` +
+		`"statNone":"<div class=\"stat \"><div class=\"v\">—</div><div class=\"k\">缓存命中率</div></div>"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("cache rate formatting=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSUsageCacheRender node + DOM 桩真实渲染一次（沙箱写法同 TestAppJSTopLevelSmoke）：
+//   - 请求记录行：有来源与无来源两组，分别渲染成 .ln 行；
+//   - 用量页：总览统计卡（含新增的缓存命中率卡）、按账号/按模型/按域三张明细表（含新增
+//     的命中率列与空态 colspan）；
+//   - 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数，无 tok 后缀）。
+//
+// 列位置也一起钉住：命中率列插在「合计」与「均延迟」之间，三张表同序——只断言列数
+// 发现不了「列数对但插错位置」。
+func TestAppJSUsageCacheRender(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; usage cache render test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// 四段纯声明切片（各自下界都是下一个函数声明，中间没有顶层副作用语句）：
+//   A = 转义/格式化工具，B = 统计口径 + renderAccounts，C = 用量页渲染，
+//   D = 请求记录渲染（renderRequestMetrics + requestLogText + 缓存/来源 helper）。
+const a = src.slice(src.indexOf('function esc('), src.indexOf('function veilStack('));
+const b = src.slice(src.indexOf('function avgTTFB('), src.indexOf('async function loadOverview('));
+const c = src.slice(src.indexOf('function fmtTok('), src.indexOf('function parsePointTime'));
+const d = src.slice(src.indexOf('function renderRequestMetrics'), src.indexOf("$('btnLogPin')"));
+if (!a || !b || !c || !d) throw new Error('render slice not found in app.js');
+const nodes = {};
+const el = id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '', selectedOptions: [] });
+const ctx = {
+  Date, Number, String, Boolean, Math, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
+  $: el,
+  renderUsageChart: () => { el('usChart').innerHTML = 'CHART'; },
+};
+vm.createContext(ctx);
+vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d +
+  '\nthis.renderRequestMetrics = renderRequestMetrics;' +
+  '\nthis.renderUsage = renderUsage;' +
+  '\nthis.renderAccounts = renderAccounts;\n', ctx);
+
+const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+const base = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12 };
+const plain = { ...base, request_id: 'req-1' };
+const full = { ...base, request_id: 'req-2', client_ip: '203.0.113.7', user_agent: 'curl/8.4.0', cache_hit_tokens: 2257, cache_miss_tokens: 43 };
+ctx.renderRequestMetrics({ completed: 2, success_rate: 100, http_success_rate: 100, avg_duration_ms: 1250, in_flight: 0,
+  archive: { enabled: true, bytes: 20480 } }, [plain, full]);
+const reqLogBox = nodes.reqLogBox.innerHTML;
+const reqNoteWithSource = nodes.reqNote.textContent;
+// 开关关闭 / 旧归档：整页无来源时明确点名，而不是让人以为解析坏了。
+ctx.renderRequestMetrics({ completed: 1, archive: { enabled: true, bytes: 0 } }, [plain]);
+const reqNoteNoSource = nodes.reqNote.textContent;
+
+ctx.renderUsage({
+  totals: { requests: 1200, total_tokens: 1200000, prompt_tokens: 900000, completion_tokens: 300000, errors: 0,
+    avg_latency_ms: 1300, cache_hit_tokens: 2257, cache_miss_tokens: 43 },
+  by_account: [{ key: 'uid-0000000000000001', extra: '号一', realm: 'cn', requests: 12, errors: 0,
+    prompt_tokens: 100, completion_tokens: 20, total_tokens: 120, avg_latency_ms: 900, avg_tokens_per_second: 30,
+    cache_hit_tokens: 95, cache_miss_tokens: 5 }],
+  by_model: [{ key: 'glm-5.3', requests: 3, errors: 1, prompt_tokens: 10, completion_tokens: 2, total_tokens: 12,
+    cache_hit_tokens: 0, cache_miss_tokens: 100 }],
+  by_realm: [{ key: 'cn', requests: 3, prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 }],
+  credit_by_account: [], credit_by_model: [], series: [],
+});
+const usStats = nodes.usStats.innerHTML;
+const usAcc = nodes.usAccBody.innerHTML;
+const usModel = nodes.usModelBody.innerHTML;
+const usRealm = nodes.usRealmBody.innerHTML;
+
+// 空态：colspan 必须与表头列数（11 / 8 / 8）一致，否则空表整行错位。
+ctx.renderUsage({ totals: {}, by_account: [], by_model: [], by_realm: [], series: [] });
+const emptyAcc = nodes.usAccBody.innerHTML;
+const emptyModel = nodes.usModelBody.innerHTML;
+const emptyRealm = nodes.usRealmBody.innerHTML;
+const emptyStats = nodes.usStats.innerHTML;
+
+ctx.renderAccounts([{
+  uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+  last_success: '2026-09-28T13:00:00Z',
+  today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+  token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+}]);
+const accounts = nodes.accBody.innerHTML;
+process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSource, usStats, usAcc, usModel, usRealm,
+  emptyAcc, emptyModel, emptyRealm, emptyStats, accounts }));`
+	f, err := os.CreateTemp(t.TempDir(), "usage-cache-render-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("usage cache render node test failed: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("usage cache render output is not JSON: %v\n%s", err, out)
+	}
+	const line = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit"
+	for _, frag := range []string{
+		`<span class="ln">` + line + ` | req-1</span>`,
+		`<span class="ln">` + line + ` | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;curl/8.4.0&quot; | req-2</span>`,
+	} {
+		if !strings.Contains(got["reqLogBox"], frag) {
+			t.Errorf("请求记录行缺少片段 %q\n实际：%s", frag, got["reqLogBox"])
+		}
+	}
+	if strings.Contains(got["reqNoteWithSource"], "来源未记录") {
+		t.Errorf("有来源时不该提示「来源未记录」：%s", got["reqNoteWithSource"])
+	}
+	if !strings.Contains(got["reqNoteNoSource"], "来源未记录") {
+		t.Errorf("整页无来源时应提示「来源未记录」：%s", got["reqNoteNoSource"])
+	}
+
+	// 统计卡：命中率卡在总览统计条里，无样本时也是 '—'（不是 0%）。
+	if !strings.Contains(got["usStats"], `<div class="stat good"><div class="v">98.1%</div><div class="k">缓存命中率</div></div>`) {
+		t.Errorf("用量总览缺少缓存命中率统计卡：%s", got["usStats"])
+	}
+	if !strings.Contains(got["emptyStats"], `<div class="stat "><div class="v">—</div><div class="k">缓存命中率</div></div>`) {
+		t.Errorf("无样本时命中率卡应显示 —：%s", got["emptyStats"])
+	}
+
+	// 明细表：命中率列在「合计」与「均延迟」之间（三张表同序），绝对值进 title。
+	if !strings.Contains(got["usAcc"],
+		`<td class="num">120</td><td class="num"><span class="c-ok" title="命中 95 / 未命中 5 tok">95%</span></td><td class="num">900ms</td><td class="num">30.0 tok/s</td>`) {
+		t.Errorf("按账号表的命中率列位置/内容不对：%s", got["usAcc"])
+	}
+	if !strings.Contains(got["usModel"], `<td class="num">12</td><td class="num"><span class="c-bad" title="命中 0 / 未命中 100 tok">0%</span></td></tr>`) {
+		t.Errorf("按模型表的命中率列位置/内容不对：%s", got["usModel"])
+	}
+	if !strings.Contains(got["usRealm"], `<td class="num">12</td><td class="num"><span class="c-muted">—</span></td></tr>`) {
+		t.Errorf("按域表缺观测时应显示 —：%s", got["usRealm"])
+	}
+	for key, want := range map[string]string{"emptyAcc": "11", "emptyModel": "8", "emptyRealm": "8"} {
+		if !strings.Contains(got[key], `colspan="`+want+`"`) || !strings.Contains(got[key], "暂无数据") {
+			t.Errorf("%s 空态 colspan 应为 %s：%s", key, want, got[key])
+		}
+	}
+
+	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
+	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got["accounts"])
+	}
+	if strings.Contains(got["accounts"], "Mtok") || strings.Contains(got["accounts"], "<em>tok</em>") {
+		t.Errorf("账号表用量列又带上了 tok 后缀：%s", got["accounts"])
+	}
+}
+
+// TestUsageTablesCacheColumnCount 用量明细表的列数必须三处一致：index.html 的表头 <th>、
+// app.js usRow 的行内 <td>、空态 colspan。本批给「按账号 / 按模型 / 按域」各加了一列缓存
+// 命中率，漏改任何一处都会让整行错位（表格里最显眼、加列时最易漏的地方），故用固定列数钉住。
+func TestUsageTablesCacheColumnCount(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, tc := range []struct {
+		caption string
+		cols    int
+	}{
+		{"用量统计：按账号", 11},
+		{"用量统计：按模型", 8},
+		{"用量统计：按域", 8},
+	} {
+		re := regexp.MustCompile(`(?s)<caption class="sr-only">` + regexp.QuoteMeta(tc.caption) + `</caption>.*?</thead>`)
+		head := re.FindString(body)
+		if head == "" {
+			t.Errorf("index.html 缺少用量表（%s）", tc.caption)
+			continue
+		}
+		// `<th[ >]` 排除 <thead
+		if ths := regexp.MustCompile(`<th[ >]`).FindAllString(head, -1); len(ths) != tc.cols {
+			t.Errorf("%s 有 %d 个 <th>，行内 <td> 与空态 colspan 都是 %d", tc.caption, len(ths), tc.cols)
+		}
+		if !strings.Contains(head, ">缓存命中率<") {
+			t.Errorf("%s 缺少「缓存命中率」表头", tc.caption)
+		}
+	}
+
+	// app.js 侧：三张表的空态 colspan 必须与表头一致（顺序同 renderUsage：账号/模型/域）。
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	empty := regexp.MustCompile(`colspan="(\d+)" class="empty">暂无数据`).FindAllStringSubmatch(string(js), -1)
+	if len(empty) != 3 {
+		t.Fatalf("app.js 用量空态有 %d 处，want 3（按账号/按模型/按域）", len(empty))
+	}
+	for i, want := range []string{"11", "8", "8"} {
+		if empty[i][1] != want {
+			t.Errorf("第 %d 张用量表空态 colspan=%s，want %s", i+1, empty[i][1], want)
+		}
+	}
+}
+
+// TestIndexConfigRequestClientInfo 面板侧的 logging.request_client_info 开关必须三处对齐：
+// 勾选框、CFG_MAP 路径、后端字段名。任一处拼错都不会报错——勾选框照常渲染，保存时被静默
+// 忽略（collectConfig 找不到表单元素就 continue），配置看着改了其实没变，故用断言钉住。
+func TestIndexConfigRequestClientInfo(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	start := strings.Index(body, `<form id="cfgForm">`)
+	end := strings.Index(body, `</form>`)
+	if start < 0 || end <= start {
+		t.Fatal("index.html 缺少配置表单 #cfgForm")
+	}
+	form := body[start:end]
+	at := strings.Index(form, `name="request_client_info"`)
+	if at < 0 {
+		t.Fatal(`配置表单缺少 request_client_info 勾选框（保存时会被静默忽略）`)
+	}
+	// 沿用既有 .switch 控件（滑块 + 标签），不新造控件样式。
+	before := form[maxInt(0, at-400):at]
+	if !strings.Contains(before, `class="switch"`) || !strings.Contains(before, `type="checkbox"`) {
+		t.Errorf("request_client_info 未使用既有 .switch 复选框控件：%s", before)
+	}
+
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(js), `request_client_info: ['logging', 'request_client_info']`) {
+		t.Error("CFG_MAP 缺少 request_client_info → logging.request_client_info 的映射（回填/保存都会失效）")
+	}
+}

@@ -970,6 +970,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中率</th>
               <th class="num">均延迟</th><th class="num">均速率</th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
@@ -986,6 +987,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
               <th class="mark" aria-hidden="true"></th><th>模型</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中率</th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
@@ -1001,6 +1003,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
               <th class="mark" aria-hidden="true"></th><th>realm</th>
               <th class="num">请求</th><th class="num">失败</th>
               <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
+              <th class="num">缓存命中率</th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
           </table>
@@ -1174,6 +1177,16 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
             <div class="switch"><span class="lb">会话粘性路由</span>
               <input type="checkbox" name="session_sticky_enabled"></div>
             <div class="hint mt-3">Upstash Redis 镜像、凭证目录与状态文件路径需手工编辑配置文件（判为重启项）。</div>
+          </div>
+        </div>
+
+        <div class="box">
+          <header><h3>日志</h3></header>
+          <div class="pad">
+            <div class="switch"><span class="lb">记录调用来源（客户端 IP / User-Agent）</span>
+              <input type="checkbox" name="request_client_info"></div>
+            <div class="hint">开启后，「运行日志」页的请求记录行会带上每次调用的来源（src=客户端 IP、ua=客户端标签），用于回答「这条请求是谁打进来的」；关闭则归档与面板都不再出现来源信息（IP 属个人信息，共享部署可关掉）。改动即时生效，无需重启。</div>
+            <div class="hint mt-1">归档开关、保留天数与容量上限（logging.request_archive_*）需手工编辑配置文件。</div>
           </div>
         </div>
 
