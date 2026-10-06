@@ -1908,8 +1908,8 @@ process.stdout.write(JSON.stringify({
 
 // TestAppJSUsageCacheRender node + DOM 桩真实渲染一次（沙箱写法同 TestAppJSTopLevelSmoke）：
 //   - 请求记录行：有来源与无来源两组，分别渲染成 .ln 行；
-//   - 用量页：总览统计卡（含新增的缓存命中率卡）、按账号/按模型/按域三张明细表（含新增
-//     的命中率列与空态 colspan）；
+//   - 用量页：总览统计条固定 6 张卡（0 空白格）、积分扣除统计条含缓存命中率卡（4→5 张）、
+//     按账号/按模型/按域三张明细表（含新增的命中率列与空态 colspan）；
 //   - 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数，无 tok 后缀）。
 //
 // 列位置也一起钉住：命中率列插在「合计」与「均延迟」之间，三张表同序——只断言列数
@@ -1972,6 +1972,12 @@ const usStats = nodes.usStats.innerHTML;
 const usAcc = nodes.usAccBody.innerHTML;
 const usModel = nodes.usModelBody.innerHTML;
 const usRealm = nodes.usRealmBody.innerHTML;
+const creditStats = nodes.usCreditStats.innerHTML;
+const creditNote = nodes.usCreditNote.textContent;
+// 总览统计条必须是 6 张实卡、0 个 .blank：statsHTML 把不足列数的空位补成 6 的倍数，
+// 多出第 7 张卡时第二行会只剩 1 张卡 + 5 个空白格，而空白格的 1px 网格线照样可见。
+const usStatsCards = (usStats.match(/class="stat\b/g) || []).length;
+const usStatsBlanks = (usStats.match(/class="stat blank"/g) || []).length;
 
 // 空态：colspan 必须与表头列数（11 / 8 / 8）一致，否则空表整行错位。
 ctx.renderUsage({ totals: {}, by_account: [], by_model: [], by_realm: [], series: [] });
@@ -1979,6 +1985,8 @@ const emptyAcc = nodes.usAccBody.innerHTML;
 const emptyModel = nodes.usModelBody.innerHTML;
 const emptyRealm = nodes.usRealmBody.innerHTML;
 const emptyStats = nodes.usStats.innerHTML;
+const emptyCreditStats = nodes.usCreditStats.innerHTML;
+const emptyCreditNote = nodes.usCreditNote.textContent;
 
 ctx.renderAccounts([{
   uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
@@ -1988,7 +1996,8 @@ ctx.renderAccounts([{
 }]);
 const accounts = nodes.accBody.innerHTML;
 process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSource, usStats, usAcc, usModel, usRealm,
-  emptyAcc, emptyModel, emptyRealm, emptyStats, accounts }));`
+  creditStats, creditNote, usStatsCards: String(usStatsCards), usStatsBlanks: String(usStatsBlanks),
+  emptyAcc, emptyModel, emptyRealm, emptyStats, emptyCreditStats, emptyCreditNote, accounts }));`
 	f, err := os.CreateTemp(t.TempDir(), "usage-cache-render-*.cjs")
 	if err != nil {
 		t.Fatal(err)
@@ -2021,12 +2030,27 @@ process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSou
 		t.Errorf("整页无来源时应提示「来源未记录」：%s", got["reqNoteNoSource"])
 	}
 
-	// 统计卡：命中率卡在总览统计条里，无样本时也是 '—'（不是 0%）。
-	if !strings.Contains(got["usStats"], `<div class="stat good"><div class="v">98.1%</div><div class="k">缓存命中率</div></div>`) {
-		t.Errorf("用量总览缺少缓存命中率统计卡：%s", got["usStats"])
+	// 总览统计条必须 6 张实卡、0 个空白格：statsHTML 只把不足列数的空位补成 6 的倍数，
+	// 第 7 张卡会让第二行只剩 1 张卡 + 5 个空白格（空白格的 1px 网格线照样可见，看着像
+	// 5 张卡没加载出来）。命中率卡因此挂在「积分扣除历史」的统计条上。
+	if got["usStatsCards"] != "6" || got["usStatsBlanks"] != "0" {
+		t.Errorf("用量总览统计条应为 6 张实卡 + 0 空白格，实际 %s 张 / %s 格：%s",
+			got["usStatsCards"], got["usStatsBlanks"], got["usStats"])
 	}
-	if !strings.Contains(got["emptyStats"], `<div class="stat "><div class="v">—</div><div class="k">缓存命中率</div></div>`) {
-		t.Errorf("无样本时命中率卡应显示 —：%s", got["emptyStats"])
+	// 统计卡：命中率卡在积分扣除统计条里，无样本时也是 '—'（不是 0%）。
+	if !strings.Contains(got["creditStats"], `<div class="stat good"><div class="v">98.1%</div><div class="k">缓存命中率</div></div>`) {
+		t.Errorf("积分扣除统计条缺少缓存命中率统计卡：%s", got["creditStats"])
+	}
+	if !strings.Contains(got["emptyCreditStats"], `<div class="stat "><div class="v">—</div><div class="k">缓存命中率</div></div>`) {
+		t.Errorf("无样本时命中率卡应显示 —：%s", got["emptyCreditStats"])
+	}
+	// 命中率卡的样本集与本条其它卡不同（全部 Token vs 积分匹配到的 Token），有样本时
+	// note 要点名口径，无样本时不要多出这句。
+	if !strings.Contains(got["creditNote"], "缓存命中率为本窗口全部 Token 口径") {
+		t.Errorf("有缓存样本时 note 应点名命中率口径：%s", got["creditNote"])
+	}
+	if strings.Contains(got["emptyCreditNote"], "缓存命中率为本窗口全部 Token 口径") {
+		t.Errorf("无缓存样本时不该出现命中率口径说明：%s", got["emptyCreditNote"])
 	}
 
 	// 明细表：命中率列在「合计」与「均延迟」之间（三张表同序），绝对值进 title。

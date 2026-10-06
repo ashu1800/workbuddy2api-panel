@@ -1989,8 +1989,10 @@ function usRow(name, sub, a, mid, withPerf) {
 
 function renderUsage(d) {
   const t = d.totals || {};
-  // 第七张卡：缓存命中率（无样本时 cacheRateStat 自己回 '—'）。statsHTML 会把不足
-  // 列数的空位补成 .blank（6 的倍数），所以多一张卡不会漏出容器底色。
+  // 统计条固定 6 张卡：statsHTML 把空位补成 6 的倍数，靠「gap + 容器底色」画的 1px 网格
+  // 才能始终排满；曾把缓存命中率当第 7 张卡塞进来，结果第二行只剩 1 张卡 + 5 个空格，
+  // 空格之间的格线照样可见，看着像 5 张卡没加载出来。命中率改挂到「积分扣除历史」的
+  // 统计条（4→5 张，仍是一行），口径说明也写在那条 note 里。
   $('usStats').innerHTML = statsHTML([
     usStat(fmtTok(t.requests), '请求数'),
     usStat(fmtTok(t.total_tokens), '总 token'),
@@ -1998,7 +2000,6 @@ function renderUsage(d) {
     usStat(fmtTok(t.completion_tokens), 'completion'),
     usStat(t.errors ? String(t.errors) : '0', '失败尝试', t.errors ? 'warn' : ''),
     usStat(fmtMs(t.avg_latency_ms), '平均延迟'),
-    cacheRateStat(t.cache_hit_tokens, t.cache_miss_tokens),
   ]);
 
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
@@ -2036,15 +2037,22 @@ function renderCreditDimensions(d) {
   const t = d.totals || {};
   const accounts = d.credit_by_account || [];
   const models = d.credit_by_model || [];
+  // 缓存命中率（无样本时 cacheRateStat 自己回 '—'）：放在这条统计条里而不是「用量总览」，
+  // 是为了守住上面那条 6 张卡的不变量；放在这里也更贴语义——命中缓存省下的正是积分。
   $('usCreditStats').innerHTML = statsHTML([
     usStat(fmtCredit(t.credits), '扣除积分'),
     usStat(fmtTok(t.credit_tokens), '匹配 Token'),
     usStat(fmtCreditRatio(t.credits_per_1m_tokens, t.credit_samples, t.credit_tokens), '平均积分 / 1M Token'),
     usStat(String(t.credit_samples || 0), '有效积分样本'),
+    cacheRateStat(t.cache_hit_tokens, t.cache_miss_tokens),
   ]);
 
+  const cacheTotal = Number(t.cache_hit_tokens || 0) + Number(t.cache_miss_tokens || 0);
   $('usCreditNote').textContent =
-    accounts.length + ' 个账号 · ' + models.length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token';
+    accounts.length + ' 个账号 · ' + models.length + ' 个模型倍率分组 · 仅统计与积分同时观测到的 Token' +
+    // 命中率卡的样本集与上表不同（全部 Token，不只积分匹配到的），note 里点名，
+    // 免得把它当成「这张表的口径」。
+    (cacheTotal > 0 ? ' · 缓存命中率为本窗口全部 Token 口径' : '');
 
   $('usCreditAccBody').innerHTML = accounts.map(row => {
     const uid = String(row.key || '');

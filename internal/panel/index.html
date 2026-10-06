@@ -1158,9 +1158,13 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
             </div>
-            <label class="fld"><span class="lb">积分保底</span>
-              <input name="credit_floor" type="number" min="0" placeholder="0">
-              <span class="hint">账号余额低于该值时，对实测收费模型（tier 2）不再出票——防止收费请求把余额打穿、连免费模型都被 402 冷却到次日签到。0 = 关闭（默认，保持既有行为）；正整数 = 「低于该值不出票」，上游示例配置推荐 100。免费与未观测模型不受限，签到回血越过该值后自动恢复。改动即时生效。</span></label>
+            <!-- 积分保底单独占一格 grid3：直接挂在 .pad 下会被全局 input{width:100%} 拉满整行
+                 （同卡片其它参数都是 377px 的三列栅格），一个三位数躺在 1164px 的输入框里。 -->
+            <div class="grid3">
+              <label class="fld"><span class="lb">积分保底</span>
+                <input name="credit_floor" type="number" min="0" placeholder="0">
+                <span class="hint">账号余额低于该值时，对实测收费模型（tier 2）不再出票——防止收费请求把余额打穿、连免费模型都被 402 冷却到次日签到。0 = 关闭（默认，保持既有行为）；正整数 = 「低于该值不出票」，上游示例配置推荐 100。免费与未观测模型不受限，签到回血越过该值后自动恢复。改动即时生效。</span></label>
+            </div>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
           </div>
