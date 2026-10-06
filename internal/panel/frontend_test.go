@@ -1799,3 +1799,606 @@ func TestIndexConfigRequestClientInfo(t *testing.T) {
 		t.Error("CFG_MAP 缺少 request_client_info → logging.request_client_info 的映射（回填/保存都会失效）")
 	}
 }
+
+// cfgFormFields 从 index.html 的 <form id="cfgForm"> 里抽出所有 name 控件（名字 → 所在片段），
+// 以及表单整体的 HTML。多张测试要按同一口径切片，抽成一处免得各写各的。
+func cfgFormFields(t *testing.T, body string) (map[string]string, string) {
+	t.Helper()
+	start := strings.Index(body, `<form id="cfgForm">`)
+	if start < 0 {
+		t.Fatal("index.html 缺少配置表单 #cfgForm")
+	}
+	rest := body[start:]
+	end := strings.Index(rest, `</form>`)
+	if end < 0 {
+		t.Fatal("配置表单 #cfgForm 未闭合")
+	}
+	form := rest[:end]
+	fields := map[string]string{}
+	for _, m := range regexp.MustCompile(`name="([a-z_0-9]+)"`).FindAllStringSubmatchIndex(form, -1) {
+		name := form[m[2]:m[3]]
+		// 控件片段取到所在标签结束：断言「是不是 .switch / type=number / min=0」要看标签本身。
+		tagStart := strings.LastIndex(form[:m[0]], "<")
+		tagEnd := strings.Index(form[m[1]:], ">")
+		if tagStart < 0 || tagEnd < 0 {
+			continue
+		}
+		fields[name] = form[tagStart : m[1]+tagEnd+1]
+	}
+	return fields, form
+}
+
+// cfgMapKeys 抽出 app.js 里 CFG_MAP 的全部键名与源码块。CFG_MAP 是「表单名 → 配置路径」
+// 的唯一映射表：漏一个键，回填与保存都会静默空转。
+func cfgMapKeys(t *testing.T, src string) (map[string]bool, string) {
+	t.Helper()
+	at := strings.Index(src, "const CFG_MAP = {")
+	if at < 0 {
+		t.Fatal("app.js 缺少 CFG_MAP")
+	}
+	block := src[at:]
+	close := strings.Index(block, "\n};")
+	if close < 0 {
+		t.Fatal("CFG_MAP 未以行首 }; 收尾（切片口径失效）")
+	}
+	block = block[:close]
+	keys := map[string]bool{}
+	// 不能按行首匹配：CFG_MAP 里多个键写在同一行（`a: [...], b: [...]`），
+	// 按「前面是行首或分隔符」判定才不漏。
+	for _, m := range regexp.MustCompile(`(?:^|[\s,{])([a-z_0-9]+):\s*\[`).FindAllStringSubmatch(block, -1) {
+		keys[m[1]] = true
+	}
+	return keys, block
+}
+
+// TestConfigFormMatchesCFGMap 钉住「配置表单控件 ↔ CFG_MAP ↔ 后端配置键名」三处一致
+// （上游 7339a3c 的等价移植，按本 fork 的表单结构与键集重写）。
+//
+// 为什么需要：这套映射断掉时没有任何编译期或运行期报错——表单里多一个字段会被保存时
+// 静默丢弃（collectConfig 只遍历 CFG_MAP），CFG_MAP 多一个键则回填/保存都是空转，
+// 两者都只能靠人点开配置页发现。logging.request_client_info 就这样丢过一次。
+// 纯 Go 读文件，不需要 node。
+func TestConfigFormMatchesCFGMap(t *testing.T) {
+	jsBytes, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	js := string(jsBytes)
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	keys, mapBlock := cfgMapKeys(t, js)
+	if len(keys) < 20 {
+		t.Fatalf("CFG_MAP 只解析出 %d 个键（本 fork 40+ 个），切片或正则口径已经失效", len(keys))
+	}
+	fields, _ := cfgFormFields(t, body)
+	if len(fields) == 0 {
+		t.Fatal("未从配置表单解析出任何 name 字段")
+	}
+
+	// formOnly 是「只在表单里、刻意不走 CFG_MAP」的白名单。本 fork 现状为空集——
+	// api_key 这类字段其实都走 CFG_MAP。留这个表是为了让例外显式化：真出现这种
+	// 字段时请连同理由登记，而不是放宽断言。
+	formOnly := map[string]string{}
+	for name := range fields {
+		if keys[name] {
+			continue
+		}
+		if why, ok := formOnly[name]; ok {
+			t.Logf("表单字段 %q 按白名单跳过 CFG_MAP 检查：%s", name, why)
+			continue
+		}
+		t.Errorf("表单字段 %q 在 CFG_MAP 里没有条目（保存时会被静默丢弃；若确实不该走 CFG_MAP，请登记进 formOnly 并写明理由）", name)
+	}
+	for name := range keys {
+		if _, ok := fields[name]; !ok {
+			t.Errorf("CFG_MAP 键 %q 在配置表单里没有同名控件（回填/保存都是空转）", name)
+		}
+	}
+
+	// 显式点名三个「后端有配置项、面板必须能在线改」的键：路径写错（拼成别的节名）
+	// 时上面的双向检查仍然会通过，只有这条能发现。
+	for _, want := range []string{
+		`request_client_info: ['logging', 'request_client_info']`,
+		`include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks']`,
+		`credit_floor: ['pool', 'credit_floor']`,
+	} {
+		if !strings.Contains(mapBlock, want) {
+			t.Errorf("CFG_MAP 缺条目 %s（回填/保存都会失效）", want)
+		}
+	}
+
+	// 第三条腿：CFG_MAP 路径的最后一段必须真的存在于后端配置结构体的 json tag 里
+	// （否则面板存下去的键后端不认识，落盘后静默丢弃）。只对上面点名的键查，
+	// 因为路径中间段（schedule/pool/logging）与结构体嵌套的对应关系留给后端测试。
+	cfgGo := filepath.Join("..", "..", "cmd", "server", "config.go")
+	raw, err := os.ReadFile(cfgGo)
+	if err != nil {
+		t.Logf("跳过后端键名核对（读不到 %s：%v）", cfgGo, err)
+		return
+	}
+	for _, name := range []string{"request_client_info", "include_disabled_in_tasks", "credit_floor"} {
+		if !strings.Contains(string(raw), `json:"`+name+`"`) {
+			t.Errorf("后端配置结构体里没有 json:%q（面板保存的 %s 会被静默丢弃）", name, name)
+		}
+	}
+}
+
+// TestIndexConfigCreditFloorAndIncludeDisabled 本批新增的两个配置控件（后端早已支持，
+// 面板此前缺字段）：控件类型、min、说明文字与「默认值」都要写清——这两个键都是
+// 「静默生效」型：填错了不报错，只是选号/定时任务的行为与预期不同。
+func TestIndexConfigCreditFloorAndIncludeDisabled(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	fields, form := cfgFormFields(t, rec.Body.String())
+
+	// include_disabled_in_tasks：布尔开关，沿用既有 .switch 复选框。
+	tag, ok := fields["include_disabled_in_tasks"]
+	if !ok {
+		t.Fatal("配置表单缺少 include_disabled_in_tasks 勾选框（保存时会被静默忽略）")
+	}
+	if !strings.Contains(tag, `type="checkbox"`) {
+		t.Errorf("include_disabled_in_tasks 不是 checkbox：%s", tag)
+	}
+	if at := strings.Index(form, `name="include_disabled_in_tasks"`); at < 0 ||
+		!strings.Contains(form[maxInt(0, at-300):at], `class="switch"`) {
+		t.Error("include_disabled_in_tasks 未使用既有 .switch 控件（不新造控件样式）")
+	}
+	for _, want := range []string{"默认关闭", "已禁用账号依旧不参与选号"} {
+		if !strings.Contains(form, want) {
+			t.Errorf("include_disabled_in_tasks 说明文字缺 %q（默认值与「禁用只关选号」的边界必须写清）", want)
+		}
+	}
+
+	// credit_floor：数字输入，min=0；0 = 关闭、正整数 = 低于该值不出票。
+	tag, ok = fields["credit_floor"]
+	if !ok {
+		t.Fatal("配置表单缺少 credit_floor 输入框（保存时会被静默忽略）")
+	}
+	for _, want := range []string{`type="number"`, `min="0"`} {
+		if !strings.Contains(tag, want) {
+			t.Errorf("credit_floor 输入框缺 %s：%s", want, tag)
+		}
+	}
+	if at := strings.Index(form, `name="credit_floor"`); at < 0 ||
+		!strings.Contains(form[maxInt(0, at-300):at], `class="fld"`) {
+		t.Error("credit_floor 未使用既有 label.fld 字段控件")
+	}
+	for _, want := range []string{"0 = 关闭（默认", "低于该值不出票"} {
+		if !strings.Contains(form, want) {
+			t.Errorf("credit_floor 说明文字缺 %q（0 与正整数的语义必须写清）", want)
+		}
+	}
+}
+
+// TestIndexKeyInputOwnForm #keyInput 必须待在独立 <form class="form-bare"> 里（上游
+// 20bde29）：游离的 password 输入框会被 Chromium 凭空合成「用户名 + 密码」凭证表单，
+// 并在同页抓第一个文本输入框当用户名，于是聚焦那个输入框就弹「保存的密码」下拉。
+//
+// 与上游的差异：上游用 style="display:contents" + onsubmit="return false"，
+// 本 fork 两样都不能写（静态内联样式禁令 / CSP script-src 'self' 拦内联处理器），
+// 改为 .form-bare 工具类 + app.js 里绑 submit 拦截——这里把两条替换都钉住。
+func TestIndexKeyInputOwnForm(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	at := strings.Index(body, `<form id="keyForm" class="form-bare">`)
+	if at < 0 {
+		t.Fatal(`index.html 缺少 <form id="keyForm" class="form-bare">（keyInput 又变成游离密码框了）`)
+	}
+	// form 标签本身不得带 style：display:contents 由 .form-bare 承担。
+	tagEnd := strings.Index(body[at:], ">")
+	if tagEnd < 0 {
+		t.Fatal("#keyForm 标签未闭合")
+	}
+	if tag := body[at : at+tagEnd+1]; strings.Contains(tag, "style=") || regexp.MustCompile(`\son[a-z]+=`).MatchString(tag) {
+		t.Errorf("#keyForm 用了内联 style 或内联事件处理器（CSP 拦截 / 静态内联样式禁令）：%s", tag)
+	}
+	closeAt := strings.Index(body[at:], "</form>")
+	if closeAt < 0 {
+		t.Fatal("#keyForm 未闭合")
+	}
+	inner := body[at : at+closeAt]
+	if !strings.Contains(inner, `id="keyInput"`) {
+		t.Fatalf("#keyInput 不在 #keyForm 内（Chromium 仍会合成凭证表单）：%s", inner)
+	}
+	if !strings.Contains(inner, `autocomplete="off"`) {
+		t.Errorf("keyInput 未设 autocomplete=\"off\"（密码管理器仍会接手机器生成的凭证表单）：%s", inner)
+	}
+	// 全局：index.html 不得出现任何内联事件处理器（CSP script-src 'self' 下它们静默失效，
+	// 表现是「按钮点了没反应」）。上游 20bde29 的 onsubmit="return false" 正属此列。
+	if m := regexp.MustCompile(`\son[a-z]+="`).FindAllString(body, -1); len(m) != 0 {
+		t.Errorf("index.html 出现内联事件处理器（CSP 下静默失效）：%v", m)
+	}
+	if !strings.Contains(body, `.form-bare { display: contents; }`) {
+		t.Error("缺少 .form-bare { display: contents; } 样式（form 会生成盒子、布局被撑开）")
+	}
+
+	// app.js 侧：submit 必须被拦住（单输入框 form 回车会隐式提交、把整页 GET 刷新一遍），
+	// 且既有密钥门逻辑（点击 / 回车 → #btnKey）不能被动掉。
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	submitAt := strings.Index(src, `$('keyForm').addEventListener('submit'`)
+	if submitAt < 0 {
+		t.Fatal("app.js 未给 #keyForm 绑 submit 拦截（回车会隐式提交并刷新页面）")
+	}
+	if tail := src[submitAt:]; !strings.Contains(tail[:minInt(len(tail), 200)], "preventDefault") {
+		t.Error("#keyForm 的 submit 处理器没有 preventDefault")
+	}
+	for _, want := range []string{
+		`$('btnKey').onclick`,
+		`$('keyInput').addEventListener('keydown'`,
+		`if (e.key === 'Enter') $('btnKey').click();`,
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("既有密钥门逻辑被破坏，app.js 里找不到 %s", want)
+		}
+	}
+}
+
+// TestIndexPackagesSortControl 积分构成逐包明细的排序切换控件（上游 6bc832c，本 fork
+// 保留了「前 N 条 + 折叠」，只加控件与排序口径）：select 必须落在 #view-packages 内，
+// 两个 option 的 value 要与 app.js 的 PK_SORT_LABELS 键一致——拼错不会报错，
+// 只会让控件切了个寂寞（渲染端认不出这个值，回落默认）。
+func TestIndexPackagesSortControl(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	viewAt := strings.Index(body, `id="view-packages"`)
+	nextView := strings.Index(body, `id="view-usage"`)
+	selAt := strings.Index(body, `<select id="pkSort" class="xs"`)
+	if viewAt < 0 || nextView <= viewAt {
+		t.Fatal("index.html 视图段落结构变了（找不到 #view-packages / #view-usage）")
+	}
+	if selAt < 0 || selAt < viewAt || selAt > nextView {
+		t.Fatalf("#pkSort 排序选择器不在 #view-packages 视图内（selAt=%d）", selAt)
+	}
+	head := body[selAt:]
+	if end := strings.Index(head, "</select>"); end > 0 {
+		head = head[:end]
+	}
+	for _, want := range []string{`value="end_asc" selected`, `value="size_desc"`} {
+		if !strings.Contains(head, want) {
+			t.Errorf("#pkSort 缺少 option %s：%s", want, head)
+		}
+	}
+
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	for _, want := range []string{
+		`const PK_SORT_LABELS = { end_asc:`, // 两种规则的显示名（与 option 文案同源）
+		`size_desc:`,
+		`const LS_PK_SORT = 'pkSortMode';`,
+		`function pkSortLoad()`,
+		`function pkSortSave(mode)`,
+		`$('pkSort').onchange`,
+		`pkDetailGroups(a.packages || [], detailLimit, pkSortMode)`, // 渲染端真的用上了当前规则
+		`let lastPackages = null, lastPackagesLimit;`,               // 切换只重排内存数据，不重新请求上游
+		`data-pk-group="`,                                           // 折叠/展开行为必须保留
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("app.js 缺少排序切换的相关实现：%s", want)
+		}
+	}
+}
+
+// TestAppJSConfigFormRoundTrip 配置页两个新字段的真实回填与保存（node + DOM 桩）：
+// 只造这两个键的控件，跑 loadConfig（后端 → 控件）与 collectConfig（控件 → 后端嵌套路径）。
+// 桩里 input.value 走 getter/setter 强制成字符串 —— 真实 DOM 的 input.value 永远是
+// string，loadConfig 会把数字直接赋进去，不模拟这一步 collectConfig 的 .trim() 会假失败。
+func TestAppJSConfigFormRoundTrip(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; config round-trip test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP = {');
+const end = src.indexOf('/* Go 时长字段即时校验');
+if (start < 0 || end < 0) throw new Error('CFG_MAP slice not found');
+// DOM 桩：input.value 永远按字符串存（同真实 DOM），checkbox 用 checked。
+function inputStub(type) {
+  return {
+    type,
+    checked: false,
+    _v: '',
+    get value() { return this._v; },
+    set value(v) { this._v = v == null ? '' : String(v); },
+  };
+}
+const checkEl = inputStub('checkbox');
+const numEl = inputStub('number');
+const keyEl = inputStub('password');
+const nodes = { cfgPath: { textContent: '' }, cfgNote: { textContent: '' } };
+nodes.cfgForm = { elements: { include_disabled_in_tasks: checkEl, credit_floor: numEl, api_key: keyEl } };
+let payload = {};
+const ctx = {
+  Number, String, Object, Array, JSON, Promise, console,
+  api: async () => ({ config: payload, path: '/etc/workbuddy/config.json' }),
+  toast: m => { ctx.toasts.push(String(m)); },
+  markDurationFields: () => {},
+  $: id => nodes[id] || (nodes[id] = { textContent: '', innerHTML: '' }),
+  toasts: [],
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.loadConfig = loadConfig; this.collectConfig = collectConfig; this.CFG_MAP = CFG_MAP;', ctx);
+(async () => {
+  // 1) 后端下发了这两个键：控件要被回填，保存要原样写回嵌套路径。
+  payload = { schedule: { include_disabled_in_tasks: true }, pool: { credit_floor: 100 } };
+  await ctx.loadConfig();
+  const filled = { checked: checkEl.checked, credit: numEl.value, path: nodes.cfgPath.textContent };
+  const saved = ctx.collectConfig();
+  // 2) 老配置里没有这两个键（后端缺省 false / 0）：控件回落默认态，留空 = 不发送。
+  payload = {};
+  await ctx.loadConfig();
+  const fallback = { checked: checkEl.checked, credit: numEl.value };
+  const savedEmpty = ctx.collectConfig();
+  process.stdout.write(JSON.stringify({
+    filled, saved, fallback, savedEmpty,
+    mapped: [ctx.CFG_MAP.include_disabled_in_tasks, ctx.CFG_MAP.credit_floor],
+    toasts: ctx.toasts,
+  }));
+})();`
+	f, err := os.CreateTemp(t.TempDir(), "cfg-roundtrip-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("config round-trip node test failed: %v\n%s", err, out)
+	}
+	got := map[string]json.RawMessage{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("config round-trip output is not JSON: %v\n%s", err, out)
+	}
+	check := func(key, want string) {
+		t.Helper()
+		if strings.TrimSpace(string(got[key])) != want {
+			t.Errorf("%s=%s want %s", key, got[key], want)
+		}
+	}
+	// 回填：勾选框 checked、数字框变字符串 "100"（DOM 语义），配置文件路径照旧回显。
+	check("filled", `{"checked":true,"credit":"100","path":"/etc/workbuddy/config.json"}`)
+	// 保存：collectConfig 产出后端认识的嵌套路径；数字走 Number 而不是字符串。
+	check("saved", `{"schedule":{"include_disabled_in_tasks":true},"pool":{"credit_floor":100}}`)
+	// 缺省：缺键时勾选框回落 false、数字框为空。勾选框**总是**回传当前状态（false 也发，
+	// 语义就是「关」——这是本 fork 既有口径）；数字框留空 = 沿用现值，不发送。
+	check("fallback", `{"checked":false,"credit":""}`)
+	check("savedEmpty", `{"schedule":{"include_disabled_in_tasks":false}}`)
+	// CFG_MAP 的路径就是回填/保存用的那条路径（[节, 键]）。
+	check("mapped", `[["schedule","include_disabled_in_tasks"],["pool","credit_floor"]]`)
+	check("toasts", `[]`)
+}
+
+// TestAppJSPackagesSortOrder 积分构成逐包明细的排序切换（node + DOM 桩真实渲染）：
+//   - 默认 end_asc：第一行是最早到期的包；无到期时间的包垫底，不掺进日期序；
+//   - 切到 size_desc：第一行变成面额最大的包，且**不用重新请求上游**（onchange 重排内存数据）；
+//   - 两种规则下「前 N 条 + 其余折叠」的既有行为都不变（折叠行 hidden + 摘要按钮计数）；
+//   - 顺带回归账号表「今日用量」列：仍是 7.10M 的 chip（大写单位 + 两位小数，无 tok 后缀）。
+func TestAppJSPackagesSortOrder(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; packages sort render skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// 四段互不重叠的纯函数切片（各自下界都是下一个函数的声明，段内没有顶层副作用，
+// 除了 pk 段末尾的 #pkSort 绑定——那正是被测的控件接线）：
+//   A 转义/格式化工具，B 账号表渲染，C fmtTok，D 积分构成整段（含排序、折叠与 loadPackages）。
+const a = src.slice(src.indexOf('function esc('), src.indexOf('function veilStack('));
+const b = src.slice(src.indexOf('function avgTTFB('), src.indexOf('async function loadOverview('));
+const c = src.slice(src.indexOf('function fmtTok('), src.indexOf('function fmtMs('));
+const d = src.slice(src.indexOf('const PK_COLORS'), src.indexOf("if ($('btnPk')) $('btnPk').onclick"));
+if (!a || !b || !c || !d) throw new Error('render slices not found in app.js');
+const nodes = {};
+const el = id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '', value: '', addEventListener() {} });
+const storage = {};
+const apiCalls = [];
+const ctx = {
+  Date, Number, String, Boolean, Math, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
+  Map, Set, Promise, console,
+  $: el,
+  localStorage: {
+    getItem: k => (k in storage ? storage[k] : null),
+    setItem: (k, v) => { storage[k] = String(v); },
+    removeItem: k => { delete storage[k]; },
+  },
+  // 上游桩：packages 返回逐包数据，config 返回明细条数上限 2（走 loadPackages 的真实路径）。
+  api: async path => {
+    apiCalls.push(path);
+    if (path === 'packages') return { accounts: [acct] };
+    return { config: { panel: { package_detail_limit: 2 } } };
+  },
+};
+vm.createContext(ctx);
+vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d +
+  '\nthis.renderAccounts = renderAccounts; this.renderPackages = renderPackages; this.loadPackages = loadPackages;', ctx);
+const DAY = 86400000, NOW = Date.now();
+const pkg = (name, size, remain, expiresAt) => ({
+  name, package_code: 'C-' + name, size, remain, used: size - remain,
+  expires_at: expiresAt || undefined, end_time: expiresAt ? new Date(expiresAt).toISOString().slice(0, 10) : '',
+});
+const acct = {
+  uid: 'uid-0000000000000001', nickname: '号一', realm: 'cn', remain: 6, size: 1250,
+  last_success: '2026-09-28T13:00:00Z',
+  today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+  token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  packages: [
+    pkg('大额晚到期', 500, 5, NOW + 30 * DAY),
+    pkg('小额快到期', 100, 1, NOW + 1 * DAY),
+    pkg('中额无到期', 400, 4, 0),
+    pkg('小额稍晚', 50, 2, NOW + 5 * DAY),
+    pkg('已用完', 200, 0, NOW + 2 * DAY),
+  ],
+};
+ctx.renderAccounts([acct]);
+const accounts = nodes.accBody.innerHTML;
+// 折叠行（data-pk-row）与摘要按钮（pk-group-summary）不算可见数据行；
+// 只认以 <tr 开头的片段，避开 </tbody> 后那段尾巴。
+const rowsOf = html => html.split('<tbody>')[1].split('</tbody>')[0].split('</tr>')
+  .map(s => s.trim()).filter(s => s.startsWith('<tr'));
+const nameOf = row => { const m = row.match(/<td>([^<]*)/); return m ? m[1] : ''; };
+const visibleOf = html => rowsOf(html).filter(r => !/data-pk-row=|pk-group-summary/.test(r)).map(nameOf);
+const foldedOf = html => rowsOf(html).filter(r => /data-pk-row="rest"/.test(r)).map(nameOf);
+const acctNoteOf = html => { const m = html.match(/<span class="note">([^<]*)<\/span>/); return m ? m[1] : ''; };
+(async () => {
+  await ctx.loadPackages();                      // 真实路径：拉数据 → 按配置条数渲染
+  const endAsc = {
+    visible: visibleOf(nodes.pkDetail.innerHTML),
+    folded: foldedOf(nodes.pkDetail.innerHTML),
+    acctNote: acctNoteOf(nodes.pkDetail.innerHTML),
+    hidden: /data-pk-row="rest" hidden/.test(nodes.pkDetail.innerHTML),
+    restBtn: (nodes.pkDetail.innerHTML.match(/其余未用完 \d+ 个包（面额合计 [^）]*）/) || [''])[0],
+  };
+  const callsAfterLoad = apiCalls.slice();
+  // 走真实控件接线：把 select 的值改成 size_desc 再触发 onchange（等价于用户操作）。
+  nodes.pkSort.value = 'size_desc';
+  nodes.pkSort.onchange();
+  const sizeDesc = {
+    visible: visibleOf(nodes.pkDetail.innerHTML),
+    folded: foldedOf(nodes.pkDetail.innerHTML),
+    acctNote: acctNoteOf(nodes.pkDetail.innerHTML),
+    hidden: /data-pk-row="rest" hidden/.test(nodes.pkDetail.innerHTML),
+    stored: storage.pkSortMode,
+  };
+  // 折叠/展开按钮仍在（既有行为不能被排序开关挤掉）。
+  const hasToggle = /data-pk-group="rest"/.test(nodes.pkDetail.innerHTML);
+  process.stdout.write(JSON.stringify({
+    accounts, endAsc, sizeDesc, hasToggle,
+    callsAfterLoad, callsAfterSwitch: apiCalls,
+  }));
+})();`
+	f, err := os.CreateTemp(t.TempDir(), "pk-sort-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("packages sort render failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Accounts string `json:"accounts"`
+		EndAsc   struct {
+			Visible  []string `json:"visible"`
+			Folded   []string `json:"folded"`
+			AcctNote string   `json:"acctNote"`
+			Hidden   bool     `json:"hidden"`
+			RestBtn  string   `json:"restBtn"`
+		} `json:"endAsc"`
+		SizeDesc struct {
+			Visible  []string `json:"visible"`
+			Folded   []string `json:"folded"`
+			AcctNote string   `json:"acctNote"`
+			Hidden   bool     `json:"hidden"`
+			Stored   string   `json:"stored"`
+		} `json:"sizeDesc"`
+		HasToggle      bool     `json:"hasToggle"`
+		CallsAfterLoad []string `json:"callsAfterLoad"`
+		CallsAfterSort []string `json:"callsAfterSwitch"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("packages sort render output is not JSON: %v\n%s", err, out)
+	}
+
+	// 默认按到期升序：最早的在前，无到期垫底（第 3 位之后），无到期的包不进前 2 条。
+	if want := []string{"小额快到期", "小额稍晚"}; !equalStrings(got.EndAsc.Visible, want) {
+		t.Errorf("end_asc 可见行=%v want %v", got.EndAsc.Visible, want)
+	}
+	if want := []string{"大额晚到期", "中额无到期"}; !equalStrings(got.EndAsc.Folded, want) {
+		t.Errorf("end_asc 折叠行=%v want %v（无到期包必须垫底，不掺进日期序）", got.EndAsc.Folded, want)
+	}
+
+	// 切到面额降序：第一行换成面额最大的包。
+	if want := []string{"大额晚到期", "中额无到期"}; !equalStrings(got.SizeDesc.Visible, want) {
+		t.Errorf("size_desc 可见行=%v want %v", got.SizeDesc.Visible, want)
+	}
+	if want := []string{"小额快到期", "小额稍晚"}; !equalStrings(got.SizeDesc.Folded, want) {
+		t.Errorf("size_desc 折叠行=%v want %v", got.SizeDesc.Folded, want)
+	}
+	if got.SizeDesc.Stored != "size_desc" {
+		t.Errorf("切换后的选择未持久化（localStorage pkSortMode=%q）", got.SizeDesc.Stored)
+	}
+	// 切换只重排内存数据：loadPackages 打过 packages+config 两次请求，onchange 后不许再多。
+	if want := []string{"packages", "config"}; !equalStrings(got.CallsAfterLoad, want) {
+		t.Errorf("loadPackages 请求序列=%v want %v", got.CallsAfterLoad, want)
+	}
+	if !equalStrings(got.CallsAfterSort, got.CallsAfterLoad) {
+		t.Errorf("切换排序后又打了上游：%v → %v（应只重排内存数据）", got.CallsAfterLoad, got.CallsAfterSort)
+	}
+
+	// 既有折叠行为不变：折叠行带 hidden、摘要按钮还在且计数按规则重算。
+	for _, tc := range []struct {
+		name string
+		got  bool
+	}{{"end_asc", got.EndAsc.Hidden}, {"size_desc", got.SizeDesc.Hidden}} {
+		if !tc.got {
+			t.Errorf("%s 折叠行丢失 hidden（折叠/展开行为被破坏）", tc.name)
+		}
+	}
+	if !got.HasToggle {
+		t.Error("折叠摘要按钮 data-pk-group=\"rest\" 消失（既有展开行为被破坏）")
+	}
+	if !strings.Contains(got.EndAsc.RestBtn, "其余未用完 2 个包") {
+		t.Errorf("end_asc 折叠摘要=%q，应说出折叠了几个包", got.EndAsc.RestBtn)
+	}
+	// 每个账号表头上的规则说明也要跟着切换（那是用户唯一能确认「当前按什么排」的地方）。
+	if !strings.Contains(got.EndAsc.AcctNote, "按到期升序展示前 2 条") {
+		t.Errorf("end_asc 账号表头注=%q", got.EndAsc.AcctNote)
+	}
+	if !strings.Contains(got.SizeDesc.AcctNote, "按面额降序展示前 2 条") {
+		t.Errorf("size_desc 账号表头注=%q", got.SizeDesc.AcctNote)
+	}
+
+	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
+	if !strings.Contains(got.Accounts, `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got.Accounts)
+	}
+	if strings.Contains(got.Accounts, "Mtok") || strings.Contains(got.Accounts, "<em>tok</em>") {
+		t.Errorf("账号表用量列又带上了 tok 后缀：%s", got.Accounts)
+	}
+}
+
+// equalStrings 比对两个字符串切片（顺序敏感）。
+func equalStrings(got, want []string) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for i := range got {
+		if got[i] != want[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// minInt / maxInt 是本文件里既有 maxInt 的补充（截断取尾片段时用）。
+func minInt(a, b int) int {
+	if a < b {
+		return a
+	}
+	return b
+}

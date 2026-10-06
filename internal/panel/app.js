@@ -224,6 +224,11 @@ $('btnKey').onclick = async () => {
   } catch (e) { $('keyErr').hidden = false; }
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
+/* #keyInput 现在待在独立 <form id="keyForm"> 里（游离的 password 框会被 Chromium
+   合成「用户名 + 密码」凭证表单，把同页第一个文本框当成用户名）。单输入框的
+   <form> 在回车时会隐式提交、把整页 GET 刷新一遍（CSP form-action 'none' 只是
+   拦下导航，面板状态照样丢），所以拦住 submit。CSP 禁内联 onsubmit，只能在 JS 侧绑。 */
+$('keyForm').addEventListener('submit', ev => ev.preventDefault());
 
 /* ── 时间范围控件（用量 / 请求记录共用）──────────────────────────────
    一个控件适配两种宿主：
@@ -1046,9 +1051,15 @@ const CFG_MAP = {
   travel_hours: ['schedule', 'travel_hours'], travel_enabled: ['schedule', 'travel_enabled'],
   activity_hours: ['schedule', 'activity_hours'], activity_enabled: ['schedule', 'activity_enabled'],
   keepalive_hours: ['schedule', 'keepalive_hours'], keepalive_enabled: ['schedule', 'keepalive_enabled'],
+  // 保号类四任务（签到 / 活跃上报 / 保活 / 余额刷新）是否覆盖已禁用账号：默认 false
+  // 保持「禁用即跳过」既有语义，故勾选框空态与后端缺省一致，不需要额外默认值代码。
+  include_disabled_in_tasks: ['schedule', 'include_disabled_in_tasks'],
   balance_refresh_enabled: ['schedule', 'balance_refresh_enabled'], balance_refresh_minutes: ['schedule', 'balance_refresh_minutes'],
   max_in_flight: ['pool', 'max_in_flight'], max_in_flight_global: ['pool', 'max_in_flight_global'],
   breaker_threshold: ['pool', 'breaker_threshold'],
+  // 积分保底：0 = 关闭（上游与后端共同的缺省），正整数 = 余额低于该值时对实测
+  // 收费模型（tier 2）不出票。表单留空 = 沿用现值（collectConfig 跳过发送）。
+  credit_floor: ['pool', 'credit_floor'],
   degrade_threshold: ['pool', 'degrade_threshold'], degrade_cooldown: ['pool', 'degrade_cooldown'],
   degrade_cooldown_max: ['pool', 'degrade_cooldown_max'],
   cost_explore_interval: ['pool', 'cost_explore_interval'],
@@ -2259,21 +2270,64 @@ function pkExpiryMs(p) {
   return Number.isFinite(parsed) ? parsed : null;
 }
 
-// pkDetailGroups 只服务单账号逐包明细：正余额包先按到期时间挑选默认展示项，
-// 其余正余额包与已用完包分别折叠；同一到期时间按面额降序。
+/* 逐包明细的排序规则（选择持久化在 localStorage，跨会话记住，与上游同款）：
+     end_asc   到期升序（默认）——快过期的包排最前，提醒优先消耗；上游没下发
+               end_time 的包没有可比的日期，统一垫底，不掺进日期序里；
+     size_desc 面额降序——看「钱从哪来」，同面额按到期升序收尾。
+   上游把整表排完就完事；本 fork 的明细表还有「前 N 条 + 折叠」，所以规则同时
+   决定折叠线：选谁，前 N 条就按谁挑——否则「按面额降序」看到的仍是最早到期的
+   那 5 条，切换只换了个顺序，大额包依旧藏在折叠里。 */
+const PK_SORT_DEFAULT = 'end_asc';
+const PK_SORT_LABELS = { end_asc: '按到期升序 · 近的在前', size_desc: '按面额降序 · 大的在前' };
+const PK_SORT_SHORT = { end_asc: '按到期升序', size_desc: '按面额降序' };
+const LS_PK_SORT = 'pkSortMode';
+let pkSortMode = PK_SORT_DEFAULT;
+
+// pkSizeOf 面额取数：非数字一律当 0，别让 NaN 把比较器搅成不稳定序。
+function pkSizeOf(p) {
+  const n = Number(p && p.size);
+  return Number.isFinite(n) ? n : 0;
+}
+
+// pkDetailCompare 到期升序：无到期垫底，同到期按面额降序。
 function pkDetailCompare(a, b) {
-  const sizeOf = p => {
-    const n = Number(p && p.size);
-    return Number.isFinite(n) ? n : 0;
-  };
   const ea = pkExpiryMs(a), eb = pkExpiryMs(b);
   if (ea == null && eb != null) return 1;
   if (ea != null && eb == null) return -1;
   if (ea != null && eb != null && ea !== eb) return ea - eb;
-  return sizeOf(b) - sizeOf(a);
+  return pkSizeOf(b) - pkSizeOf(a);
 }
 
-function pkDetailGroups(packs, limit) {
+// 面额降序：同面额回落到期升序。pkDetailCompare 本身就是「到期升序 + 无到期垫底
+// + 同到期按面额降序」，直接复用，不维护第二份日期比较。
+function pkSizeDescCompare(a, b) {
+  const d = pkSizeOf(b) - pkSizeOf(a);
+  return d !== 0 ? d : pkDetailCompare(a, b);
+}
+
+function pkSortCompare(mode) {
+  return mode === 'size_desc' ? pkSizeDescCompare : pkDetailCompare;
+}
+
+// pkSortLoad 读回上次选择：只认白名单里的值（localStorage 里可能存着改版前的废弃
+// 值），读写都可能抛（隐私模式 / 无 localStorage 的宿主），一律回落默认值——一个
+// 排序偏好不值得让整个面板白屏。
+function pkSortLoad() {
+  try {
+    const v = localStorage.getItem(LS_PK_SORT);
+    if (typeof v === 'string' && Object.prototype.hasOwnProperty.call(PK_SORT_LABELS, v)) return v;
+    if (v) localStorage.removeItem(LS_PK_SORT);
+  } catch (e) { /* 读不到就用默认值 */ }
+  return PK_SORT_DEFAULT;
+}
+function pkSortSave(mode) {
+  try { localStorage.setItem(LS_PK_SORT, mode); } catch (e) { /* 存不下只影响下次打开 */ }
+}
+
+// pkDetailGroups 只服务单账号逐包明细：正余额包先按当前排序规则挑选展示项，
+// 其余正余额包与已用完包分别折叠。
+function pkDetailGroups(packs, limit, mode) {
+  const cmp = pkSortCompare(mode);
   const active = [], used = [];
   let usedSize = 0, restSize = 0, restRemain = 0;
   for (const p of packs || []) {
@@ -2286,8 +2340,8 @@ function pkDetailGroups(packs, limit) {
     const size = Number(p && p.size);
     if (Number.isFinite(size)) usedSize += size;
   }
-  active.sort(pkDetailCompare);
-  used.sort(pkDetailCompare);
+  active.sort(cmp);
+  used.sort(cmp);
   const visible = active.slice(0, pkDetailLimitValue(limit));
   const rest = active.slice(visible.length);
   for (const p of rest) {
@@ -2486,10 +2540,10 @@ function renderPackages(d, detailLimit) {
 
   $('pkNote').textContent = list.length + ' 个账号 · 实时查询上游';
 
-  // 逐包明细：每个账号一个表，包的**面额**列是重点
+  // 逐包明细：每个账号一个表；排序规则由视图顶部的选择器决定（默认到期近的在前）
   $('pkDetail').innerHTML = list.map(a => {
     if (a.error) return '';
-    const groups = pkDetailGroups(a.packages || [], detailLimit);
+    const groups = pkDetailGroups(a.packages || [], detailLimit, pkSortMode);
     const rowOf = (p, rowGroup) => {
       const k = (p.package_code || '') + '|' + (p.name || '(未命名)');
       const sub = (p.sub_product_code || '').replace(/^sp_tcaca_codebuddyide_?/, '') ||
@@ -2528,7 +2582,7 @@ function renderPackages(d, detailLimit) {
       '</h3><span class="grow"></span><span class="note">余额 ' + fmtTok(a.remain) +
       ' / 总额 ' + fmtTok(a.size) + ' · 可用 ' + (groups.visible.length + groups.rest.length) + ' 个包' +
       (groups.used.length ? ' / 已用完 ' + groups.used.length + ' 个' : '') +
-      ' · 默认展示最早到期 ' + pkDetailLimitValue(detailLimit) + ' 条</span>' +
+      ' · ' + (PK_SORT_SHORT[pkSortMode] || '') + '展示前 ' + pkDetailLimitValue(detailLimit) + ' 条</span>' +
       '</header><div class="tbl-wrap"><table class="acc"><thead><tr>' +
       '<th class="mark" aria-hidden="true"></th><th>包名 / 来源</th>' +
       '<th class="num">面额</th><th class="num">剩余</th><th class="num">已用</th>' +
@@ -2561,6 +2615,22 @@ if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
   }
 });
 
+/* 最近一次拉到的积分构成数据与生效的明细条数：切换排序规则时只重排内存数据，
+   不重新向上游请求（逐包明细是逐账号实时查询，刷新代价高）。 */
+let lastPackages = null, lastPackagesLimit;
+
+/* 排序规则控件：恢复上次选择（localStorage 跨会话记住）并绑定切换。 */
+if ($('pkSort')) {
+  pkSortMode = pkSortLoad();
+  $('pkSort').value = pkSortMode;
+  $('pkSort').onchange = () => {
+    const v = $('pkSort').value;
+    pkSortMode = Object.prototype.hasOwnProperty.call(PK_SORT_LABELS, v) ? v : PK_SORT_DEFAULT;
+    pkSortSave(pkSortMode);
+    if (lastPackages) renderPackages(lastPackages, lastPackagesLimit);
+  };
+}
+
 async function loadPackages() {
   $('pkSummary').innerHTML = '<div class="empty">查询中…（逐账号向上游实时查询）</div>';
   $('pkDetail').innerHTML = '';
@@ -2570,7 +2640,9 @@ async function loadPackages() {
       api('packages'),
       api('config').catch(() => null),
     ]);
-    renderPackages(d, pkDetailLimit(c && c.config));
+    lastPackages = d;                            // 缓存供排序切换即时重排
+    lastPackagesLimit = pkDetailLimit(c && c.config);
+    renderPackages(lastPackages, lastPackagesLimit);
   } catch (e) {
     $('pkSummary').innerHTML = '<div class="empty">读取失败：' + esc(e.message) + '</div>';
     $('pkExpiry').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(e.message) + '</div>';

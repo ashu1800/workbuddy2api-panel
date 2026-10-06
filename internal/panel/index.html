@@ -705,6 +705,10 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
 .strong { font-weight: 600; }
 .help { cursor: help; }
 .ta-c { text-align: center; }
+/* 只承载语义、不参与布局的表单壳：display:contents 让 <form> 自己不生成盒子，
+   子元素按原位置排版——加壳前后布局逐像素一致（密钥框用它把游离的 password
+   输入框收进 form，见 #keyForm）。 */
+.form-bare { display: contents; }
 
 /* ════════════════════════════════════════════════════════════════════════
    14. 响应式（控制台以桌面为主：只保证不横向滚动、导航可折叠）
@@ -906,6 +910,10 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
           <h3>账号对比</h3>
           <span class="grow"></span>
           <span class="note" id="pkNote">—</span>
+          <select id="pkSort" class="xs" title="逐包明细的排序规则">
+            <option value="end_asc" selected>按到期（近的在前）</option>
+            <option value="size_desc">按面额（大的在前）</option>
+          </select>
           <button class="xs" id="btnPk">刷新</button>
         </header>
         <div class="pad"><div class="pk-grid" id="pkSummary"></div></div>
@@ -1094,6 +1102,10 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
                 <input name="growth_hours" placeholder="1">
                 <span class="hint">每日到点自动「扫描 + 执行全部待办」（Sequential 任务链零点解锁后自动推进，建议零点后）</span></label>
             </div>
+            <div class="hr"></div>
+            <div class="switch"><span class="lb">保号任务覆盖已禁用账号</span>
+              <input type="checkbox" name="include_disabled_in_tasks"></div>
+            <div class="hint">默认关闭：签到 / 活跃上报 / Token 保活 / 后台刷新余额这四类保号任务默认跳过已禁用账号——禁用只该关掉选号，不该连签到这条唯一的自动回血路径一起断掉，待命号恰恰最需要保号。打开后它们对已禁用账号照常执行；已禁用账号依旧不参与选号（选号侧的过滤不受本开关影响），猫猫旅行与成长任务不受影响。改动即时生效。</div>
           </div>
         </div>
 
@@ -1146,6 +1158,9 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
                 <input name="ttl" placeholder="30m">
                 <span class="hint">改动需重启进程</span></label>
             </div>
+            <label class="fld"><span class="lb">积分保底</span>
+              <input name="credit_floor" type="number" min="0" placeholder="0">
+              <span class="hint">账号余额低于该值时，对实测收费模型（tier 2）不再出票——防止收费请求把余额打穿、连免费模型都被 402 冷却到次日签到。0 = 关闭（默认，保持既有行为）；正整数 = 「低于该值不出票」，上游示例配置推荐 100。免费与未观测模型不受限，签到回血越过该值后自动恢复。改动即时生效。</span></label>
             <div class="switch"><span class="lb">快过期积分优先</span>
               <input type="checkbox" name="prefer_expiring"></div>
           </div>
@@ -1344,7 +1359,14 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
       <div class="hint">该网关已启用 api_key 鉴权，请输入 config.json 中的密钥。</div>
     </header>
     <div class="body">
-      <input type="password" id="keyInput" placeholder="api_key" autocomplete="current-password">
+      <!-- keyInput 必须待在 form 里：游离的 password 输入框会被 Chromium 凭空合成
+           「用户名 + 密码」凭证表单，并在同页抓第一个文本输入框当用户名——于是聚焦
+           那个输入框就会弹「保存的密码」下拉、甚至自动填入保存过的用户名。
+           用 .form-bare（display:contents）让它不生成盒子——布局与裸露输入框一致。
+           回车提交由 app.js 拦截（CSP 禁内联 onsubmit），Enter 仍走 #btnKey。 -->
+      <form id="keyForm" class="form-bare">
+        <input type="password" id="keyInput" placeholder="api_key" autocomplete="off">
+      </form>
       <div class="state err mt-2" id="keyErr" hidden>密钥不正确，请重试。</div>
     </div>
     <footer>
