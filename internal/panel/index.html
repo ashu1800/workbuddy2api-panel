@@ -391,7 +391,8 @@ th.num, td.num { text-align: right; }
 .realm-opt { display: inline-flex; align-items: center; gap: var(--sp-1); font-size: var(--fs-12); color: var(--ink-2); cursor: pointer; }
 /* 用量 / 首字 / 推理 三列：都只用 `.usage-line` + `.usage-item` 一套 chip，
    保证三列基线、字号、内边距完全一致。用量是主指标用 accent，首字/推理是性能
-   指标——性能不是状态，不占用琥珀/绿，异常与否交给工具提示。 */
+   指标——性能不是状态，不占用琥珀/绿，异常与否交给工具提示。用量 chip 里只放
+   「7.10M」这样的数字+大写单位，不挂 "tok" 后缀小字（.calls-cell 的「次」仍用 em）。 */
 .usage-cell { min-width: 74px; }
 .ttfb-cell, .speed-cell { min-width: 74px; }
 /* 调用次数：`1771次 | 99.83%`。百分比是这一行唯一的语义色（成功率是状态）。 */
@@ -412,7 +413,6 @@ th.num, td.num { text-align: right; }
 }
 .usage-item { display: inline-flex; align-items: baseline; padding: 2px var(--sp-1); border-radius: var(--r-sm); background: var(--surface-3); }
 .usage-item b { font-weight: 600; }
-.usage-item em { margin-left: 1px; font: 500 10px/1 var(--sans); font-style: normal; color: var(--ink-2); }
 .usage-total { color: var(--accent-ink); background: var(--accent-soft); }
 
 /* ════════════════════════════════════════════════════════════════════════

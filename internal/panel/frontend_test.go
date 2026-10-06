@@ -173,6 +173,65 @@ process.stdout.write(JSON.stringify({
 	}
 }
 
+// 账号表「今日用量」的格式契约：单位大写 K/M/B、小数固定两位、且不再拼 "tok" 后缀
+// （7.1mtok → 7.10M）。1000 以下保持精确整数，0 就是 "0" 而不是 "0.00"——
+// 用量列只显示数字+单位，量纲说明交给悬浮提示。
+func TestAppJSFormatTokenCount(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; token count formatting test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function formatTokenCount');
+const end = src.indexOf('function formatLatency');
+if (start < 0 || end < 0) throw new Error('token count formatter not found');
+const ctx = { Number, String, Math };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) + '\nthis.fmt=formatTokenCount;', ctx);
+process.stdout.write(JSON.stringify({
+  example: ctx.fmt(7100000),
+  large: ctx.fmt(18700000),
+  zero: ctx.fmt(0),
+  below1k: ctx.fmt(320),
+  kilo: ctx.fmt(1500),
+  carry: ctx.fmt(999999),
+  billion: ctx.fmt(1234567890),
+  negative: ctx.fmt(-1),
+  missing: ctx.fmt(null),
+  blank: ctx.fmt(''),
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "token-format-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("token count formatting node test failed: %v\n%s", err, out)
+	}
+	const want = `{"example":"7.10M","large":"18.70M","zero":"0","below1k":"320",` +
+		`"kilo":"1.50K","carry":"1.00M","billion":"1.23B","negative":"—","missing":"—","blank":"—"}`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("token count formatting=%s want %s", out, want)
+	}
+
+	// 用量单元格里不得再出现 "tok" 小字：格式必须整体由 formatTokenCount 决定。
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, banned := range []string{"todayTokUnit", "<em>tok</em>"} {
+		if strings.Contains(string(js), banned) {
+			t.Errorf("app.js 用量列仍带 tok 后缀（发现 %q）", banned)
+		}
+	}
+}
+
 // 模型限流时间必须同时支持上游 reset_at、网关 until 和无重置时间三种形态。
 func TestAppJSRateLimitMeta(t *testing.T) {
 	node, err := exec.LookPath("node")

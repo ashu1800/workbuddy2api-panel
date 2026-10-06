@@ -31,9 +31,9 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-// 1.13.4：侧边栏收窄到 184px + 站点图标（蓝底白 W，侧边栏品牌标与 favicon 同几何）；
-// 顶栏与内容区改为共用「封顶 + 居中」容器，任意视口下左右留白对称。
-const appVersion = "1.13.4-panel"
+// 1.13.5：账号表「今日用量」去掉 "tok" 后缀，单位改大写 K/M/B 且小数固定两位
+// （7.1mtok → 7.10M），列内数字等宽对齐、量纲由单位字母承载。
+const appVersion = "1.13.5-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

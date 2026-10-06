@@ -123,26 +123,28 @@ function rateLimitMeta(row, now) {
   }
   return { model, kind, detail, title: title.join('\n') };
 }
+/* 账号表用量列（今日 chip + 悬浮提示里的累计值）专用：单位一律大写（K/M/B）、
+   小数固定两位，量纲由单位字母承载，不再拼 "tok" 后缀——列内数字等宽对齐，
+   7.1mtok → 7.10M。1000 以下仍是精确整数（不凑两位小数，免得把 0 写成 0.00、
+   把 320 写成 320.00）。 */
 function formatTokenCount(tokens) {
   if (tokens == null || tokens === '') return '—';
   const n = Number(tokens);
   if (!Number.isFinite(n) || n < 0) return '—';
   if (n < 1000) return String(Math.round(n));
-  const units = [['k', 1e3], ['m', 1e6], ['b', 1e9]];
+  const units = [['K', 1e3], ['M', 1e6], ['B', 1e9]];
   let unit = units[0];
   for (const candidate of units) {
     if (n >= candidate[1]) unit = candidate;
   }
-  let value = n / unit[1];
-  let rounded = Number(value.toFixed(1));
-  // 999999 → 1m，而不是 1000k；四舍五入后自动升级单位。
+  let text = (n / unit[1]).toFixed(2);
+  // 999999 → 1.00M，而不是 1000.00K；四舍五入后自动升级单位。
   const next = units[units.indexOf(unit) + 1];
-  if (next && rounded >= 1000) {
+  if (next && Number(text) >= 1000) {
     unit = next;
-    value = n / unit[1];
-    rounded = Number(value.toFixed(1));
+    text = (n / unit[1]).toFixed(2);
   }
-  return rounded + unit[0];
+  return text + unit[0];
 }
 
 function formatLatency(ms) {
@@ -385,7 +387,6 @@ function renderAccounts(list) {
     const todayReq = td.requests || 0;
     const todayErr = typeof td.errors === 'number' ? td.errors : null;
     const todayTok = formatTokenCount(td.total_tokens);
-    const todayTokUnit = todayTok === '—' ? '' : '<em>tok</em>';
     const dayLabel = '今天' + (td.day ? '（' + td.day + '）' : '');
     // 累计对照值
     const cumTok = formatTokenCount(tu.total_tokens);
@@ -429,7 +430,7 @@ function renderAccounts(list) {
         '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line">' +
-        '<span class="usage-item usage-total"><b>' + todayTok + '</b>' + todayTokUnit + '</span>' +
+        '<span class="usage-item usage-total"><b>' + todayTok + '</b></span>' +
       '</span></td>' +
       // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
       '<td class="num ttfb-cell" title="' + esc(ttfbTitle) + '">' +
