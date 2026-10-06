@@ -14,6 +14,14 @@ let lastFocus = null;
 // ReferenceError（旧版直接刷新用量页即报 "Cannot access 'usageRateWarmAt'
 // before initialization"），async 只是把它变成被 catch 吞掉的 rejection。
 let usageRateWarmAt = 0;
+// 请求记录的视图选择与筛选条件。表格是上游形态（默认），行式是本 fork 移植前的
+// 原始流水行——两种都留着，选择记在 localStorage 跨会话记住。
+// 与 usageRateWarmAt 同理必须声明在文件顶部：顶层 go() 落到 #logs 时会同步调进
+// loadLogs，声明在下方就是 TDZ ReferenceError。
+const LS_REQVIEW = 'wb2api.reqview';
+let reqView = localStorage.getItem(LS_REQVIEW) === 'line' ? 'line' : 'table';
+let reqEntries = [];   // 最近一次拉取到的记录（表格的筛选基数，也是计数条的分母）
+let reqFilter = { client_ip: '', user_agent: '', account: '', model: '', outcome: '' };
 
 const $ = id => document.getElementById(id);
 
@@ -900,11 +908,11 @@ $('logChips').addEventListener('click', ev => {
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
-  // 时间范围交给归档侧过滤，不是前端筛已拉取的行：区间落在更早的时间段时，
-  // 「最近 100 条」里根本不会有那些记录，必须让服务端按时间取。
-  // 默认「全部历史」→ 查询串与移植前逐字相同（request_logs?limit=100）。
-  const rq = trangeQuery('reqRange', false);
-  rq.set('limit', '100');
+  // 时间范围与筛选栏都交给归档侧过滤，不是前端筛已拉取的行：命中的记录可能落在
+  // 「最近 N 条」之外，必须让服务端按条件取。
+  // 默认「全部历史」+ 空筛选 → 查询串与移植前逐字相同（request_logs?limit=100）。
+  const rq = reqQuery();
+  reqLoading();
   try {
     const [d, metrics, requestRows] = await Promise.all([
       api('logs'),
@@ -934,12 +942,95 @@ async function loadLogs() {
     $('logNote').textContent = logCh === 'all'
       ? '任务 ' + (counts.task || 0) + ' · 对话 ' + (counts.chat || 0) + ' · 系统 ' + (counts.sys || 0)
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
-  } catch (e) { /* 概览已提示 */ }
+  } catch (e) {
+    /* 概览/密钥门已提示失败原因。表格里若留着加载骨架会一直像「正在加载」，
+       这里就地收尾（写法同 loadModels 的失败态）；行式视图不动——它的内容是上一次
+       成功渲染的结果，与移植前的表现一致。 */
+    if (reqView === 'table') {
+      const tb = $('reqBody');
+      if (tb) tb.innerHTML = '<tr><td colspan="10"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    }
+  }
 }
 
 // 请求记录的时间范围控件：任何改动（预设切换 / 自定义起止）都重新拉一次归档。
 // 绑定本身不发请求——首次加载由 go() 驱动，否则打开日志页会打两遍接口。
 if ($('reqRange')) trangeBind('reqRange', loadLogs);
+
+/* ── 请求记录：筛选栏 + 视图切换（表格 / 行式）──────────────────────
+   筛选控件 → 请求参数 → 重新拉取。字段名与 panel.requestLogs 一一对应，
+   前端只做「取值 + 拼查询串」，不自己重写一套匹配语义。 */
+const REQ_FIELDS = { reqIP: 'client_ip', reqUA: 'user_agent', reqAccount: 'account', reqModel: 'model' };
+
+function reqSyncFilter() {
+  for (const [id, key] of Object.entries(REQ_FIELDS)) {
+    const el = $(id);
+    reqFilter[key] = el ? String(el.value || '').trim() : '';
+  }
+  const oc = $('reqOutcome');
+  if (oc) reqFilter.outcome = oc.value || '';
+}
+
+/* reqQuery 把筛选栏 + 时间范围 + 条数拼成请求记录接口的查询串。顺序固定为
+   「时间范围 → limit → 筛选条件」：默认（全部历史 + 空筛选）时逐字就是移植前的
+   request_logs?limit=100，既有断言（含时间范围那批）钉得住。 */
+function reqQuery() {
+  const q = trangeQuery('reqRange', false);
+  const limit = $('reqLimit') && $('reqLimit').value;
+  q.set('limit', limit || '100');
+  for (const key of ['client_ip', 'user_agent', 'account', 'model']) {
+    if (reqFilter[key]) q.set(key, reqFilter[key]);
+  }
+  if (reqFilter.outcome) q.set('outcome', reqFilter.outcome);
+  return q;
+}
+
+/* reqLoading 拉取期间的加载态：表格视图铺既有骨架行（skeletonRows，与账号表/
+   任务表同一写法），行式视图什么都不做——那条路径的输出（含空态文案）是逐字节
+   钉住的，不能多一行占位。 */
+function reqLoading() {
+  if (reqView !== 'table') return;
+  const tb = $('reqBody');
+  if (tb) tb.innerHTML = skeletonRows(10, 4);
+}
+
+/* reqPaintView 把分段控件的选中态与两个容器的显隐对齐到 reqView。 */
+function reqPaintView() {
+  for (const c of document.querySelectorAll('#reqViews .chip')) c.classList.toggle('on', c.dataset.rv === reqView);
+  const wrap = $('reqTableWrap'), box = $('reqLogBox');
+  if (wrap) wrap.hidden = reqView !== 'table';
+  if (box) box.hidden = reqView === 'table';
+}
+
+/* reqSetView 切换视图：只重画当前容器，不重拉数据（reqEntries 就是刚拉到的那批）。
+   localStorage 读写都可能抛（隐私模式 / 无存储宿主），一律吞掉——存不下只是下次
+   打开不记得，不该让切换本身失败。 */
+function reqSetView(v) {
+  reqView = v === 'line' ? 'line' : 'table';
+  try { localStorage.setItem(LS_REQVIEW, reqView); } catch (e) { /* 只影响下次打开 */ }
+  reqPaintView();
+  renderRequestLog();
+}
+if ($('reqViews')) $('reqViews').addEventListener('click', ev => {
+  const b = ev.target.closest('button[data-rv]');
+  if (b) reqSetView(b.dataset.rv);
+});
+
+// 文字筛选防抖 250ms：每敲一个字符打一次接口会把归档读穿（UA 这种长串尤其）。
+// 下拉（结果 / 条数）不防抖——一次点击就是一次明确的查询。
+let reqTimer = null;
+function reqOnType() {
+  reqSyncFilter();
+  clearTimeout(reqTimer);
+  reqTimer = setTimeout(loadLogs, 250);
+}
+for (const id of Object.keys(REQ_FIELDS)) if ($(id)) $(id).oninput = reqOnType;
+if ($('reqOutcome')) $('reqOutcome').onchange = () => { reqSyncFilter(); loadLogs(); };
+if ($('reqLimit')) $('reqLimit').onchange = loadLogs;
+if ($('btnReqReload')) $('btnReqReload').onclick = loadLogs;
+
+// 首屏恢复上次的视图选择（index.html 的默认骨架是表格态，这里只处理「上次选了行式」）。
+reqPaintView();
 
 function renderRequestMetrics(m, entries) {
   m = m || {};
@@ -955,14 +1046,125 @@ function renderRequestMetrics(m, entries) {
       (a.last_error ? ' · 错误：' + a.last_error : '')
     : '仅内存指标，JSONL 归档已关闭';
 
-  const rows = entries || [];
-  $('reqLogBox').innerHTML = rows.map(requestLogLine).join('') ||
-    '<span class="c-muted">暂无请求记录</span>';
-  // 调用来源是增量字段：开关关闭（logging.request_client_info=false）或读到功能上线前
-  // 写入的归档行时，整页都不会有来源。这时在归档状态旁点名原因，否则每行缺的那段
-  // 会被当成 reqlog 解析坏了。
-  const hasSource = rows.some(e => e && (e.client_ip || e.user_agent));
-  if (rows.length && !hasSource) $('reqNote').textContent += ' · 来源未记录';
+  // 记录交给当前视图渲染（表格 / 行式），计数条与来源提示跟着一起更新。
+  reqEntries = entries || [];
+  renderRequestLog();
+}
+
+/* reqMatch 单行匹配：与后端 reqlog.Filter 同一口径——client_ip / user_agent /
+   account / model 是大小写不敏感的子串匹配，outcome 精确匹配。
+   服务端已经按同一套条件筛过一遍，这里再匹配一次是为了「归档关闭」时前端会回落
+   到内存里的最近请求（metrics.recent）——那批数据没经过服务端筛选，不兜一层的话
+   筛选栏看起来完全失效（表格里仍是全部记录）。 */
+function reqMatch(e, f) {
+  f = f || reqFilter;
+  if (f.outcome && String(e && e.outcome || '') !== f.outcome) return false;
+  for (const key of ['client_ip', 'user_agent', 'account', 'model']) {
+    const needle = String(f[key] || '').trim().toLowerCase();
+    if (needle && !String((e && e[key]) || '').toLowerCase().includes(needle)) return false;
+  }
+  return true;
+}
+function reqList(f) { return reqEntries.filter(e => reqMatch(e, f)); }
+
+/* reqOutcomeTag 结果列：HTTP 状态码 + outcome 标签，色走既有 .tag 语义色
+   （成功 ok / 中断 warn / 出错 bad / 无结果 mute），不新起一套徽标。 */
+function reqOutcomeTag(e) {
+  const outcome = String(e && e.outcome || '');
+  const label = { success: '成功', http_error: 'HTTP 错误', stream_error: '流错误', interrupted: '中断' }[outcome] ||
+    outcome || '—';
+  const cls = outcome === 'success' ? 'ok' : outcome === 'interrupted' ? 'warn' : outcome ? 'bad' : 'mute';
+  // 状态码缺失时不拼出「— —」（上游写法）：两者都没有就只留一个 —。
+  const status = e && e.status ? String(e.status) : '';
+  return '<span class="tag ' + cls + '">' + esc((status + ' ' + label).trim()) + '</span>';
+}
+
+/* reqTokenCell Token 列：总量 + 缓存命中率。命中率只在有观测（命中+未命中>0）时
+   出现——老归档行没有 cache_* 字段，凭空补一个「—」会被读成「缓存完全没命中」。
+   命中率直接复用用量明细表的 cacheRateCell：同一口径、同一分档色，两处不漂移。 */
+function reqTokenCell(e) {
+  const total = Number(e && e.total_tokens || 0) ||
+    (Number(e && e.prompt_tokens || 0) + Number(e && e.completion_tokens || 0));
+  const cell = total ? fmtTok(total) : '<span class="muted">—</span>';
+  const observed = Number(e && e.cache_hit_tokens || 0) + Number(e && e.cache_miss_tokens || 0);
+  if (!observed) return cell;
+  return cell + '<span class="req-hit">' + cacheRateCell(e.cache_hit_tokens, e.cache_miss_tokens) + '</span>';
+}
+
+/* reqCreditCell 积分列：credit_known=false（未计费/请求没走完）显示 —。「不知道」
+   和「0 分」是两回事，都写成 0.00 会让对账时分不清。 */
+function reqCreditCell(e) {
+  if (!e || !e.credit_known) return '<span class="muted">—</span>';
+  const v = Number(e.credit);
+  return Number.isFinite(v) ? trimFixed(v.toFixed(2)) : '<span class="muted">—</span>';
+}
+
+/* renderRequestTable 渲染请求记录表。来源列是这一版的重点：IP 用等宽字体方便扫，
+   UA 单行截断（完整值在 title 里，整行用 requestLogText 作 tooltip，与行式视图
+   看到的是同一份文本）。
+   老归档（来源功能上线前写入）没有 client_ip/user_agent：显示 — 而不是空白——
+   空白会被读成「这一列坏了」。 */
+function renderRequestTable(list) {
+  const tb = $('reqBody');
+  if (!tb) return;
+  const rows = list || reqList();
+  tb.innerHTML = rows.map(e => {
+    const when = e && e.time ? new Date(e.time).toLocaleTimeString('zh-CN', { hour12: false }) : '—';
+    const ip = (e && e.client_ip) || '';
+    const ua = (e && e.user_agent) || '';
+    const rid = (e && e.request_id) || '';
+    return '<tr title="' + esc(requestLogText(e)) + '">' +
+      '<td class="num">' + esc(when) + '</td>' +
+      '<td>' + reqOutcomeTag(e) + '</td>' +
+      '<td>' + esc((e && e.model) || '—') + '</td>' +
+      '<td>' + esc((e && e.account) || '—') + '</td>' +
+      '<td>' + (ip ? '<span class="clip ip" title="' + esc(ip) + '">' + esc(ip) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td>' + (ua ? '<span class="clip" title="' + esc(ua) + '">' + esc(ua) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '<td class="num">' + fmtMs(e && e.duration_ms) + '</td>' +
+      '<td class="num">' + reqTokenCell(e) + '</td>' +
+      '<td class="num">' + reqCreditCell(e) + '</td>' +
+      '<td>' + (rid ? '<span class="clip rid" title="' + esc(rid) + '">' + esc(rid) + '</span>' : '<span class="muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('') || '<tr><td colspan="10" class="empty">' +
+    (reqEntries.length ? '没有符合当前筛选条件的请求记录' : '暂无请求记录') + '</td></tr>';
+}
+
+/* reqFiltered 当前是否带着筛选条件发过查询。服务端按条件取回的批次已经只剩命中
+   项，本地匹配不会再去掉任何行——计数条必须靠这个标志说明「这不是全部」。 */
+function reqFiltered() {
+  return ['client_ip', 'user_agent', 'account', 'model', 'outcome'].some(k => reqFilter[k]);
+}
+
+/* renderRequestCount 计数条（筛选栏右侧）：命中数 / 总数。同一批记录里一条来源
+   都没有时（开关关闭，或读到来源功能上线前写入的归档）在计数后点名「来源未记录」
+   并转琥珀（.src-off）——否则表格里那两列整片 — 会被当成解析坏了。 */
+function renderRequestCount(list) {
+  const el = $('reqCount');
+  if (!el) return;
+  const total = reqEntries.length, shown = (list || []).length;
+  const localFiltered = shown !== total;
+  const queryFiltered = reqFiltered();
+  const hasSource = reqEntries.some(e => e && (e.client_ip || e.user_agent));
+  el.textContent = !total ? '—'
+    : (localFiltered ? '命中 ' + shown + ' / ' + total + ' 条'
+      : queryFiltered ? '命中 ' + shown + ' 条' : total + ' 条') + (hasSource ? '' : ' · 来源未记录');
+  el.className = (total > 0 && (localFiltered || queryFiltered || !hasSource)) ? 'note src-off' : 'note';
+}
+
+/* renderRequestLog 按当前视图渲染请求记录：表格（.acc.req 的 tbody）或行式
+   （移植前的 .ln 流水行）。两个容器各写各的，切换视图不重拉数据；非当前视图的
+   容器不渲染——500 行拼两遍 DOM 是白费。行式分支保持移植前的表达式（含空态
+   文案）逐字节不变，那是被测试钉住的输出。 */
+function renderRequestLog() {
+  const list = reqList();
+  renderRequestCount(list);
+  if (reqView === 'line') {
+    const box = $('reqLogBox');
+    if (box) box.innerHTML = list.map(requestLogLine).join('') ||
+      '<span class="c-muted">暂无请求记录</span>';
+    return;
+  }
+  renderRequestTable(list);
 }
 
 /* requestLogText 生成请求记录行（本 fork 的行式日志，渲染进 #reqLogBox 的 .ln 行）。

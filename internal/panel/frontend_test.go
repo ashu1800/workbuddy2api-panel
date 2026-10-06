@@ -1021,7 +1021,8 @@ const sandbox = {
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
 vm.runInContext(src +
-  '\nthis.loadUsage=loadUsage; this.loadLogs=loadLogs; this.renderAccounts=renderAccounts; this.renderRequestMetrics=renderRequestMetrics;',
+  '\nthis.loadUsage=loadUsage; this.loadLogs=loadLogs; this.renderAccounts=renderAccounts; this.renderRequestMetrics=renderRequestMetrics;' +
+  '\nthis.reqSetView=reqSetView;',
   sandbox, { filename: 'app.js' });
 
 const tick = () => new Promise(r => setTimeout(r, 5));
@@ -1077,6 +1078,10 @@ const setCustom = (id, from, to) => {
   out.badFetched = urls.length > n1;
 
   // 请求记录：默认「全部历史」不发 from/to（与移植前逐字一致），选定区间才带。
+  // 请求记录默认视图是表格（与上游一致），下面断言的是**行式视图**的输出：切到行式
+  // 后走的仍是移植前的 requestLogLine，行内容必须逐字不变（默认视图与切换另有
+  // TestAppJSRequestTableRender 钉住）。
+  sandbox.reqSetView('line');
   const logQ = async preset => {
     if (preset) setPreset('reqRange', preset);
     await sandbox.loadLogs();
@@ -1907,7 +1912,9 @@ process.stdout.write(JSON.stringify({
 }
 
 // TestAppJSUsageCacheRender node + DOM 桩真实渲染一次（沙箱写法同 TestAppJSTopLevelSmoke）：
-//   - 请求记录行：有来源与无来源两组，分别渲染成 .ln 行；
+//   - 请求记录：同一批记录先按默认的表格视图渲染（#reqBody），再切到行式渲染
+//     （#reqLogBox，即有来源与无来源两组 .ln 行；表格视图的完整契约见
+//     TestAppJSRequestTableRender）；
 //   - 用量页：总览统计条固定 6 张卡（0 空白格）、积分扣除统计条含缓存命中率卡（4→5 张）、
 //     按账号/按模型/按域三张明细表（含新增的命中率列与空态 colspan）；
 //   - 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数，无 tok 后缀）。
@@ -1938,6 +1945,10 @@ const ctx = {
   renderUsageChart: () => { el('usChart').innerHTML = 'CHART'; },
   // renderUsage 把窗口标签写进 #usNote（本段只关心卡片/表格，标签另有 trange 测试钉住）。
   trangeLabel: () => '近 3 天',
+  // 请求记录的模块级状态（声明在文件顶部，不在本切片里）：表格渲染要读它们。
+  reqEntries: [],
+  reqFilter: { client_ip: '', user_agent: '', account: '', model: '', outcome: '' },
+  reqView: 'table',
 };
 vm.createContext(ctx);
 vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d +
@@ -1950,13 +1961,21 @@ const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
 const base = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12 };
 const plain = { ...base, request_id: 'req-1' };
 const full = { ...base, request_id: 'req-2', client_ip: '203.0.113.7', user_agent: 'curl/8.4.0', cache_hit_tokens: 2257, cache_miss_tokens: 43 };
-ctx.renderRequestMetrics({ completed: 2, success_rate: 100, http_success_rate: 100, avg_duration_ms: 1250, in_flight: 0,
-  archive: { enabled: true, bytes: 20480 } }, [plain, full]);
+const metrics = { completed: 2, success_rate: 100, http_success_rate: 100, avg_duration_ms: 1250, in_flight: 0,
+  archive: { enabled: true, bytes: 20480 } };
+// 默认视图 = 表格：同一批记录先以表格渲染（首屏形态），再切到行式渲染。
+// 两个分支的输出分别断言，行式必须与移植前逐字一致。
+ctx.renderRequestMetrics(metrics, [plain, full]);
+const reqTable = nodes.reqBody.innerHTML;
+ctx.reqView = 'line';
+ctx.renderRequestMetrics(metrics, [plain, full]);
 const reqLogBox = nodes.reqLogBox.innerHTML;
-const reqNoteWithSource = nodes.reqNote.textContent;
-// 开关关闭 / 旧归档：整页无来源时明确点名，而不是让人以为解析坏了。
+const reqCountWithSource = nodes.reqCount.textContent;
+// 开关关闭 / 旧归档：整批记录都没有来源时明确点名（计数条转 .src-off），
+// 而不是让人以为解析坏了或筛选失效了。
 ctx.renderRequestMetrics({ completed: 1, archive: { enabled: true, bytes: 0 } }, [plain]);
-const reqNoteNoSource = nodes.reqNote.textContent;
+const reqCountNoSource = nodes.reqCount.textContent;
+const reqCountNoSourceCls = nodes.reqCount.className;
 
 ctx.renderUsage({
   totals: { requests: 1200, total_tokens: 1200000, prompt_tokens: 900000, completion_tokens: 300000, errors: 0,
@@ -1996,7 +2015,8 @@ ctx.renderAccounts([{
   token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
 }]);
 const accounts = nodes.accBody.innerHTML;
-process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSource, usStats, usAcc, usModel, usRealm,
+process.stdout.write(JSON.stringify({ reqLogBox, reqCountWithSource, reqCountNoSource, reqCountNoSourceCls, reqTable,
+  usStats, usAcc, usModel, usRealm,
   creditStats, creditNote, usStatsCards: String(usStatsCards), usStatsBlanks: String(usStatsBlanks),
   chipUnit: ctx.tokenChipHTML('7.10M'), chipPlain: ctx.tokenChipHTML('320'), chipDash: ctx.tokenChipHTML('—'),
   emptyAcc, emptyModel, emptyRealm, emptyStats, emptyCreditStats, emptyCreditNote, accounts }));`
@@ -2017,6 +2037,7 @@ process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSou
 		t.Fatalf("usage cache render output is not JSON: %v\n%s", err, out)
 	}
 	const line = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit"
+	// 行式视图：逐字沿用移植前的行格式（同一批记录、同一条 requestLogLine）。
 	for _, frag := range []string{
 		`<span class="ln">` + line + ` | req-1</span>`,
 		`<span class="ln">` + line + ` | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;curl/8.4.0&quot; | req-2</span>`,
@@ -2025,11 +2046,20 @@ process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSou
 			t.Errorf("请求记录行缺少片段 %q\n实际：%s", frag, got["reqLogBox"])
 		}
 	}
-	if strings.Contains(got["reqNoteWithSource"], "来源未记录") {
-		t.Errorf("有来源时不该提示「来源未记录」：%s", got["reqNoteWithSource"])
+	// 表格视图（默认）：两行都在 #reqBody 里，来源列有值/缺值分别呈现。
+	if !strings.Contains(got["reqTable"], `<span class="tag ok">200 成功</span>`) ||
+		!strings.Contains(got["reqTable"], `<span class="clip ip" title="203.0.113.7">203.0.113.7</span>`) ||
+		strings.Count(got["reqTable"], `<tr title="`) != 2 {
+		t.Errorf("请求记录表格渲染不对：%s", got["reqTable"])
 	}
-	if !strings.Contains(got["reqNoteNoSource"], "来源未记录") {
-		t.Errorf("整页无来源时应提示「来源未记录」：%s", got["reqNoteNoSource"])
+	if strings.Contains(got["reqCountWithSource"], "来源未记录") {
+		t.Errorf("有来源时不该提示「来源未记录」：%s", got["reqCountWithSource"])
+	}
+	if !strings.Contains(got["reqCountNoSource"], "来源未记录") {
+		t.Errorf("整页无来源时应提示「来源未记录」：%s", got["reqCountNoSource"])
+	}
+	if !strings.Contains(got["reqCountNoSourceCls"], "src-off") {
+		t.Errorf("无来源时计数条应转琥珀（.src-off）：%q", got["reqCountNoSourceCls"])
 	}
 
 	// 总览统计条必须 6 张实卡、0 个空白格：statsHTML 只把不足列数的空位补成 6 的倍数，
@@ -2764,6 +2794,588 @@ func equalStrings(got, want []string) bool {
 		}
 	}
 	return true
+}
+
+/* ══════════════════════════════════════════════════════════════════════════
+   请求记录表格（表格 / 行式切换 + 筛选栏）
+   ══════════════════════════════════════════════════════════════════════════ */
+
+// TestIndexRequestTableView index.html 侧的表格骨架必须真的在页面里：视图分段
+// 控件、筛选栏的每个控件、10 列表头与 tbody、行式容器（默认隐藏）。
+// app.js 侧全是 `if ($('reqIP')) …` 的守卫写法——宿主被删掉时 JS 不报错、测试
+// 全绿，只是筛选栏人间蒸发，故这里逐个钉住。
+func TestIndexRequestTableView(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	// 筛选栏：四个文字筛选 + 结果 + 时间范围 + 条数 + 计数 + 重新读取，全在 .fbar 内。
+	const fbarStart = `<div class="fbar" id="reqFilterBar">`
+	const tblStart = `<div class="tbl-wrap req-wrap" id="reqTableWrap">`
+	i, j := strings.Index(body, fbarStart), strings.Index(body, tblStart)
+	if i < 0 || j < 0 || j < i {
+		t.Fatalf("index.html 缺少筛选栏或表格容器：fbar=%d table=%d", i, j)
+	}
+	fbar := body[i:j]
+	for _, want := range []string{
+		`id="reqIP"`, `id="reqUA"`, `id="reqAccount"`, `id="reqModel"`,
+		`<select id="reqOutcome" aria-label="按结果筛选">`,
+		`<span class="trange" id="reqRange"></span>`,
+		`<select id="reqLimit" aria-label="读取条数">`,
+		`<span class="note" id="reqCount">—</span>`,
+		`<button class="xs" id="btnReqReload">重新读取</button>`,
+	} {
+		if !strings.Contains(fbar, want) {
+			t.Errorf("筛选栏缺少控件 %s\n实际：%s", want, fbar)
+		}
+	}
+	// 结果下拉的取值必须与后端 reqlog 的 outcome 字面量一一对应（不发明取值）。
+	for _, want := range []string{
+		`<option value="">全部结果</option>`,
+		`<option value="success">成功</option>`,
+		`<option value="http_error">HTTP 错误</option>`,
+		`<option value="stream_error">流错误</option>`,
+		`<option value="interrupted">中断</option>`,
+	} {
+		if !strings.Contains(fbar, want) {
+			t.Errorf("结果筛选缺少选项 %s", want)
+		}
+	}
+	// 条数四档，默认 100（与移植前 request_logs?limit=100 的默认一致）。
+	for _, want := range []string{
+		`<option value="50">最近 50 条</option>`,
+		`<option value="100" selected>最近 100 条</option>`,
+		`<option value="200">最近 200 条</option>`,
+		`<option value="500">最近 500 条</option>`,
+	} {
+		if !strings.Contains(fbar, want) {
+			t.Errorf("条数下拉缺少选项 %s", want)
+		}
+	}
+
+	// 视图切换与两个容器：默认表格（表格 chip 带 on、行式容器 hidden）。
+	for _, want := range []string{
+		`<span class="chips" id="reqViews" role="group" aria-label="请求记录视图">`,
+		`<button class="xs chip on" data-rv="table">表格</button>`,
+		`<button class="xs chip" data-rv="line">行式</button>`,
+		`<table class="acc req">`,
+		`<tbody id="reqBody"></tbody>`,
+		`<pre id="reqLogBox" hidden></pre>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少请求记录视图元素：%s", want)
+		}
+	}
+
+	// 表头 10 列：与 app.js 的行内 <td> 数、空态 colspan 三处一致（列数对不上整行错位）。
+	head := body[i:strings.Index(body, `<tbody id="reqBody">`)]
+	if n := strings.Count(head, "</th>"); n != 10 {
+		t.Errorf("请求记录表头应为 10 列，实际 %d", n)
+	}
+	for _, want := range []string{
+		`<th>来源 IP</th>`, `<th>User-Agent</th>`,
+		`<th class="num">耗时</th>`, `<th class="num">Token</th>`, `<th class="num">积分</th>`,
+		`<th>请求 ID</th>`,
+	} {
+		if !strings.Contains(head, want) {
+			t.Errorf("请求记录表头缺少列 %s", want)
+		}
+	}
+
+	// 样式：筛选栏 / 表格 / 截断列 / 计数条琥珀，全部走既有 token 与类名体系。
+	for _, want := range []string{
+		".fbar {", ".fbar > input, .fbar > select", ".acc.req",
+		".req-wrap { max-height: 460px; }", ".clip {", ".clip.ip", ".clip.rid",
+		".acc.req .muted", ".req-hit {", ".src-off {",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少请求记录表样式：%s", want)
+		}
+	}
+}
+
+// reqPanelStubJS 是「请求记录表格 / 筛选」用例共用的 node 沙箱骨架（沙箱写法与
+// TestAppJSTopLevelSmoke / TestAppJSTrangeRequests 同款）：
+//   - DOM 桩按 id 缓存元素，支持 innerHTML / textContent / value / className / hidden /
+//     dataset / classList，addEventListener 把 handler 记进 __h——用例可以像真实点击
+//     那样派发事件，而不是直接改内部状态；
+//   - 假 fetch 记录每条请求路径（含查询串）；REQ_LOGS_FAIL=1 时 request_logs 直接
+//     reject，用来走「归档关闭 → 回落内存最近请求」这条唯一需要前端兜底筛选的路径；
+//   - localStorage 桩记录写入（断言视图选择持久化）；REQ_VIEW_PRE 预置初值，验证
+//     「下次打开记住行式」；
+//   - 时钟钉死（2026-09-30T14:30 本地），断言才能落在具体的 from/to 秒数与 14:05:06 上。
+//
+// 场景脚本接在骨架之后，用骨架里的 runScenario(async () => {…}) 返回待断言的 JSON。
+const reqPanelStubJS = `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+
+// 假后端：fetched 是 request_logs 回的批次（用例改写），recent 是内存指标里的
+// 「最近请求」（归档关闭时前端回落到它）。
+let fetched = [];
+let recent = [];
+let reqLogsFail = process.env.REQ_LOGS_FAIL === '1';
+let logsFail = false;
+let slow = false;   // 拉取期间才有机会观察加载态（默认 fetch 立刻 resolve）
+const urls = [];
+const body = p => {
+  if (p.startsWith('logs')) return { entries: [] };
+  if (p.startsWith('request_metrics')) return { completed: 2, success_rate: 100, http_success_rate: 100,
+    avg_duration_ms: 1250, in_flight: 0, archive: { enabled: !reqLogsFail, bytes: 2048 }, recent };
+  if (p.startsWith('request_logs')) return { entries: fetched, limit: 100 };
+  return {};
+};
+
+// localStorage 桩：记下写入的键值；REQ_VIEW_PRE 预置「上次的选择」。
+const lsStore = {};
+if (process.env.REQ_VIEW_PRE) lsStore['wb2api.reqview'] = process.env.REQ_VIEW_PRE;
+
+// DOM 桩：元素是 Proxy，未实现的成员回落到 inert（跑通整份 app.js 不必实现所有 DOM 方法）。
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; }, has() { return true; },
+});
+const nodes = {}, qcache = {};
+const mkEl = key => {
+  const classes = new Set();
+  const handlers = {};
+  const store = {
+    key, innerHTML: '', textContent: '', value: '', title: '', hidden: false, disabled: false,
+    className: '', dataset: {}, style: {}, children: [], selectedOptions: [], __h: handlers,
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    classList: {
+      add: c => classes.add(c), remove: c => classes.delete(c),
+      toggle: (c, on) => { const w = on === undefined ? !classes.has(c) : !!on; if (w) classes.add(c); else classes.delete(c); return w; },
+      contains: c => classes.has(c),
+    },
+    classes,
+    setAttribute() {}, getAttribute: () => null, removeAttribute() {}, hasAttribute: () => false,
+    addEventListener(t, fn) { handlers[t] = fn; }, removeEventListener() {},
+    appendChild(n) { store.children.push(n); return n; }, remove() {}, focus() {}, blur() {}, click() {},
+    closest: () => null, contains: () => false, insertAdjacentHTML() {},
+    getElementsByTagName: () => [], querySelectorAll: () => [],
+    querySelector: sel => (qcache[key + '|' + sel] = qcache[key + '|' + sel] || mkEl(key + '|' + sel)),
+    get firstElementChild() { return store.children[0] || null; },
+  };
+  return new Proxy(store, { get(t, k) { return k in t ? t[k] : inert; }, set(t, k, v) { t[k] = v; return true; }, has: () => true });
+};
+const el = id => (nodes[id] = nodes[id] || mkEl(id));
+const chipTable = mkEl('chip-table'), chipLine = mkEl('chip-line');
+chipTable.dataset.rv = 'table'; chipLine.dataset.rv = 'line';
+
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-30T14:30:00');
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const sandbox = {
+  location: { hash: '#logs' },   // 深链：顶层 go() 会同步调进 loadLogs
+  history: { replaceState() {} },
+  localStorage: {
+    getItem: k => (k in lsStore ? lsStore[k] : null),
+    setItem: (k, v) => { lsStore[k] = String(v); },
+    removeItem: k => { delete lsStore[k]; },
+  },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    getElementById: el,
+    querySelectorAll: sel => (sel === '#reqViews .chip' ? [chipTable, chipLine] : []),
+    querySelector: () => inert, addEventListener() {},
+    documentElement: el('documentElement'), head: inert, body: inert, cookie: '',
+    createElement: () => mkEl('created'), contains: () => false, activeElement: inert,
+  },
+  fetch: url => {
+    const path = String(url).replace('/panel/api/', '');
+    urls.push(path);
+    if (logsFail && path.startsWith('logs')) return Promise.reject(new Error('日志接口挂了'));
+    if (reqLogsFail && path.startsWith('request_logs')) return Promise.reject(new Error('archive off'));
+    if (slow) return new Promise(r => setTimeout(() => r({ status: 200, ok: true, json: () => Promise.resolve(body(path)) }), 40));
+    return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(body(path)) });
+  },
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date: FakeDate, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src +
+  '\nthis.loadLogs=loadLogs; this.renderAccounts=renderAccounts; this.renderModelLocks=renderModelLocks;' +
+  '\nthis.renderRequestMetrics=renderRequestMetrics; this.reqSetView=reqSetView; this.reqSyncFilter=reqSyncFilter;' +
+  '\nthis.reqFilter=reqFilter; this.reqQuery=reqQuery;',
+  sandbox, { filename: 'app.js' });
+
+const tick = () => new Promise(r => setTimeout(r, 5));
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const reqUrls = () => urls.filter(u => u.startsWith('request_logs'));
+const lastReq = () => reqUrls().slice(-1)[0] || '';
+const setPreset = (id, v) => { const s = el(id).querySelector('.tr-preset'); s.value = v; s.onchange(); };
+// 走控件自己的 click 事件（不是直接改状态）：分段控件有没有真的接上切换函数，
+// 只有这条路径能证明。
+const clickView = rv => el('reqViews').__h.click({ target: { closest: () => ({ dataset: { rv } }) } });
+const rowsOf = html => html.split('<tr ').slice(1).map(s => '<tr ' + s);
+const cells = r => (r.replace(/^<tr[^>]*>/, '').replace(/<\/tr>$/, '').match(/<td[^>]*>.*?<\/td>/g) || []);
+const chipOn = () => (chipTable.classList.contains('on') ? 'table' : '') + (chipLine.classList.contains('on') ? 'line' : '');
+const runScenario = fn => fn().then(
+  out => { process.stdout.write(JSON.stringify(out)); process.exit(0); },
+  e => { console.log('REQ TABLE FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// TestAppJSRequestTableRender node + DOM 桩真实渲染请求记录表：(a) 表格行（含来源
+// 缺失 / 有来源 / 缓存命中率三态）+ 空态 + 计数条；(c) 视图切换（表格 ↔ 行式，
+// 行式输出与既有断言逐字一致、选择写进 localStorage、预置选择能恢复）；(d) 回归
+// 红线：账号表用量列、模型锁池表、trange 控件都还在。
+func TestAppJSRequestTableRender(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; request table render test skipped")
+	}
+	script := reqPanelStubJS + `
+runScenario(async () => {
+  const out = {};
+  await tick();                       // 深链 #logs 的首屏加载（默认表格 + ?limit=100）
+  out.initView = chipOn();
+  out.initUrl = lastReq();
+  out.initTableHidden = String(el('reqTableWrap').hidden);
+  out.initLineHidden = String(el('reqLogBox').hidden);
+  sandbox.reqSetView('table');        // 归一化：下面的渲染断言不依赖预置的视图选择
+
+  const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
+  const base = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)',
+    duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12 };
+  const old = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)',
+    duration_ms: 1250, total_tokens: 2300, request_id: 'req-1' };   // 老归档：无来源/无缓存/无积分观测
+  const full = { ...base, request_id: 'req-2', client_ip: '203.0.113.7', user_agent: 'curl/8.4.0',
+    cache_hit_tokens: 2257, cache_miss_tokens: 43 };
+  const allMiss = { ...base, request_id: 'req-3', outcome: 'stream_error', status: 502,
+    cache_hit_tokens: 0, cache_miss_tokens: 2000 };
+  const httpErr = { ...base, request_id: 'req-4', outcome: 'http_error', status: 500, credit_known: false };
+  const cut = { ...base, request_id: 'req-5', outcome: 'interrupted',
+    client_ip: '<b>10.0.0.1</b>', user_agent: 'Mozilla/5.0 Chrome/1.0<b>' };
+
+  fetched = [full, old, allMiss, httpErr, cut];
+  await sandbox.loadLogs();
+  const rows = rowsOf(el('reqBody').innerHTML);
+  out.rowCount = String(rows.length);
+  out.row1 = rows[0];
+  out.row2 = rows[1];
+  out.tags = rows.map(r => (r.match(/<span class="tag [a-z]+">[^<]*<\/span>/) || [''])[0]).join('|');
+  out.tokenOld = cells(rows[1])[7];      // 无观测：只有总量
+  out.tokenMiss = cells(rows[2])[7];     // 有观测且全未命中：0%（不是「没有样本」）
+  out.tokenFull = cells(rows[0])[7];     // 有观测：命中率（复用用量明细表的分档色）
+  out.srcOld = cells(rows[1])[4] + cells(rows[1])[5];   // 老归档 → —
+  out.srcFull = cells(rows[0])[4] + cells(rows[0])[5];
+  out.srcCut = cells(rows[4])[4] + cells(rows[4])[5];   // 客户端可控文本必须转义
+  out.creditUnknown = cells(rows[3])[8];
+  out.ridCell = cells(rows[0])[9];
+  out.count = el('reqCount').textContent;
+  out.countCls = el('reqCount').className;
+
+  // 加载态：拉取期间表格铺既有骨架行（skeletonRows，与账号表/任务表同一写法），
+  // 不是「正在查询…」一行把表格塌掉。
+  fetched = [full];
+  slow = true;
+  const pending = sandbox.loadLogs();
+  out.loadingTable = el('reqBody').innerHTML;
+  await pending;
+  slow = false;
+  out.loadedRows = String(rowsOf(el('reqBody').innerHTML).length);
+
+  // 空态：一整批都没有 → 「暂无请求记录」；有记录但筛掉 → 另一句文案（colspan=10）。
+  fetched = [];
+  await sandbox.loadLogs();
+  out.emptyTable = el('reqBody').innerHTML;
+  out.emptyCount = el('reqCount').textContent;
+
+  // 整次拉取失败（logs 接口报错）：表格不能停在加载骨架上，就地收尾成失败文案。
+  logsFail = true;
+  await sandbox.loadLogs();
+  out.errTable = el('reqBody').innerHTML;
+  logsFail = false;
+
+  // 归档关闭：request_logs 报错 → 回落内存里的最近请求；那批数据没经过服务端筛选，
+  // 前端必须自己兜住（否则筛选栏看起来完全失效）。
+  reqLogsFail = true;
+  recent = [full, { ...old, request_id: 'req-9', client_ip: '198.51.100.9' }];
+  el('reqIP').value = '198.51.100.9';
+  sandbox.reqSyncFilter();
+  await sandbox.loadLogs();
+  out.fallbackRows = String(rowsOf(el('reqBody').innerHTML).length);
+  out.fallbackCount = el('reqCount').textContent;
+  out.fallbackCls = el('reqCount').className;
+  el('reqIP').value = '192.0.2.1';
+  sandbox.reqSyncFilter();
+  await sandbox.loadLogs();
+  out.missTable = el('reqBody').innerHTML;
+  out.missCount = el('reqCount').textContent;
+  el('reqIP').value = '';
+  sandbox.reqSyncFilter();
+  reqLogsFail = false;
+
+  // 视图切换：表格 → 行式 → 表格。行式分支走移植前的 requestLogLine，逐字不变
+  // （下面两行就是既有断言里的那一对：带来源与缓存的 req-2、无来源的 req-1）。
+  fetched = [full, { ...base, request_id: 'req-1' }];
+  await sandbox.loadLogs();
+  out.tableRows = String(rowsOf(el('reqBody').innerHTML).length);
+  out.tableHiddenBefore = String(el('reqTableWrap').hidden);
+  clickView('line');
+  out.lineRows = el('reqLogBox').innerHTML;
+  out.lineHidden = String(el('reqLogBox').hidden);
+  out.tableHidden = String(el('reqTableWrap').hidden);
+  out.lsView = lsStore['wb2api.reqview'] || '';
+  out.chipLine = chipOn();
+  clickView('table');
+  out.chipBack = chipOn();
+  out.lineHiddenBack = String(el('reqLogBox').hidden);
+  out.tableHiddenBack = String(el('reqTableWrap').hidden);
+  out.lineKept = el('reqLogBox').innerHTML;
+
+  // 回归红线：账号表用量列、模型锁池表、时间范围控件。
+  sandbox.renderAccounts([{
+    uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+    last_success: '2026-09-28T13:00:00Z',
+    today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+    token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  }]);
+  out.accounts = el('accBody').innerHTML;
+  sandbox.renderModelLocks([{ model: 'glm-5.3', realm: 'cn', total: 5, servable: 0, locked: 5, state: 'locked',
+    unlock_at: new Date(FIXED + 3600000).toISOString(), fully_unlock_at: new Date(FIXED + 9000000).toISOString(),
+    reason: '上游 429' }]);
+  out.locks = el('mlBody').innerHTML;
+  out.rangeOptions = String((el('reqRange').innerHTML.match(/<option/g) || []).length);
+  return out;
+});`
+	f, err := os.CreateTemp(t.TempDir(), "req-table-render-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+
+	// 行式视图的两行输出：与 TestAppJSRequestLogFormatting 钉的行格式逐字相同
+	// （同一批记录、同一条 requestLogLine，只是渲染进 #reqLogBox 而不是表格）。
+	const lineHead = "14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit"
+	const lineFull = `<span class="ln">` + lineHead + ` | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;curl/8.4.0&quot; | req-2</span>`
+	const lineOld = `<span class="ln">` + lineHead + ` | req-1</span>`
+
+	for _, tc := range []struct{ name, pre, initView, initTable, initLine string }{
+		{"默认表格", "", "table", "false", "true"},
+		{"记住行式", "line", "line", "true", "false"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command(node, f.Name(), "app.js")
+			cmd.Dir = "."
+			cmd.Env = append(os.Environ(), "REQ_VIEW_PRE="+tc.pre)
+			out, err := cmd.CombinedOutput()
+			if err != nil {
+				t.Fatalf("请求记录表格渲染失败: %v\n%s", err, out)
+			}
+			got := map[string]string{}
+			if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+				t.Fatalf("请求记录表格渲染输出不是 JSON: %v\n%s", err, out)
+			}
+			check := func(key, want string) {
+				t.Helper()
+				if got[key] != want {
+					t.Errorf("%s=%q\nwant %q", key, got[key], want)
+				}
+			}
+			// 首屏：默认表格 + 默认条数 100（不放筛选条件、不发 from/to）。
+			check("initView", tc.initView)
+			check("initUrl", "request_logs?limit=100")
+			check("initTableHidden", tc.initTable)
+			check("initLineHidden", tc.initLine)
+
+			// 表格行（逐字钉住前两行：时间/结果/模型/账号/来源/耗时/Token/积分/请求 ID）。
+			check("rowCount", "5")
+			check("row1", `<tr title="14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;curl/8.4.0&quot; | req-2">`+
+				`<td class="num">14:05:06</td><td><span class="tag ok">200 成功</span></td><td>glm-5.3</td><td>账号(uid8)</td>`+
+				`<td><span class="clip ip" title="203.0.113.7">203.0.113.7</span></td>`+
+				`<td><span class="clip" title="curl/8.4.0">curl/8.4.0</span></td>`+
+				`<td class="num">1.25s</td>`+
+				`<td class="num">2.3k<span class="req-hit"><span class="c-ok" title="命中 2.3k / 未命中 43 tok">98.1%</span></span></td>`+
+				`<td class="num">0.12</td><td><span class="clip rid" title="req-2">req-2</span></td></tr>`)
+			check("row2", `<tr title="14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | credit — | req-1">`+
+				`<td class="num">14:05:06</td><td><span class="tag ok">200 成功</span></td><td>glm-5.3</td><td>账号(uid8)</td>`+
+				`<td><span class="muted">—</span></td><td><span class="muted">—</span></td>`+
+				`<td class="num">1.25s</td><td class="num">2.3k</td>`+
+				`<td class="num"><span class="muted">—</span></td><td><span class="clip rid" title="req-1">req-1</span></td></tr>`)
+
+			// 结果列语义色：成功 ok / 流错误·HTTP 错误 bad / 中断 warn（不新起一套徽标）。
+			check("tags", `<span class="tag ok">200 成功</span>|<span class="tag ok">200 成功</span>|`+
+				`<span class="tag bad">502 流错误</span>|<span class="tag bad">500 HTTP 错误</span>|`+
+				`<span class="tag warn">200 中断</span>`)
+
+			// Token 列的缓存命中率三态：无观测（老归档）只有总量；全未命中显示 0%（有样本）；
+			// 命中显示 98.1%——三态都复用用量明细表的 cacheRateCell。
+			check("tokenOld", `<td class="num">2.3k</td>`)
+			check("tokenMiss", `<td class="num">2.3k<span class="req-hit">`+
+				`<span class="c-bad" title="命中 0 / 未命中 2.0k tok">0%</span></span></td>`)
+			check("tokenFull", `<td class="num">2.3k<span class="req-hit">`+
+				`<span class="c-ok" title="命中 2.3k / 未命中 43 tok">98.1%</span></span></td>`)
+
+			// 来源列：老归档显示 — 而不是空白；有值时截断显示、完整值进 title；
+			// 客户端可控文本（IP/UA）必须转义。
+			check("srcOld", `<td><span class="muted">—</span></td><td><span class="muted">—</span></td>`)
+			check("srcFull", `<td><span class="clip ip" title="203.0.113.7">203.0.113.7</span></td>`+
+				`<td><span class="clip" title="curl/8.4.0">curl/8.4.0</span></td>`)
+			check("srcCut", `<td><span class="clip ip" title="&lt;b&gt;10.0.0.1&lt;/b&gt;">&lt;b&gt;10.0.0.1&lt;/b&gt;</span></td>`+
+				`<td><span class="clip" title="Mozilla/5.0 Chrome/1.0&lt;b&gt;">Mozilla/5.0 Chrome/1.0&lt;b&gt;</span></td>`)
+			check("creditUnknown", `<td class="num"><span class="muted">—</span></td>`)
+			check("ridCell", `<td><span class="clip rid" title="req-2">req-2</span></td>`)
+			check("count", "5 条")
+			check("countCls", "note")
+
+			// 空态：colspan 必须等于表头列数（10），否则空表整行错位。
+			// 加载态：4 行骨架（既有 skeletonRows 写法，colspan=10 铺满整行）。
+			if strings.Count(got["loadingTable"], `<span class="skeleton`) != 4 ||
+				!strings.Contains(got["loadingTable"], `<td colspan="10">`) {
+				t.Errorf("加载态应是 4 行 colspan=10 的骨架行：%s", got["loadingTable"])
+			}
+			check("loadedRows", "1")
+			check("emptyTable", `<tr><td colspan="10" class="empty">暂无请求记录</td></tr>`)
+			check("emptyCount", "—")
+			// 失败态：就地收尾，不把加载骨架留在屏幕上。
+			check("errTable", `<tr><td colspan="10"><div class="empty">日志接口挂了</div></td></tr>`)
+			check("fallbackRows", "1")
+			check("fallbackCount", "命中 1 / 2 条")
+			check("fallbackCls", "note src-off")
+			check("missTable", `<tr><td colspan="10" class="empty">没有符合当前筛选条件的请求记录</td></tr>`)
+			check("missCount", "命中 0 / 2 条")
+
+			// 视图切换：两个容器互斥、分段控件选中态、选择写进 localStorage。
+			check("tableRows", "2")
+			check("tableHiddenBefore", "false")
+			check("lineRows", lineFull+lineOld)
+			check("lineHidden", "false")
+			check("tableHidden", "true")
+			check("lsView", "line")
+			check("chipLine", "line")
+			check("chipBack", "table")
+			check("lineHiddenBack", "true")
+			check("tableHiddenBack", "false")
+			check("lineKept", lineFull+lineOld)
+
+			// 回归红线：账号表今日用量、模型锁池表、trange 控件的 7 个预设。
+			if !strings.Contains(got["accounts"], `<b>7.10<span class="usage-unit">M</span></b>`) {
+				t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got["accounts"])
+			}
+			if !strings.Contains(got["locks"], `<td>glm-5.3</td>`) ||
+				!strings.Contains(got["locks"], `<span class="tag bad">整池不可用</span>`) {
+				t.Errorf("模型锁池表渲染异常：%s", got["locks"])
+			}
+			check("rangeOptions", "7")
+		})
+	}
+}
+
+// TestAppJSRequestTableFilters (b) 筛选控件 → 实际请求 URL：逐条驱动真实控件
+// （oninput / onchange / 预设切换 / 重新读取），用假 fetch 记录到的查询串断言。
+// 参数名与后端 panel.requestLogs 一一对应，前端不发明参数、顺序也固定
+// （时间范围 → limit → 筛选条件），默认状态逐字是移植前的 request_logs?limit=100。
+func TestAppJSRequestTableFilters(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; request table filter test skipped")
+	}
+	script := reqPanelStubJS + `
+runScenario(async () => {
+  const out = {};
+  await tick();
+  out.qOpen = lastReq();              // 深链首屏那次（默认表格 + limit=100）
+  urls.length = 0;                    // 之后的断言只看控件驱动的请求
+  await sandbox.loadLogs();
+  out.qDefault = lastReq();
+  // 文字筛选：控件输入 → 防抖 250ms → 重新拉取
+  const type = async (id, v) => { el(id).value = v; el(id).oninput(); await sleep(300); return lastReq(); };
+  out.qIP = await type('reqIP', '203.0.113.7');
+  out.qUA = await type('reqUA', 'curl/8.4.0');
+  out.qAccount = await type('reqAccount', 'uid8');
+  out.qModel = await type('reqModel', 'glm-5.3');
+  // 下拉不防抖：一次点击就是一次明确的查询
+  el('reqOutcome').value = 'http_error'; el('reqOutcome').onchange(); await tick();
+  out.qOutcome = lastReq();
+  el('reqLimit').value = '500'; el('reqLimit').onchange(); await tick();
+  out.qLimit = lastReq();
+  // 时间范围沿用 trange 控件（预设 → from/to）
+  setPreset('reqRange', 'today'); await tick();
+  out.qToday = lastReq();
+  setPreset('reqRange', '24'); await tick();
+  out.q24 = lastReq();
+  setPreset('reqRange', '0'); await tick();
+  out.qAll = lastReq();
+  // 防抖：连打三个字符只发一次请求（每次 loadLogs 自身是 logs + request_metrics +
+  // request_logs 三个接口，故只数 request_logs）。
+  const before = reqUrls().length;
+  for (const v of ['1', '19', '198']) { el('reqIP').value = v; el('reqIP').oninput(); }
+  await sleep(300);
+  out.debounce = String(reqUrls().length - before);
+  out.qDebounced = lastReq();
+  // 清空一个字段：该参数从查询串里消失（空值不发，后端把空串当「不筛该字段」）
+  out.qClearIP = await type('reqIP', '');
+  out.qClearUA = await type('reqUA', '');
+  // 重新读取：无条件重发（不依赖筛选变化）
+  const n = urls.length;
+  el('btnReqReload').onclick(); await tick();
+  out.reloadFetched = String(urls.length > n);
+  out.reloadUrl = lastReq();
+  out.filterState = JSON.stringify(sandbox.reqFilter);
+  out.queryString = sandbox.reqQuery().toString();
+  return out;
+});`
+	f, err := os.CreateTemp(t.TempDir(), "req-table-filters-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("请求记录筛选 node 测试失败: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("请求记录筛选输出不是 JSON: %v\n%s", err, out)
+	}
+	// 控件按顺序叠加，后面的断言用前面积累出来的查询串（顺序即参数顺序）。
+	const flt = "&client_ip=203.0.113.7&user_agent=curl%2F8.4.0&account=uid8&model=glm-5.3&outcome=http_error"
+	sec := func(d time.Time) string { return strconv.FormatInt(d.Unix(), 10) }
+	// 沙箱时钟钉在 2026-09-30T14:30 本地：断言落在具体的 from 秒数上（否则随真实日期漂）。
+	at := func(day, h, m int) time.Time { return time.Date(2026, 9, day, h, m, 0, 0, time.Local) }
+	for _, tc := range []struct{ key, want string }{
+		// 默认：与移植前逐字一致（全部历史不发 from/to，条数默认 100）
+		{"qDefault", "request_logs?limit=100"},
+		{"qOpen", "request_logs?limit=100"},
+		{"qIP", "request_logs?limit=100&client_ip=203.0.113.7"},
+		{"qUA", "request_logs?limit=100&client_ip=203.0.113.7&user_agent=curl%2F8.4.0"},
+		{"qAccount", "request_logs?limit=100&client_ip=203.0.113.7&user_agent=curl%2F8.4.0&account=uid8"},
+		{"qModel", "request_logs?limit=100&client_ip=203.0.113.7&user_agent=curl%2F8.4.0&account=uid8&model=glm-5.3"},
+		{"qOutcome", "request_logs?limit=100" + flt},
+		{"qLimit", "request_logs?limit=500" + flt},
+		// 「今天」= 浏览器本地 00:00 起（只发 from）；滚动预设折算成 from（归档没有 hours 口径）
+		{"qToday", "request_logs?from=" + sec(at(30, 0, 0)) + "&limit=500" + flt},
+		{"q24", "request_logs?from=" + sec(at(29, 14, 30)) + "&limit=500" + flt},
+		{"qAll", "request_logs?limit=500" + flt},
+		{"debounce", "1"},
+		{"qDebounced", "request_logs?limit=500&client_ip=198&user_agent=curl%2F8.4.0&account=uid8&model=glm-5.3&outcome=http_error"},
+		{"qClearIP", "request_logs?limit=500&user_agent=curl%2F8.4.0&account=uid8&model=glm-5.3&outcome=http_error"},
+		{"qClearUA", "request_logs?limit=500&account=uid8&model=glm-5.3&outcome=http_error"},
+		{"reloadFetched", "true"},
+		{"reloadUrl", "request_logs?limit=500&account=uid8&model=glm-5.3&outcome=http_error"},
+		// 前端状态与发出去的查询串同源（模型/账号/结果留着，两个被清空的字段是空串）
+		{"filterState", `{"client_ip":"","user_agent":"","account":"uid8","model":"glm-5.3","outcome":"http_error"}`},
+		{"queryString", "limit=500&account=uid8&model=glm-5.3&outcome=http_error"},
+	} {
+		if got[tc.key] != tc.want {
+			t.Errorf("%s=%q\nwant %q", tc.key, got[tc.key], tc.want)
+		}
+	}
 }
 
 // minInt / maxInt 是本文件里既有 maxInt 的补充（截断取尾片段时用）。
