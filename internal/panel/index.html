@@ -567,6 +567,15 @@ th.num, td.num { text-align: right; }
 .uschart-body .gl { stroke: var(--line-soft); stroke-width: 1; stroke-dasharray: 2 3; opacity: .7; }
 .uschart-body .gl.dim { opacity: .45; }
 .uschart-body .tk { fill: var(--ink-2); font: 10px var(--mono); }
+/* 均值参考线（虚线 + 左端标签）与峰值标注。都用既有语义 token，不引新色。 */
+.uschart-body .avg { stroke: var(--warn); stroke-width: 1; stroke-dasharray: 4 4; opacity: .55; }
+.uschart-body .tk-avg { fill: var(--warn); font: 10px var(--mono); opacity: .9; }
+.uschart-body .tk-peak { fill: var(--ink); font: 600 10px var(--mono); }
+/* 悬停高亮按「整根柱」（同一桶的 prompt/completion 两段一起亮）：只亮一段会被读成
+   柱子缺了一截。rect.usbar 不能改名为 .bar——账号池积分条是 .bar{height:4px}，而
+   SVG2 里 height 是 rect 的 CSS 几何属性，同名类会把柱子全压成 4px 高。 */
+.uschart-body rect.usbar { transition: opacity .12s; }
+.uschart-body g.usbar-g:hover rect.usbar { opacity: .8; }
 .uschart-body .us-empty { padding: var(--sp-6) 0; text-align: center; color: var(--ink-2); font-size: var(--fs-12); }
 .credit-dim + .credit-dim { margin-top: var(--sp-4); }
 .credit-dim-hd {
@@ -581,6 +590,17 @@ th.num, td.num { text-align: right; }
 .us-wrapbar .bar { display: inline-block; width: var(--w, 2px); height: 6px; border-radius: var(--r-full); min-width: 2px; vertical-align: middle; margin-top: 0; }
 .us-wrapbar .bar-p { background: var(--chart-1); }
 .us-wrapbar .bar-c { background: var(--chart-2); }
+
+/* 明细表表头排序。th 上静态写 data-sort（候选列）与 .sort-ind 指示符，JS 只改类名、
+   aria-sort 与指示字符——列定义因此只有 index.html 一份，指示符也不许走内联样式。
+   · .sortable：本批数据里这列真有可比值的行 → 可点（指针 + 悬停转正常字色）
+   · .sorted：当前排序列 → 文字与指示符转强调色，方向由字符表达（▲ 升 / ▼ 降）
+   · 不可排序列由 JS 摘掉 .sortable 并清空指示符：点上去毫无反应，不装成能点 */
+#view-usage th.sortable { cursor: pointer; user-select: none; }
+#view-usage th.sortable:hover { color: var(--ink); }
+#view-usage th.sorted { color: var(--accent); }
+#view-usage th .sort-ind { margin-left: var(--sp-1); color: var(--ink-faint); font-size: 9px; }
+#view-usage th.sorted .sort-ind { color: var(--accent); }
 
 /* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
    预设下拉 + 「自定义」时展开的起止时间。整组是 inline-flex 且允许换行：
@@ -1025,14 +1045,18 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
         <header><h3>按账号</h3><span class="grow"></span>
           <span class="note">请求数含失败尝试</span></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc" id="usAccTable">
             <caption class="sr-only">用量统计：按账号</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>账号</th><th>域</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">缓存命中率</th>
-              <th class="num">均延迟</th><th class="num">均速率</th>
+              <th class="num" data-sort="requests" aria-sort="none" tabindex="0">请求<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="errors" aria-sort="none" tabindex="0">失败<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="prompt" aria-sort="none" tabindex="0">Prompt<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="completion" aria-sort="none" tabindex="0">Completion<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="total" aria-sort="none" tabindex="0">合计<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="cache" aria-sort="none" tabindex="0">缓存命中率<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="latency" aria-sort="none" tabindex="0">均延迟<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="rate" aria-sort="none" tabindex="0">均速率<span class="sort-ind" aria-hidden="true"></span></th>
             </tr></thead>
             <tbody id="usAccBody"></tbody>
           </table>
@@ -1042,13 +1066,16 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
       <div class="box">
         <header><h3>按模型</h3></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc" id="usModelTable">
             <caption class="sr-only">用量统计：按模型</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>模型</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">缓存命中率</th>
+              <th class="num" data-sort="requests" aria-sort="none" tabindex="0">请求<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="errors" aria-sort="none" tabindex="0">失败<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="prompt" aria-sort="none" tabindex="0">Prompt<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="completion" aria-sort="none" tabindex="0">Completion<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="total" aria-sort="none" tabindex="0">合计<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="cache" aria-sort="none" tabindex="0">缓存命中率<span class="sort-ind" aria-hidden="true"></span></th>
             </tr></thead>
             <tbody id="usModelBody"></tbody>
           </table>
@@ -1058,13 +1085,16 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
       <div class="box">
         <header><h3>按域</h3></header>
         <div class="tbl-wrap">
-          <table class="acc">
+          <table class="acc" id="usRealmTable">
             <caption class="sr-only">用量统计：按域</caption>
             <thead><tr>
               <th class="mark" aria-hidden="true"></th><th>realm</th>
-              <th class="num">请求</th><th class="num">失败</th>
-              <th class="num">Prompt</th><th class="num">Completion</th><th class="num">合计</th>
-              <th class="num">缓存命中率</th>
+              <th class="num" data-sort="requests" aria-sort="none" tabindex="0">请求<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="errors" aria-sort="none" tabindex="0">失败<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="prompt" aria-sort="none" tabindex="0">Prompt<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="completion" aria-sort="none" tabindex="0">Completion<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="total" aria-sort="none" tabindex="0">合计<span class="sort-ind" aria-hidden="true"></span></th>
+              <th class="num" data-sort="cache" aria-sort="none" tabindex="0">缓存命中率<span class="sort-ind" aria-hidden="true"></span></th>
             </tr></thead>
             <tbody id="usRealmBody"></tbody>
           </table>

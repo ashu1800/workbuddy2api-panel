@@ -2180,8 +2180,9 @@ function usBar(prompt, completion, total) {
 
 /* usRow 生成一行。mid 是插在「名称」之后、请求数之前的额外单元格（如「域」列）。
    withPerf 控制延迟/速率两列；列开关显式传入，避免调用方改动后与表头错列。
-   缓存命中率紧跟在「合计」之后：它是 token 口径的构成指标，与三张表都同序，
-   加列时表头（index.html）、本函数、空态 colspan 三处必须一起改。 */
+   缓存命中率紧跟在「合计」之后：它是 token 口径的构成指标，与三张表都同序。
+   加列时四处必须一起改：表头（index.html 的 <th>，数值列还要补可排序的 data-sort）、
+   US_SORT_VAL（该列怎么取值比大小）、本函数、空态 colspan。 */
 function usRow(name, sub, a, mid, withPerf) {
   return '<tr>' +
     '<td class="mark" aria-hidden="true"></td>' +
@@ -2200,7 +2201,164 @@ function usRow(name, sub, a, mid, withPerf) {
     '</tr>';
 }
 
-function renderUsage(d) {
+/* ── 用量明细表：点击表头排序 ────────────────────────────────────────
+   三张表（按账号 / 按模型 / 按域）各自持有排序状态：同一列再点一次切换升降序，
+   换一列则从降序开始（最大者最相关）。排序全在内存里做——usageData 就是刚拉到
+   的那批数据，点表头不再发请求；没点过（key 为 null）时逐字保持后端返回的顺序，
+   首屏观感与移植前一致。表头是静态 HTML（列数由 index.html 与测试三处钉住），
+   这里只往 th 上写类名 / aria-sort / 指示字符，不重建表头，避免列定义出现两份。 */
+
+/* usageData / usSorts 声明在本段内（不在文件顶部状态区）：只有用量渲染这条路径
+   读它们，而 renderUsage 在 loadUsage 的 await 之后才跑——顶层 go() 同步进入的
+   只有 warmUsageModelRates（见文件顶部 usageRateWarmAt 的 TDZ 说明），这里不存在
+   TDZ；放在本段顺带让求值渲染切片的测试自包含。 */
+let usageData = null;
+let usSorts = {};
+
+const US_DIM_TABLE = { account: 'usAccTable', model: 'usModelTable', realm: 'usRealmTable' };
+
+function usNum(v) { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; }
+
+/* 可排序列的取值。null = 本行没有可比口径（单元格显示 '—'）：计数类的 0 是合法值
+   （字段缺失按 0 处理），命中率 / 延迟 / 速率则是没有样本才算缺失——与单元格的呈现
+   口径一致（cacheRateText / fmtMs / fmtRate 对无样本都回 '—'）。 */
+const US_SORT_VAL = {
+  requests: a => usNum(a.requests),
+  errors: a => usNum(a.errors),
+  prompt: a => usNum(a.prompt_tokens),
+  completion: a => usNum(a.completion_tokens),
+  total: a => usNum(a.total_tokens),
+  cache: a => {
+    const hit = usNum(a.cache_hit_tokens), miss = usNum(a.cache_miss_tokens);
+    return hit + miss > 0 ? hit / (hit + miss) : null;
+  },
+  latency: a => usNum(a.avg_latency_ms) > 0 ? usNum(a.avg_latency_ms) : null,
+  rate: a => usNum(a.avg_tokens_per_second) > 0 ? usNum(a.avg_tokens_per_second) : null,
+};
+
+/* usSortRows 纯函数：回排好序的新数组，不动入参。缺可比值的行恒沉底（升序也不上浮，
+   否则 '—' 会占满表头）；等值按原下标（稳定），反复点同一列不会让等值行互相换位。 */
+function usSortRows(rows, key, dir) {
+  const out = (rows || []).slice();
+  const val = US_SORT_VAL[key];
+  if (!val) return out;                        // 未排序 / 未知列：保持后端顺序
+  const sign = dir === 'asc' ? 1 : -1;
+  return out
+    .map((row, i) => ({ row, i, v: val(row) }))
+    .sort((a, b) => {
+      if (a.v === null || b.v === null) {      // null 之间也按原下标，保持稳定
+        return a.v === b.v ? a.i - b.i : (a.v === null ? 1 : -1);
+      }
+      return a.v === b.v ? a.i - b.i : (a.v - b.v) * sign;
+    })
+    .map(x => x.row);
+}
+
+/* usSortableKeys 本批数据里真有可比值的列——决定表头能不能点。整列都是 '—' 时
+   （如按域表的缓存命中率、按模型/按域表根本没有的延迟列）不给指示符也不响应点击，
+   免得点了没反应像是坏了。 */
+function usSortableKeys(rows) {
+  const keys = new Set();
+  for (const key of Object.keys(US_SORT_VAL)) {
+    if ((rows || []).some(r => US_SORT_VAL[key](r) !== null)) keys.add(key);
+  }
+  return keys;
+}
+
+/* 表头 th 只查一次（表头是静态的），之后每帧只改类名与指示字符。 */
+const usHeads = {};
+function usHeadThs(dim) {
+  if (!usHeads[dim]) {
+    const map = new Map();
+    const table = $(US_DIM_TABLE[dim]);
+    // 表未挂载（DOM 桩 / 只求值渲染切片）时留空表：渲染不因表头缺失而中断。
+    if (table && table.querySelectorAll) {
+      for (const th of table.querySelectorAll('th[data-sort]')) map.set(th.dataset.sort, th);
+    }
+    usHeads[dim] = map;
+  }
+  return usHeads[dim];
+}
+
+/* usPaintHead 把排序状态画到表头上：可点（.sortable）/ 当前排序列（.sorted）/
+   指示字符（⇅ 未排、▲ 升、▼ 降）。aria-sort 让读屏用户也能听出当前列与方向。 */
+function usPaintHead(dim, rows, st) {
+  const map = usHeadThs(dim);
+  if (!map.size) return;
+  const usable = usSortableKeys(rows);
+  for (const [key, th] of map) {
+    const can = usable.has(key);
+    const on = can && st.key === key;
+    th.classList.toggle('sortable', can);
+    th.classList.toggle('sorted', on);
+    th.setAttribute('aria-sort', on ? (st.dir === 'asc' ? 'ascending' : 'descending') : 'none');
+    const ind = th.querySelector('.sort-ind');
+    if (ind) ind.textContent = !can ? '' : (on ? (st.dir === 'asc' ? '▲' : '▼') : '⇅');
+  }
+}
+
+/* usSortState 取某个维度的排序状态，首次用到时补默认（未排序 = 后端顺序）。 */
+function usSortState(dim) {
+  return usSorts[dim] || (usSorts[dim] = { key: null, dir: 'desc' });
+}
+
+/* usClickSort 点表头：同一列切换升降序，换列从降序开始。只重画三张表——
+   usageData 是刚拉到的那批，排序不重新请求，也不动图表（图表与排序无关）。 */
+function usClickSort(dim, key) {
+  if (!US_SORT_VAL[key]) return;
+  const st = usSortState(dim);
+  if (st.key === key) st.dir = st.dir === 'asc' ? 'desc' : 'asc';
+  else { st.key = key; st.dir = 'desc'; }
+  renderUsageTables();
+}
+
+/* usHeadTh 从事件里取被点的表头；非候选列（没有 data-sort）与不可排序列（整列都是
+   '—'，JS 摘掉了 .sortable）返回 null——点了不做事，也不把状态改坏。 */
+function usHeadTh(ev) {
+  const th = ev.target && ev.target.closest ? ev.target.closest('th[data-sort]') : null;
+  return th && th.classList.contains('sortable') ? th : null;
+}
+
+function usHeadClick(ev, dim) {
+  const th = usHeadTh(ev);
+  if (th) usClickSort(dim, th.dataset.sort);
+}
+
+/* 表头可点但不是按钮，补键盘路径（th 上给了 tabindex）：Enter / 空格等价于点击，
+   空格要挡掉默认的翻页滚动。 */
+function usHeadKey(ev, dim) {
+  if (ev.key !== 'Enter' && ev.key !== ' ') return;
+  const th = usHeadTh(ev);
+  if (!th) return;
+  ev.preventDefault();
+  usClickSort(dim, th.dataset.sort);
+}
+
+/* renderUsageTables 只画三张明细表（行序 + 表头指示）。首屏渲染与点击重排共用这
+   一条路径，否则「点表头重排」会走成第二套渲染逻辑，两边迟早不一致。 */
+function renderUsageTables() {
+  const d = usageData || {};
+  const rowsOf = (dim, rows) => {
+    const st = usSortState(dim);
+    usPaintHead(dim, rows, st);
+    return usSortRows(rows, st.key, st.dir);
+  };
+
+  $('usAccBody').innerHTML = rowsOf('account', d.by_account || []).map(x =>
+    usRow(x.key.slice(0, 8), x.extra || '', x,
+      '<td class="num">' + esc(x.realm || '') + '</td>', true)
+  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
+
+  $('usModelBody').innerHTML = rowsOf('model', d.by_model || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+
+  $('usRealmBody').innerHTML = rowsOf('realm', d.by_realm || []).map(x =>
+    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+}
+
+function renderUsage(data) {
+  usageData = data || {};
+  const d = usageData;
   const t = d.totals || {};
   // 统计条固定 6 张卡：statsHTML 把空位补成 6 的倍数，靠「gap + 容器底色」画的 1px 网格
   // 才能始终排满；曾把缓存命中率当第 7 张卡塞进来，结果第二行只剩 1 张卡 + 5 个空格，
@@ -2231,16 +2389,8 @@ function renderUsage(d) {
     (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
     (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
 
-  $('usAccBody').innerHTML = (d.by_account || []).map(x =>
-    usRow(x.key.slice(0, 8), x.extra || '', x,
-      '<td class="num">' + esc(x.realm || '') + '</td>', true)
-  ).join('') || '<tr><td colspan="11" class="empty">暂无数据</td></tr>';
-
-  $('usModelBody').innerHTML = (d.by_model || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
-
-  $('usRealmBody').innerHTML = (d.by_realm || []).map(x =>
-    usRow(x.key, '', x, '', false)).join('') || '<tr><td colspan="8" class="empty">暂无数据</td></tr>';
+  // 三张明细表走独立函数：表头点击重排时只重画这三张表（不重新请求，也不动图表）。
+  renderUsageTables();
 
   renderCreditDimensions(d);
   renderUsageChart(d.series || []);
@@ -2340,6 +2490,10 @@ function renderUsageChart(series) {
   const span = Math.max(1, t1 - t0);
 
   const max = Math.max(1, ...pts.map(p => p.tt));
+  // 均值与峰值：均值线给「这根是不是异常高」一个参照，峰值标注直接点名最高的那一根
+  // （最高桶常常不在窗口末尾，光看刻度得逐根比）。
+  const peak = pts.reduce((a, b) => (b.tt > a.tt ? b : a), pts[0]);
+  const avg = pts.reduce((s, p) => s + p.tt, 0) / pts.length;
 
   // 柱宽取「最小真实间隔」的 70%，并夹在合理区间内——窗口拉到 30 天时柱子会
   // 变细，但不会细到看不见。
@@ -2350,6 +2504,7 @@ function renderUsageChart(series) {
   const bw = Math.max(1.5, Math.min(30, slot * 0.7));
 
   const xOf = t => PL + (t - t0) / span * iw;
+  const yOf = v => PT + ih - ih * (v / max);
 
   let out = '<svg viewBox="0 0 ' + W + ' ' + H + '" role="img" ' +
             'preserveAspectRatio="xMidYMid meet">';
@@ -2363,6 +2518,16 @@ function renderUsageChart(series) {
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
+  // 均值参考线（虚线 + 标签）。avg 等于 max 时不画：线与顶框重合，看不出是均值
+  // （只有一个点、或所有桶等高时）。标签贴左——右端常被峰值柱占着，贴左不会被压住。
+  if (avg > 0 && avg < max) {
+    const y = yOf(avg);
+    out += '<line class="avg" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
+           '" y2="' + y.toFixed(1) + '"/>';
+    out += '<text class="tk-avg" x="' + (PL + 5) + '" y="' + (y - 4).toFixed(1) +
+           '" text-anchor="start">均值 ' + fmtTok(avg) + '</text>';
+  }
+
   // 柱子
   for (const p of pts) {
     const cx = xOf(p.t);
@@ -2371,14 +2536,30 @@ function renderUsageChart(series) {
     const hP = p.tt ? hTot * (p.pt / p.tt) : 0;
     const hC = Math.max(p.tt && p.ct ? 1 : 0, hTot - hP);
     const yBase = PT + ih;
-    if (hP > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
+    // 一根柱子包成一组：<title> 作为组的首个子节点，悬停时给出这一桶的明细
+    // （prompt / completion / 合计 / 请求数 / 时间），组上的类名同时承担悬停高亮。
+    out += '<g class="usbar-g">' +
+      '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
+      fmtTok(p.ct) + ' completion / 合计 ' + fmtTok(p.tt) + ' / ' + esc(p.req) + ' 次</title>';
+    // 类名用 usbar 而不是 bar：账号池的积分条是 .bar{height:4px}，而 SVG2 里 height
+    // 是 rect 的 CSS 几何属性，同名类会把每根柱子压成 4px 高（上游踩过一次）。
+    if (hP > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hP.toFixed(2) +
       '" fill="var(--chart-1)" rx="1.5"/>';
-    if (hC > 0) out += '<rect x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
+    if (hC > 0) out += '<rect class="usbar" x="' + x.toFixed(2) + '" y="' + (yBase - hP - hC).toFixed(2) +
       '" width="' + bw.toFixed(2) + '" height="' + hC.toFixed(2) +
       '" fill="var(--chart-2)" rx="1.5"/>';
-    out += '<title>' + esc(p.raw) + '  ' + fmtTok(p.pt) + ' prompt / ' +
-           fmtTok(p.ct) + ' completion / ' + p.req + ' 次</title>';
+    out += '</g>';
+  }
+
+  // 峰值标注：贴在最高柱顶上（越出绘图区就贴边），不必再逐根比对刻度。
+  {
+    const px = xOf(peak.t);
+    const py = yOf(peak.tt);
+    const anchor = px > W - PR - 90 ? 'end' : 'middle';
+    out += '<text class="tk-peak" x="' + Math.max(PL, Math.min(W - PR, px)).toFixed(1) +
+           '" y="' + Math.max(10, py - 5).toFixed(1) + '" text-anchor="' + anchor + '">' +
+           '峰值 ' + fmtTok(peak.tt) + '</text>';
   }
 
   // x 轴基线画在柱子之后，避免压在柱底
@@ -2457,6 +2638,15 @@ async function loadUsage() {
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
 // 时间范围控件（替换旧的 #usWindow 下拉）：预设或自定义起止一变就重拉用量。
 if ($('usRange')) trangeBind('usRange', loadUsage);
+
+// 明细表表头排序：委托绑在三张表上（表头静态、行每次重画，委托的监听不会随行重建
+// 丢事件）。点击只重排内存里的那一批，不发请求；键盘走 Enter / 空格。
+for (const dim of Object.keys(US_DIM_TABLE)) {
+  const table = $(US_DIM_TABLE[dim]);
+  if (!table || !table.addEventListener) continue;
+  table.addEventListener('click', ev => usHeadClick(ev, dim));
+  table.addEventListener('keydown', ev => usHeadKey(ev, dim));
+}
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」

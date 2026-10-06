@@ -2167,6 +2167,555 @@ func TestUsageTablesCacheColumnCount(t *testing.T) {
 	}
 }
 
+// TestAppJSUsageSortAndChartRender 用量页本批两项增量的完整闸门（node + DOM 桩真跑一遍）：
+//   - (a) 排序纯函数 usSortRows：8 个可排序列 × 升降序，覆盖缺失值（无样本的命中率/延迟/
+//     速率恒沉底，升序也不上浮）、零值（0 是合法值，按 0 参与排序）、并列（按原下标稳定）、
+//     纯函数性（不改动入参）；
+//   - (b) 表头排序交互：初始指示符与 aria-sort、点击后各表首行顺序、再点切换升降序、
+//     换列回到降序、三张表状态互相独立、不可排序列点了不做事、键盘 Enter/空格等价、
+//     排序不触发新请求（假 fetch 逐字比对 URL 清单）、刷新后排序状态不丢；
+//   - (c) 图表增强：均值参考线（虚线，样式在 index.html 的 CSS 里）、均值/峰值标签、
+//     柱子悬停类名与单桶明细（<title> 含 prompt/completion/合计/请求数/时间），且仍是
+//     --chart-1/--chart-2 平色（本 fork 不搬上游渐变：那需要 style="stop-color:…"，
+//     违反静态内联样式禁令）；
+//   - (d) 回归：三张表列数 11/8/8（index.html 静态表头与渲染出的行都数）、空态 colspan、
+//     总览统计条 6 张实卡 0 空白格、积分扣除统计条 5 张实卡 + 1 个补齐格（含命中率卡）、
+//     账号表 7.10M chip（含 .usage-unit）。
+//
+// 表头的 data-sort 列清单直接从 index.html 里读出来建 DOM 桩，所以指示符断言是「按真实
+// 页面的列序」做的，桩不会自己编一套列序。无 node 环境跳过。
+func TestAppJSUsageSortAndChartRender(t *testing.T) {
+	// 先确认真正下发的那份资产带着排序接线（go:embed 的就是 index.html 本身，但
+	// 列数/接线这类回归历来是靠这条路径抓出来的，例如 TestUsageTablesCacheColumnCount）。
+	// 这一步不需要 node，所以放在跳过判断之前。
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	served := rec.Body.String()
+	for _, frag := range []string{
+		`id="usAccTable"`, `id="usModelTable"`, `id="usRealmTable"`,
+		`data-sort="total"`, `data-sort="cache"`, `data-sort="latency"`, `data-sort="rate"`,
+		`class="sort-ind"`, `aria-sort="none"`,
+	} {
+		if !strings.Contains(served, frag) {
+			t.Errorf("服务端下发的面板缺少 %s", frag)
+		}
+	}
+	if n := strings.Count(served, `data-sort="`); n != 20 {
+		t.Errorf("下发的页面里候选排序列应为 20 个（账号 8 + 模型 6 + 域 6），实际 %d", n)
+	}
+	if n := strings.Count(served, `class="sort-ind"`); n != 20 {
+		t.Errorf("排序指示符 span 应为 20 个，实际 %d", n)
+	}
+
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; usage sort/chart render test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const page = fs.readFileSync(process.argv[3], 'utf8');
+
+// ── 静态表头：data-sort 列清单与列数都从 index.html 读，桩不另编一套列序 ──
+function theadOf(cap) {
+  const i = page.indexOf('<caption class="sr-only">' + cap + '</caption>');
+  const j = page.indexOf('</thead>', i);
+  return i < 0 || j < 0 ? '' : page.slice(i, j);
+}
+const CAP = { account: '用量统计：按账号', model: '用量统计：按模型', realm: '用量统计：按域' };
+function sortKeysOf(dim) {
+  return (theadOf(CAP[dim]).match(/data-sort="[^"]+"/g) || []).map(function (s) { return s.slice(11, -1); });
+}
+
+// ── 极简 DOM 桩：只实现被测代码用到的那几个 API ──────────────────────
+function classSet(store) {
+  return {
+    add: function (n) { store.add(n); },
+    remove: function (n) { store.delete(n); },
+    contains: function (n) { return store.has(n); },
+    toggle: function (n, f) {
+      const on = f === undefined ? !store.has(n) : !!f;
+      if (on) store.add(n); else store.delete(n);
+      return on;
+    },
+  };
+}
+function mkTh(key) {
+  const el = {
+    dataset: { sort: key }, attrs: {}, ind: { textContent: '' },
+    setAttribute: function (k, v) { el.attrs[k] = String(v); },
+    getAttribute: function (k) { return Object.prototype.hasOwnProperty.call(el.attrs, k) ? el.attrs[k] : null; },
+    querySelector: function (sel) { return sel === '.sort-ind' ? el.ind : null; },
+    closest: function (sel) { return sel === 'th[data-sort]' ? el : null; },
+  };
+  el.classes = new Set();
+  el.classList = classSet(el.classes);
+  return el;
+}
+const TH_KEYS = { account: sortKeysOf('account'), model: sortKeysOf('model'), realm: sortKeysOf('realm') };
+const TABLE_ID = { account: 'usAccTable', model: 'usModelTable', realm: 'usRealmTable' };
+const nodes = {};
+function mkTable(keys) {
+  const ths = keys.map(mkTh);
+  const el = { innerHTML: '', textContent: '', hidden: false, ths: ths, handlers: {},
+    addEventListener: function (type, fn) { el.handlers[type] = fn; },
+    querySelectorAll: function (sel) { return sel === 'th[data-sort]' ? ths : []; } };
+  return el;
+}
+Object.keys(TABLE_ID).forEach(function (dim) { nodes[TABLE_ID[dim]] = mkTable(TH_KEYS[dim]); });
+function el(id) { return nodes[id] || (nodes[id] = { innerHTML: '', textContent: '', hidden: false }); }
+function thOf(dim, key) { return nodes[TABLE_ID[dim]].ths[TH_KEYS[dim].indexOf(key)]; }
+
+// 假 fetch：记录 URL。「排序不触发新请求」的断言就是比对这份清单。
+const fetchCalls = [];
+const FIXTURE = {
+  totals: { requests: 70, total_tokens: 348, prompt_tokens: 310, completion_tokens: 33, errors: 4,
+    avg_latency_ms: 800, cache_hit_tokens: 96, cache_miss_tokens: 8 },
+  // 刻意造出四种边界：零值（丁全 0）、并列（乙/丙 请求与失败都相同）、
+  // 缺失（乙/丁 无延迟与速率样本、无缓存样本）、正常值。
+  by_account: [
+    { key: 'acct-aaa1', extra: '甲', realm: 'cn', requests: 10, errors: 0, prompt_tokens: 10, completion_tokens: 2,
+      total_tokens: 12, avg_latency_ms: 900, avg_tokens_per_second: 30, cache_hit_tokens: 95, cache_miss_tokens: 5 },
+    { key: 'acct-bbb2', extra: '乙', realm: 'us', requests: 30, errors: 4, prompt_tokens: 300, completion_tokens: 30,
+      total_tokens: 330, avg_latency_ms: 0, avg_tokens_per_second: 0, cache_hit_tokens: 0, cache_miss_tokens: 0 },
+    { key: 'acct-ccc3', extra: '丙', realm: 'cn', requests: 30, errors: 4, prompt_tokens: 5, completion_tokens: 1,
+      total_tokens: 6, avg_latency_ms: 1500, avg_tokens_per_second: 12, cache_hit_tokens: 1, cache_miss_tokens: 3 },
+    { key: 'acct-ddd4', extra: '丁', realm: 'us', requests: 0, errors: 0, prompt_tokens: 0, completion_tokens: 0,
+      total_tokens: 0, avg_latency_ms: 0, avg_tokens_per_second: 0, cache_hit_tokens: 0, cache_miss_tokens: 0 },
+  ],
+  // 模型表：命中率 0%（100 miss）仍是合法可比值 → 该列可排序。
+  by_model: [
+    { key: 'glm-5.3', requests: 3, errors: 1, prompt_tokens: 10, completion_tokens: 2, total_tokens: 12,
+      cache_hit_tokens: 0, cache_miss_tokens: 100 },
+    { key: 'glm-5.2', requests: 7, errors: 0, prompt_tokens: 20, completion_tokens: 4, total_tokens: 24,
+      cache_hit_tokens: 50, cache_miss_tokens: 50 },
+    { key: 'glm-4.5', requests: 1, errors: 0, prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+  ],
+  // 域表：整张表都没有缓存字段 → 命中率列没有任何可比行，应当不可排序。
+  by_realm: [
+    { key: 'cn', requests: 3, errors: 0, prompt_tokens: 10, completion_tokens: 2, total_tokens: 12 },
+    { key: 'us', requests: 9, errors: 1, prompt_tokens: 30, completion_tokens: 6, total_tokens: 36 },
+  ],
+  // 图表：峰值在中间（不是最后一根），均值 470 < 峰值 1200。
+  series: [
+    { t: '2026-09-28T10', prompt_tokens: 100, completion_tokens: 50, total_tokens: 150, requests: 3 },
+    { t: '2026-09-28T11', prompt_tokens: 900, completion_tokens: 300, total_tokens: 1200, requests: 9 },
+    { t: '2026-09-28T12', prompt_tokens: 50, completion_tokens: 10, total_tokens: 60, requests: 2 },
+  ],
+  credit_by_account: [], credit_by_model: [],
+};
+function fakeFetch(url) {
+  fetchCalls.push(String(url));
+  return Promise.resolve({ ok: true, status: 200, json: function () { return Promise.resolve(FIXTURE); } });
+}
+async function fakeApi(ep) { const r = await fakeFetch('/panel/api/' + ep); return r.json(); }
+
+const ctx = {
+  Date: Date, Number: Number, String: String, Boolean: Boolean, Math: Math, Array: Array, Object: Object,
+  JSON: JSON, RegExp: RegExp, Error: Error, isNaN: isNaN, parseInt: parseInt, parseFloat: parseFloat,
+  URLSearchParams: URLSearchParams,
+  $: el,
+  api: fakeApi,
+  trangeQuery: function () { return new URLSearchParams('hours=72'); },
+  trangeLabel: function () { return '近 3 天'; },
+  usageRateWarmAt: 0,
+  // 请求记录的模块级状态声明在文件顶部、不在下面这几段切片里。
+  reqEntries: [], reqFilter: { client_ip: '', user_agent: '', account: '', model: '', outcome: '' }, reqView: 'table',
+};
+// 切片：A 转义工具，B 账号表渲染，C 用量页渲染（含本批的排序），D 请求记录渲染
+// （usRow 复用的 cacheRateCell 等命中率 helper 落在这一段里，缺了它 renderUsage 会
+// 抛 ReferenceError——loadUsage 的 catch 会把它吞成"读取用量失败"，所以下面显式拦一次），
+// E 图表（parsePointTime + renderUsageChart，本批改成真跑而不是打桩），
+// F warmUsageModelRates + loadUsage（真走一次拉取，好证明排序不再拉），
+// G 表头排序的委托绑定（真跑那段顶层绑定，桩表才收得到 click/keydown）。
+const a = src.slice(src.indexOf('function esc('), src.indexOf('function veilStack('));
+const b = src.slice(src.indexOf('function avgTTFB('), src.indexOf('async function loadOverview('));
+const c = src.slice(src.indexOf('function fmtTok('), src.indexOf('function parsePointTime'));
+const d = src.slice(src.indexOf('function renderRequestMetrics'), src.indexOf("$('btnLogPin')"));
+const e = src.slice(src.indexOf('function parsePointTime'), src.indexOf('function fmtTokTip'));
+const f = src.slice(src.indexOf('async function warmUsageModelRates'), src.indexOf("if ($('btnUsage'))"));
+const g = src.slice(src.indexOf('// 明细表表头排序'), src.indexOf('/* ── 积分构成'));
+if (!a || !b || !c || !d || !e || !f || !g) throw new Error('usage render slice not found in app.js');
+vm.createContext(ctx);
+vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d + '\n' + e + '\n' + f + '\n' + g +
+  '\nthis.renderUsage = renderUsage; this.usSortRows = usSortRows; this.usHeadKey = usHeadKey;' +
+  '\nthis.loadUsage = loadUsage; this.renderUsageChart = renderUsageChart;' +
+  '\nthis.renderAccounts = renderAccounts; this.tokenChipHTML = tokenChipHTML;', ctx);
+
+const flat = {};
+function put(k, v) { flat[k] = String(v); }
+function labels(rows) { return rows.map(function (r) { return r.extra || r.key; }).join(','); }
+function cellNames(h) { return (h.match(/<td>([^<]*)/g) || []).map(function (s) { return s.slice(4); }).join(','); }
+function countOf(s, needle) { return s.split(needle).length - 1; }
+function firstRow(h) { return (h.match(/<tr>[\s\S]*?<\/tr>/) || [''])[0]; }
+function headState(dim) {
+  return TH_KEYS[dim].map(function (k) {
+    const th = thOf(dim, k);
+    return k + '(sortable=' + (th.classList.contains('sortable') ? 'y' : 'n') +
+      ',sorted=' + (th.classList.contains('sorted') ? 'y' : 'n') +
+      ',ind=' + (th.querySelector('.sort-ind').textContent || '-') +
+      ',aria=' + (th.getAttribute('aria-sort') || '-') + ')';
+  }).join(' ');
+}
+function clickHead(dim, key) {
+  const th = thOf(dim, key);
+  nodes[TABLE_ID[dim]].handlers.click({
+    target: { closest: function (sel) { return sel === 'th[data-sort]' ? th : null; } },
+  });
+}
+
+(async function () {
+  // ── (a) 排序纯函数 ───────────────────────────────────────────────
+  const acc = FIXTURE.by_account;
+  const before = acc.map(function (r) { return r.key; }).join(',');
+  ['requests', 'errors', 'prompt', 'completion', 'total', 'cache', 'latency', 'rate'].forEach(function (key) {
+    put('pure.' + key + '_desc', labels(ctx.usSortRows(acc, key, 'desc')));
+    put('pure.' + key + '_asc', labels(ctx.usSortRows(acc, key, 'asc')));
+  });
+  put('pure.none', labels(ctx.usSortRows(acc, null, 'desc')));
+  put('pure.unknown', labels(ctx.usSortRows(acc, 'nope', 'asc')));
+  put('pure.inputIntact', acc.map(function (r) { return r.key; }).join(',') === before ? 'yes' : 'no');
+
+  // ── 首屏：真走 loadUsage（假 fetch 记 URL）→ renderUsage → 三表 + 图表 ──
+  await ctx.loadUsage();
+  // loadUsage 的 catch 会把渲染期的异常吞成这一行文案；显式拦一次，否则失败会以
+  // "某个 body 是 undefined" 的形式在下面几行才暴露。
+  if (nodes.usChart.innerHTML.indexOf('读取用量失败') >= 0) {
+    throw new Error('loadUsage 吞掉了渲染异常：' + nodes.usChart.innerHTML);
+  }
+  put('fetch.afterLoad', fetchCalls.join(' '));
+  put('rows.init.account', cellNames(nodes.usAccBody.innerHTML));
+  put('rows.init.model', cellNames(nodes.usModelBody.innerHTML));
+  put('rows.init.realm', cellNames(nodes.usRealmBody.innerHTML));
+  put('raw.init.account', firstRow(nodes.usAccBody.innerHTML));
+  put('raw.init.model', firstRow(nodes.usModelBody.innerHTML));
+  put('raw.init.realm', firstRow(nodes.usRealmBody.innerHTML));
+  put('head.init.account', headState('account'));
+  put('head.init.model', headState('model'));
+  put('head.init.realm', headState('realm'));
+  put('td.account', countOf(firstRow(nodes.usAccBody.innerHTML), '<td'));
+  put('td.model', countOf(firstRow(nodes.usModelBody.innerHTML), '<td'));
+  put('td.realm', countOf(firstRow(nodes.usRealmBody.innerHTML), '<td'));
+  put('stats.cards', countOf(nodes.usStats.innerHTML, 'class="stat'));
+  put('stats.blanks', countOf(nodes.usStats.innerHTML, 'class="stat blank"'));
+  put('stats.credit.cards', countOf(nodes.usCreditStats.innerHTML, 'class="stat'));
+  put('stats.credit.blanks', countOf(nodes.usCreditStats.innerHTML, 'class="stat blank"'));
+  put('stats.credit.hasCache', nodes.usCreditStats.innerHTML.indexOf('缓存命中率') >= 0 ? 'yes' : 'no');
+  put('chart.svg', nodes.usChart.innerHTML);
+
+  // ── (b) 表头点击 ─────────────────────────────────────────────────
+  clickHead('account', 'total');
+  put('rows.totalDesc.account', cellNames(nodes.usAccBody.innerHTML));
+  put('head.totalDesc.account', headState('account'));
+  clickHead('account', 'total');                       // 同一列再点 → 升序
+  put('rows.totalAsc.account', cellNames(nodes.usAccBody.innerHTML));
+  put('head.totalAsc.account', headState('account'));
+  clickHead('account', 'cache');                       // 换列 → 回到降序，旧列复位
+  put('rows.cacheDesc.account', cellNames(nodes.usAccBody.innerHTML));
+  put('head.cacheDesc.account', headState('account'));
+  clickHead('model', 'total');                         // 另一张表：状态独立
+  put('rows.modelTotalDesc.model', cellNames(nodes.usModelBody.innerHTML));
+  put('rows.modelTotalDesc.account', cellNames(nodes.usAccBody.innerHTML));
+  clickHead('realm', 'cache');                         // 不可排序列：点了不做事
+  put('rows.realmCacheClick.realm', cellNames(nodes.usRealmBody.innerHTML));
+  put('head.realmCacheClick.realm', headState('realm'));
+
+  // 键盘：空格等价于点击，且要挡掉默认滚动
+  const thReq = thOf('account', 'requests');
+  nodes.usAccTable.handlers.keydown({
+    key: ' ', preventDefault: function () { put('kbd.prevented', 'yes'); },
+    target: { closest: function (sel) { return sel === 'th[data-sort]' ? thReq : null; } },
+  });
+  put('rows.kbdSpace.account', cellNames(nodes.usAccBody.innerHTML));
+  put('raw.sorted.account', firstRow(nodes.usAccBody.innerHTML));
+  put('raw.sorted.model', firstRow(nodes.usModelBody.innerHTML));
+  put('raw.sorted.realm', firstRow(nodes.usRealmBody.innerHTML));
+
+  // 排序全程不得新增请求（放在刷新之前取，刷新本来就会重新拉一次）
+  put('fetch.afterClicks', fetchCalls.join(' '));
+
+  // 排序后再刷新（重新拉取一次）：排序状态不丢——点了「请求降序」再刷新，看到的还是
+  // 降序，而不是悄悄弹回后端顺序。倍率回填有 10 分钟节流，所以这次只多一条 usage。
+  await ctx.loadUsage();
+  put('rows.refetch.account', cellNames(nodes.usAccBody.innerHTML));
+  put('head.refetch.account', headState('account'));
+  put('fetch.afterRefetch', fetchCalls.join(' '));
+
+  // ── (c) 图表 ─────────────────────────────────────────────────────
+  ctx.renderUsageChart([{ t: '2026-09-28T10', prompt_tokens: 5, completion_tokens: 5, total_tokens: 10, requests: 1 }]);
+  put('chart.single', nodes.usChart.innerHTML);        // 只有一个点：均值线与顶框重合，不画
+  ctx.renderUsageChart([]);
+  put('chart.empty', nodes.usChart.innerHTML);
+
+  // ── (d) 回归 ─────────────────────────────────────────────────────
+  ctx.renderUsage({ totals: {}, by_account: [], by_model: [], by_realm: [], series: [] });
+  put('empty.account', nodes.usAccBody.innerHTML);
+  put('empty.model', nodes.usModelBody.innerHTML);
+  put('empty.realm', nodes.usRealmBody.innerHTML);
+  put('empty.stats.cards', countOf(nodes.usStats.innerHTML, 'class="stat'));
+  put('empty.stats.blanks', countOf(nodes.usStats.innerHTML, 'class="stat blank"'));
+  ctx.renderAccounts([{
+    uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+    last_success: '2026-09-28T13:00:00Z',
+    today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+    token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  }]);
+  put('chip', ctx.tokenChipHTML('7.10M'));
+
+  // ── 静态页：列数 / data-sort 清单 / 指示符 / CSS ──────────────────
+  ['account', 'model', 'realm'].forEach(function (dim) {
+    const head = theadOf(CAP[dim]);
+    put('static.' + dim + '.th', (head.match(/<th[ >]/g) || []).length);
+    put('static.' + dim + '.sort', countOf(head, 'data-sort="'));
+    put('static.' + dim + '.ind', countOf(head, 'class="sort-ind"'));
+  });
+  put('static.tableIds', ['usAccTable', 'usModelTable', 'usRealmTable'].every(function (id) {
+    return page.indexOf('id="' + id + '"') >= 0;
+  }) ? 'yes' : 'no');
+  put('th.account', TH_KEYS.account.join(','));
+  put('th.model', TH_KEYS.model.join(','));
+  put('th.realm', TH_KEYS.realm.join(','));
+  put('css.avg', (page.match(/\.uschart-body \.avg \{[^}]*\}/) || [''])[0]);
+  put('css.tkAvg', (page.match(/\.uschart-body \.tk-avg \{[^}]*\}/) || [''])[0]);
+  put('css.tkPeak', (page.match(/\.uschart-body \.tk-peak \{[^}]*\}/) || [''])[0]);
+  put('css.hover', (page.match(/\.uschart-body g\.usbar-g:hover rect\.usbar \{[^}]*\}/) || [''])[0]);
+  put('css.sortable', (page.match(/#view-usage th\.sortable \{[^}]*\}/) || [''])[0]);
+  put('css.sorted', (page.match(/#view-usage th\.sorted \{[^}]*\}/) || [''])[0]);
+
+  console.log(JSON.stringify(flat));
+})().catch(function (e) { console.log('HARNESS FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });`
+	f, err := os.CreateTemp(t.TempDir(), "usage-sort-chart-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js", "index.html").CombinedOutput()
+	if err != nil {
+		t.Fatalf("usage sort/chart node test failed: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("usage sort/chart output is not JSON: %v\n%s", err, out)
+	}
+
+	accCols := []string{"requests", "errors", "prompt", "completion", "total", "cache", "latency", "rate"}
+	modelCols := []string{"requests", "errors", "prompt", "completion", "total", "cache"}
+	// headWant 拼表头状态串：active 列给对应字符与 aria-sort，dead 里的列整列没有可比
+	// 值（不可排），其余候选列是未排序的 ⇅。
+	headWant := func(cols []string, active, dir string, dead ...string) string {
+		deadSet := map[string]bool{}
+		for _, d := range dead {
+			deadSet[d] = true
+		}
+		parts := make([]string, 0, len(cols))
+		for _, c := range cols {
+			switch {
+			case deadSet[c]:
+				parts = append(parts, c+"(sortable=n,sorted=n,ind=-,aria=none)")
+			case c == active && dir == "asc":
+				parts = append(parts, c+"(sortable=y,sorted=y,ind=▲,aria=ascending)")
+			case c == active:
+				parts = append(parts, c+"(sortable=y,sorted=y,ind=▼,aria=descending)")
+			default:
+				parts = append(parts, c+"(sortable=y,sorted=n,ind=⇅,aria=none)")
+			}
+		}
+		return strings.Join(parts, " ")
+	}
+
+	want := map[string]string{
+		// 静态表头：列数与 data-sort 候选列（列序即真实页面的列序，指示符断言据此比对）。
+		"static.account.th": "11", "static.account.sort": "8", "static.account.ind": "8",
+		"static.model.th": "8", "static.model.sort": "6", "static.model.ind": "6",
+		"static.realm.th": "8", "static.realm.sort": "6", "static.realm.ind": "6",
+		"static.tableIds": "yes",
+		"th.account":      strings.Join(accCols, ","),
+		"th.model":        strings.Join(modelCols, ","),
+		"th.realm":        strings.Join(modelCols, ","),
+		// 表头初始态：全部候选列 ⇅/none，没有列被标成已排序。
+		"head.init.account": headWant(accCols, "", ""),
+		"head.init.model":   headWant(modelCols, "", ""),
+		"head.init.realm":   headWant(modelCols, "", "", "cache"),
+		// 首屏顺序 = 后端顺序（没点过表头不重排）。
+		"rows.init.account": "acct-aaa,acct-bbb,acct-ccc,acct-ddd",
+		"rows.init.model":   "glm-5.3,glm-5.2,glm-4.5",
+		"rows.init.realm":   "cn,us",
+		// 点「合计」：首次降序（330 的乙在前），再点升序（0 的丁在前）。
+		"rows.totalDesc.account": "acct-bbb,acct-aaa,acct-ccc,acct-ddd",
+		"head.totalDesc.account": headWant(accCols, "total", "desc"),
+		"rows.totalAsc.account":  "acct-ddd,acct-ccc,acct-aaa,acct-bbb",
+		"head.totalAsc.account":  headWant(accCols, "total", "asc"),
+		// 换列点命中率：新列回到降序（无样本的乙/丁沉底），旧列复位成 ⇅。
+		"rows.cacheDesc.account": "acct-aaa,acct-ccc,acct-bbb,acct-ddd",
+		"head.cacheDesc.account": headWant(accCols, "cache", "desc"),
+		// 三张表状态互相独立：排模型表不影响已排好的账号表。
+		"rows.modelTotalDesc.model":   "glm-5.2,glm-5.3,glm-4.5",
+		"rows.modelTotalDesc.account": "acct-aaa,acct-ccc,acct-bbb,acct-ddd",
+		// 域表整列没有缓存样本 → 不可排序列点了不做事（顺序与 aria 都不变）。
+		"rows.realmCacheClick.realm": "cn,us",
+		"head.realmCacheClick.realm": headWant(modelCols, "", "", "cache"),
+		// 键盘空格等价于点击：请求数降序（并列的乙/丙保持后端顺序）。
+		"kbd.prevented":         "yes",
+		"rows.kbdSpace.account": "acct-bbb,acct-ccc,acct-aaa,acct-ddd",
+		// 刷新（重新拉取）后排序状态仍在，且带箭头的是同一列。
+		"rows.refetch.account": "acct-bbb,acct-ccc,acct-aaa,acct-ddd",
+		"head.refetch.account": headWant(accCols, "requests", "desc"),
+		// 点表头全程不新增请求：URL 清单与首次加载逐字相同（只有刷新才多一条 usage）。
+		"fetch.afterClicks":  "/panel/api/models /panel/api/usage?hours=72",
+		"fetch.afterLoad":    "/panel/api/models /panel/api/usage?hours=72",
+		"fetch.afterRefetch": "/panel/api/models /panel/api/usage?hours=72 /panel/api/usage?hours=72",
+		// 渲染出的行与表头同列数（排序不会掉列）。
+		"td.account": "11", "td.model": "8", "td.realm": "8",
+		// 统计条：总览 6 张实卡 0 空白格；积分扣除 5 张实卡 + 1 个补齐格（含命中率卡）。
+		"stats.cards": "6", "stats.blanks": "0",
+		"stats.credit.cards": "6", "stats.credit.blanks": "1", "stats.credit.hasCache": "yes",
+		"empty.stats.cards": "6", "empty.stats.blanks": "0",
+		// chip 回归：7.10M 的 M 单独包 .usage-unit。
+		"chip": `7.10<span class="usage-unit">M</span>`,
+	}
+	for key, w := range want {
+		if got[key] != w {
+			t.Errorf("%s = %q\nwant %q", key, got[key], w)
+		}
+	}
+
+	// (a) 纯函数：8 个可排序列 × 升降序。甲乙丙丁 = 后端顺序，括号里是取值。
+	wantPure := map[string]string{
+		// 请求数：30/30 并列（乙在丙前）；0（丁）是合法值，升序排最前。
+		"pure.requests_desc": "乙,丙,甲,丁",
+		"pure.requests_asc":  "丁,甲,乙,丙",
+		// 失败数：4/4 与 0/0 两组并列，两个方向都保持后端顺序（甲在丁前）。
+		"pure.errors_desc": "乙,丙,甲,丁",
+		"pure.errors_asc":  "甲,丁,乙,丙",
+		"pure.prompt_desc":     "乙,甲,丙,丁",
+		"pure.prompt_asc":      "丁,丙,甲,乙",
+		"pure.completion_desc": "乙,甲,丙,丁",
+		"pure.completion_asc":  "丁,丙,甲,乙",
+		// 合计 Token 是默认口径：330 > 12 > 6 > 0。
+		"pure.total_desc": "乙,甲,丙,丁",
+		"pure.total_asc":  "丁,丙,甲,乙",
+		// 命中率：甲 95% > 丙 25%；乙/丁 没有缓存样本，升降序都沉底。
+		"pure.cache_desc": "甲,丙,乙,丁",
+		"pure.cache_asc":  "丙,甲,乙,丁",
+		// 延迟 / 速率：0 与缺字段都算「无样本」，同样沉底。
+		"pure.latency_desc": "丙,甲,乙,丁",
+		"pure.latency_asc":  "甲,丙,乙,丁",
+		"pure.rate_desc":    "甲,丙,乙,丁",
+		"pure.rate_asc":     "丙,甲,乙,丁",
+		// 未排序 / 未知列：逐字保持后端顺序（首屏观感不变）。
+		"pure.none":    "甲,乙,丙,丁",
+		"pure.unknown": "甲,乙,丙,丁",
+		// 纯函数：入参数组不得被就地重排。
+		"pure.inputIntact": "yes",
+	}
+	for key, w := range wantPure {
+		if got[key] != w {
+			t.Errorf("%s = %q\nwant %q", key, got[key], w)
+		}
+	}
+
+	// (c) 图表：均值线 + 均值/峰值标签 + 悬停类名 + 单桶明细。
+	svg := got["chart.svg"]
+	avg := (150 + 1200 + 60) / 3
+	for _, frag := range []string{
+		`<line class="avg"`,                                        // 均值参考线（虚线样式在 CSS 里）
+		`<text class="tk-avg"`,                                     // 均值标签
+		">均值 " + strconv.Itoa(avg) + "<",                         // 470
+		`<text class="tk-peak"`,                                    // 峰值标注
+		">峰值 1.2k<",                                              // 最高桶 1200
+		`<g class="usbar-g">`,
+		`<rect class="usbar"`,                                      // 悬停高亮挂在这个类上
+		`fill="var(--chart-1)"`, `fill="var(--chart-2)"`,           // 仍是本 fork 的平色 token
+		`<title>2026-09-28T11  900 prompt / 300 completion / 合计 1.2k / 9 次</title>`,
+		`<title>2026-09-28T10  100 prompt / 50 completion / 合计 150 / 3 次</title>`,
+	} {
+		if !strings.Contains(svg, frag) {
+			t.Errorf("图表缺少片段 %q\n实际：%s", frag, svg)
+		}
+	}
+	if n := strings.Count(svg, `<g class="usbar-g">`); n != 3 {
+		t.Errorf("单桶分组应为 3 个，实际 %d：%s", n, svg)
+	}
+	if n := strings.Count(svg, `<rect class="usbar"`); n != 6 {
+		t.Errorf("柱子（prompt+completion 两段 × 3 桶）应为 6 段，实际 %d：%s", n, svg)
+	}
+	if strings.Contains(svg, "linearGradient") {
+		t.Errorf("图表不该用渐变（本 fork 用 --chart-1/2 平色，渐变要 style=… 会破内联样式禁令）：%s", svg)
+	}
+	// 只有一个点（或所有桶等高）时均值线与顶框重合，不画线也不给标签。
+	single := got["chart.single"]
+	if strings.Contains(single, `class="avg"`) || strings.Contains(single, "tk-avg") {
+		t.Errorf("均值等于峰值时不该画均值线：%s", single)
+	}
+	if !strings.Contains(single, ">峰值 10<") {
+		t.Errorf("单点时峰值标注仍应在：%s", single)
+	}
+	if !strings.Contains(got["chart.empty"], "暂无用量数据") {
+		t.Errorf("空序列应回空态文案：%s", got["chart.empty"])
+	}
+	// CSS：虚线靠 CSS 表达（不许内联 style），悬停规则只改不透明度、绝不碰 height
+	// （SVG2 里 height 是 rect 的 CSS 几何属性，账号池的 .bar{height:4px} 曾把柱子压扁）。
+	for key, frag := range map[string]string{
+		"css.avg":      "stroke-dasharray: 4 4",
+		"css.tkAvg":    "fill: var(--warn)",
+		"css.tkPeak":   "font: 600 10px var(--mono)",
+		"css.hover":    "opacity: .8",
+		"css.sortable": "cursor: pointer",
+		"css.sorted":   "color: var(--accent)",
+	} {
+		if !strings.Contains(got[key], frag) {
+			t.Errorf("%s 缺少 %q：%q", key, frag, got[key])
+		}
+	}
+	if strings.Contains(got["css.hover"], "height") {
+		t.Errorf("柱子悬停规则不得设置 height（会压扁 rect）：%q", got["css.hover"])
+	}
+
+	// (d) 空态 colspan 与静态表头一致。
+	for key, cols := range map[string]string{"empty.account": "11", "empty.model": "8", "empty.realm": "8"} {
+		if !strings.Contains(got[key], `colspan="`+cols+`" class="empty">暂无数据`) {
+			t.Errorf("%s 空态 colspan 应为 %s：%s", key, cols, got[key])
+		}
+	}
+
+	// 关键渲染结果落日志，便于人眼核对（go test -v）。
+	t.Logf("排序前：账号=%s 模型=%s 域=%s", got["rows.init.account"], got["rows.init.model"], got["rows.init.realm"])
+	t.Logf("排序前首行：账号 %s", clipLine(got["raw.init.account"], "<tr>", 240))
+	t.Logf("排序前首行：模型 %s", clipLine(got["raw.init.model"], "<tr>", 240))
+	t.Logf("排序前首行：域 %s", clipLine(got["raw.init.realm"], "<tr>", 240))
+	t.Logf("合计降序：%s（表头 %s）", got["rows.totalDesc.account"], got["head.totalDesc.account"])
+	t.Logf("合计升序：%s", got["rows.totalAsc.account"])
+	t.Logf("命中率降序：%s（旧列复位：%s）", got["rows.cacheDesc.account"], got["head.cacheDesc.account"])
+	t.Logf("域表命中率不可排：顺序=%s 表头=%s", got["rows.realmCacheClick.realm"], got["head.realmCacheClick.realm"])
+	t.Logf("排序后首行：账号 %s", clipLine(got["raw.sorted.account"], "<tr>", 240))
+	t.Logf("排序后首行：模型 %s", clipLine(got["raw.sorted.model"], "<tr>", 240))
+	t.Logf("排序后首行：域 %s", clipLine(got["raw.sorted.realm"], "<tr>", 240))
+	t.Logf("请求清单：加载后=%s 排序后=%s 刷新后=%s", got["fetch.afterLoad"], got["fetch.afterClicks"], got["fetch.afterRefetch"])
+	t.Logf("图表均值线：%s", clipLine(svg, `<line class="avg"`, 130))
+	t.Logf("图表均值标签：%s", clipLine(svg, ">均值 ", 130))
+	t.Logf("图表峰值标注：%s", clipLine(svg, ">峰值 ", 130))
+	t.Logf("单桶明细：%s", clipLine(svg, "<title>2026-09-28T11", 130))
+	t.Logf("行内单元格数：账号=%s 模型=%s 域=%s；统计卡 %s 张/%s 空白格；chip=%s",
+		got["td.account"], got["td.model"], got["td.realm"], got["stats.cards"], got["stats.blanks"], got["chip"])
+}
+
+// clipLine 截取 s 中 needle 开始的至多 max 个字符，仅供测试日志人眼核对。
+func clipLine(s, needle string, max int) string {
+	i := strings.Index(s, needle)
+	if i < 0 {
+		return "（缺 " + needle + "）"
+	}
+	rest := s[i:]
+	if len(rest) > max {
+		rest = rest[:max] + "…"
+	}
+	return rest
+}
+
 // TestIndexConfigRequestClientInfo 面板侧的 logging.request_client_info 开关必须三处对齐：
 // 勾选框、CFG_MAP 路径、后端字段名。任一处拼错都不会报错——勾选框照常渲染，保存时被静默
 // 忽略（collectConfig 找不到表单元素就 continue），配置看着改了其实没变，故用断言钉住。
