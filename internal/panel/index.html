@@ -333,7 +333,11 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
   overflow: auto; max-height: 60vh; overscroll-behavior: contain;
   scrollbar-gutter: stable;
 }
-#view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 251px)); }
+/* 账号表的高度预算是「撑满视口剩余高度」——上方插入「积分到期提醒」卡片后，必须把
+   卡片的实测高度一起扣掉，否则表底会被顶出首屏。卡片高度随到期批次在「空态一行」到
+   「150px 内滚」之间变化，写死常数不是留白就是溢出，故由 app.js 的 syncExpHeight 把
+   实测值写进 --exp-h；取不到实测值（无布局环境）时按 0 算，即与加卡片前一致。 */
+#view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 251px - var(--exp-h, 0px))); }
 #view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 239px)); }
 .dlg .tbl-wrap { max-height: none; overflow: visible; }
 .acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
@@ -662,6 +666,19 @@ th.num, td.num { text-align: right; }
 .pk-expiry-legend i { width: 9px; height: 9px; border-radius: 3px; flex: 0 0 9px; background: var(--seg-color, var(--chart-1)); }
 .pk-expiry-foot { margin-top: var(--sp-2); padding-top: var(--sp-2); border-top: 1px solid var(--line-soft); color: var(--ink-2); font-size: var(--fs-11); }
 .pk-expiry-empty { padding: var(--sp-6) 0; text-align: center; color: var(--ink-2); font-size: var(--fs-12); }
+/* 账号管理视图的「积分到期提醒」卡整块复用上面的 .pk-expiry-* 网格（同样的行/
+   轨道/图例/脚注/空态），只把列加宽：这边一行是「一个到期日」的汇总，比积分构成
+   那张图多两列（面额、账号数），72+52+68+76+52 是这些列在 11px 字号下的内容宽。 */
+#view-accounts .pk-expiry-hdr,
+#view-accounts .pk-expiry-row { grid-template-columns: 72px 52px minmax(80px, 1fr) 68px 76px 52px; }
+/* 卡片就在账号表上方，行数多时卡内滚动（≈5 行）而不是把表一路推下去。 */
+#view-accounts .pk-expiry-chart { max-height: 150px; }
+/* 危险度落在「剩余天数」的文字上（表格布局没有色点位置）：≤3 天红（不抓紧就真
+   没了）、≤7 天琥珀、更远绿——与上游色点的判据完全一致。 */
+#view-accounts .pk-expiry-days { font-weight: 600; }
+#view-accounts .pk-expiry-days.is-bad { color: var(--bad); }
+#view-accounts .pk-expiry-days.is-warn { color: var(--warn); }
+#view-accounts .pk-expiry-days.is-ok { color: var(--ok); }
 
 /* ════════════════════════════════════════════════════════════════════════
    10. 券码弹窗（票券式卡片，类名统一 vc- 前缀防越界）
@@ -859,6 +876,19 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
+      </div>
+
+      <!-- 积分到期提醒：账号表上方的提醒卡（位置与上游一致），整块复用积分构成的
+           .pk-expiry-* 样式。数据与「积分构成」共用 /panel/api/packages 缓存
+           （2 分钟新鲜窗口），「检查」忽略缓存强制重取。进视图才显示，避免空卡。 -->
+      <div class="box" id="expBox" hidden>
+        <header>
+          <h3>积分到期提醒<span class="hint">按到期日聚合 · 上游按失效时刻先后自动优先扣减（FEFO），先到期的先被消耗 · 日均需耗 = 批次剩余 ÷ 距到期天数，用不完即作废</span></h3>
+          <span class="grow"></span>
+          <span class="note" id="expNote"></span>
+          <button class="xs" id="btnExp" title="忽略缓存，重新逐账号查询上游">检查</button>
+        </header>
+        <div class="pad"><div id="expList"></div></div>
       </div>
 
       <div class="box">

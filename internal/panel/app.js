@@ -393,6 +393,17 @@ function trangeLabel(id) {
 }
 
 /* ── 路由 ─────────────────────────────────────────────────────────── */
+/* 积分包明细的共享缓存：「积分构成」视图与账号管理视图的「积分到期提醒」卡片共用
+   同一份 /panel/api/packages 数据（该接口逐账号实时查上游、并发只有 3，能省一次是
+   一次）。声明必须留在路由区：下面顶层的 go() 一执行就会进 loadExpiry 读这几个
+   let——挪到文件底部（贴着函数定义放）就是 TDZ ReferenceError。 */
+let lastPackages = null, lastPackagesLimit;
+let lastPackagesAt = 0;                        // 上次成功拉取的时刻（缓存年龄标注用）
+let expFetching = false;                       // 到期卡片在途标记（连点「检查」不重复打上游）
+/* 缓存新鲜窗口 2 分钟：阈值照搬上游 acb3830 的 EXP_FRESH_MS（2 * 60 * 1000），
+   该窗口内切视图直接复用，超过才重新逐账号查上游。 */
+const EXP_FRESH_MS = 2 * 60 * 1000;
+
 /* 视图标题：导航与顶栏共用，统一 4 字（导航栏宽度固定 216px，标题长度一致
    才能让 7 个条目左对齐成一条竖线）。 */
 const TITLES = { accounts: '账号管理', usage: '用量统计', packages: '积分构成', taskscenter: '任务中心', models: '模型档位', config: '系统配置', logs: '运行日志' };
@@ -420,6 +431,7 @@ function go(v) {
   if (v === 'logs') loadLogs();
   if (v === 'usage') loadUsage();
   if (v === 'packages') loadPackages();
+  if (v === 'accounts') loadExpiry();
   if (v === 'taskscenter') reattachQueueView();
   // 视图切换后把焦点交给主区：读屏与键盘用户不会滞留在导航里。
   $('main').focus({ preventScroll: true });
@@ -3210,8 +3222,9 @@ if ($('pkDetail')) $('pkDetail').addEventListener('click', ev => {
 });
 
 /* 最近一次拉到的积分构成数据与生效的明细条数：切换排序规则时只重排内存数据，
-   不重新向上游请求（逐包明细是逐账号实时查询，刷新代价高）。 */
-let lastPackages = null, lastPackagesLimit;
+   不重新向上游请求（逐包明细是逐账号实时查询，刷新代价高）。
+   两个变量声明在路由区（见文件顶部）：账号管理视图的到期卡片与这里共用同一份缓存，
+   顶层的 go() 会先一步读它们。 */
 
 /* 排序规则控件：恢复上次选择（localStorage 跨会话记住）并绑定切换。 */
 if ($('pkSort')) {
@@ -3235,6 +3248,7 @@ async function loadPackages() {
       api('config').catch(() => null),
     ]);
     lastPackages = d;                            // 缓存供排序切换即时重排
+    lastPackagesAt = Date.now();                 // 同一份缓存也喂账号管理视图的到期卡片
     lastPackagesLimit = pkDetailLimit(c && c.config);
     renderPackages(lastPackages, lastPackagesLimit);
   } catch (e) {
@@ -3244,3 +3258,200 @@ async function loadPackages() {
 }
 
 if ($('btnPk')) $('btnPk').onclick = loadPackages;
+
+/* ── 积分到期提醒（账号管理视图的卡片）──────────────────────────────── */
+/* 积分不是永久的：签到/任务发的裂变包约一个月失效。只看「剩余积分 ÷ 日消耗」会
+   系统性偏乐观——用不完的部分到期直接蒸发。这里把「哪天会同时作废多少、牵涉哪几个
+   账号、先烧哪一批」顶到账号表上方；数据源与「积分构成」共用 lastPackages 缓存
+   （EXP_FRESH_MS 内切视图不重复打上游，「检查」按钮强制重取）。
+   渲染只发生在异步续体里（loadExpiry 取到数据之后）：顶层 go('accounts') 同步走到
+   loadExpiry 时 lastPackages 必然是空的，不会在 PK_ACCOUNT_COLORS 初始化前碰到它。 */
+
+/* expBatches 把某账号的包聚合成「到期日 → 该日作废的积分」升序列表。
+   只统计 remain>0 且有到期时间的包：没余额、或没有到期时间的包，到期没有任何影响。
+   比上游多带两列——size（该批面额，卡片要显示「本来有多少」）与 n（包数）：
+   再遍历一遍包只会把日期归并逻辑写第二份。
+   到期日取 end_time 的日期部分：后端三条分支（DeductionEndTime 的 RFC3339、
+   上游墙钟串、CycleEndTime）写出来都以 YYYY-MM-DD 开头，slice(0,10) 是同一口径，
+   也和 pkBySource 取最早到期日一致。 */
+function expBatches(packs) {
+  const byDay = new Map();
+  for (const p of packs || []) {
+    const remain = Number((p && p.remain) || 0);
+    const date = String((p && p.end_time) || '').slice(0, 10);
+    if (remain <= 0 || !date) continue;
+    const row = byDay.get(date) || { date, remain: 0, size: 0, n: 0 };
+    row.remain += remain;
+    const size = Number((p && p.size) || 0);
+    if (Number.isFinite(size) && size > 0) row.size += size;
+    row.n += 1;
+    byDay.set(date, row);
+  }
+  // 升序 = 上游扣包顺序（FEFO）。日期来自 Map 的键，天然唯一，比较器不必处理相等。
+  return [...byDay.values()].sort((a, b) => (a.date < b.date ? -1 : 1));
+}
+
+/* expDaysLeft 到期日 → 距今天数（本地自然日，今天 = 0）。两端都按同一时区的自然日
+   相减：上游给的是「到期日」不是时刻，这样不会因为差几个小时把今天到期算成明天。
+   Math.round 兜住夏令时的 ±1 小时偏移（本仓库的主要时区无夏令时，纯防守）。 */
+function expDaysLeft(dateStr, today) {
+  return Math.round((new Date(dateStr + 'T00:00:00') - today) / 86400000);
+}
+
+// expDayWord 把天数翻成人话：0 天 / 1 天说成「今天到期 / 明天到期」，比「0 天后到期」可读。
+function expDayWord(days) {
+  if (days < 0) return '已过期';
+  if (days === 0) return '今天到期';
+  if (days === 1) return '明天到期';
+  return days + ' 天后到期';
+}
+
+/* renderExpiry 渲染卡片：按到期日聚合——同一批到期日常散在几个账号里（裂变包按次
+   发放），合成一行才看得出「哪天会一起蒸发多少」；行内轨道段按账号着色，配色与
+   「积分构成」视图同源，同一个号在两个视图里同色。
+   三种「没有」给三句不同的话（没账号 / 全查挂 / 确实没有将到期的批次），不摆空表。 */
+function renderExpiry(d) {
+  const list = (d && d.accounts) || [];
+  const today = new Date(); today.setHours(0, 0, 0, 0);
+  const colors = pkAccountColorMap(list);
+  const byDay = new Map();
+  const failed = [];
+  let expired = 0;
+  for (const a of list) {
+    if (a.error) { failed.push(a); continue; }
+    const uid = String(a.uid || '');
+    const name = a.nickname || uid.slice(0, 8) || '未命名账号';
+    for (const b of expBatches(a.packages)) {
+      const days = expDaysLeft(b.date, today);
+      if (days < 0) { expired++; continue; }   // 已作废的批次不再占首页位置，只在脚注提一句
+      const row = byDay.get(b.date) || { date: b.date, days, remain: 0, size: 0, who: [] };
+      row.remain += b.remain;
+      row.size += b.size;
+      row.who.push({ uid, name, remain: b.remain });
+      byDay.set(b.date, row);
+    }
+  }
+  // 天数升序就是 FEFO 顺序：最上面那行正是上游最先扣减的批次。
+  const rows = [...byDay.values()].sort((a, b) => a.days - b.days);
+  const nodes = rows.map(row => {
+    // 危险度判据与上游色点一致：≤3 天红（不抓紧就真没了）、≤7 天琥珀、更远绿。
+    const cls = row.days <= 3 ? 'is-bad' : row.days <= 7 ? 'is-warn' : 'is-ok';
+    const word = expDayWord(row.days);
+    const total = Math.max(1, row.remain);
+    const segs = row.who.map(w => {
+      const title = w.name + ' ' + fmtTok(w.remain) + ' 积分\n到期时间 ' +
+        row.date + '（' + word + '）';
+      return '<span class="pk-expiry-seg" style="--seg-color:' +
+        (colors.get(w.uid) || 'var(--accent)') +
+        ';--seg-op:' + pkCreditOpacity(row.days).toFixed(5) +
+        ';--seg-flex:' + Math.max(0.008, w.remain / total).toFixed(4) + ' 1 0" title="' +
+        esc(title) + '" aria-label="' + esc(title) + '"></span>';
+    }).join('');
+    return '<div class="pk-expiry-row">' +
+      '<span class="pk-expiry-days ' + cls + '">' + esc(word) + '</span>' +
+      '<span>' + esc(row.date.slice(5)) + '</span>' +
+      '<div class="pk-expiry-track">' + segs + '</div>' +
+      '<b>' + (row.size > 0 ? fmtTok(row.size) : '—') + '</b>' +
+      '<b>' + fmtTok(row.remain) + '</b>' +
+      '<b>' + row.who.length + '</b></div>';
+  }).join('');
+  // 图例只列真正牵涉到的账号，避免把「积分不会作废」的号也画进来。
+  const seen = new Set();
+  const legendParts = [];
+  for (const row of rows) for (const w of row.who) {
+    if (seen.has(w.uid)) continue;
+    seen.add(w.uid);
+    legendParts.push('<span><i style="--seg-color:' + (colors.get(w.uid) || 'var(--accent)') +
+      '"></i>' + esc(w.name) + '</span>');
+  }
+  const legend = legendParts.join('');
+  const first = rows[0];
+  // 7 天内合计（上游卡片同一个数字）：把「这周之内会蒸发多少」压成一个数，
+  // 只有最近一批时它就是那一批的剩余。
+  const weekTotal = rows.filter(r => r.days <= 7).reduce((s, r) => s + r.remain, 0);
+  /* FEFO 结论：上游按失效时刻升序扣包（实测口径，见上游 bb8fd1d），所以「先消耗哪
+     一批」不用猜——最上面那行就是。日均需耗用 Math.max(1, days)：今天到期（days=0）
+     时给的参照是「今天之内得把这批烧完」。 */
+  const foot = (first
+    ? 'FEFO 结论：上游按失效时刻先后自动优先扣减——先消耗 <b>' + esc(first.date) +
+      '</b>（' + esc(expDayWord(first.days)) + '）那一批：剩余 <b>' + fmtTok(first.remain) +
+      '</b> 积分 · 涉及 ' + first.who.length + ' 个账号 · 到期前日均需耗 ≥<b>' +
+      fmtTok(Math.ceil(first.remain / Math.max(1, first.days))) + '</b>'
+    : 'FEFO 结论：当前没有会到期的积分批次，不必特意去消耗哪一批') +
+    (weekTotal ? ' · 7 天内合计 <b>' + fmtTok(weekTotal) + '</b> 积分' : '') +
+    ' · 共 ' + list.length + ' 个账号' +
+    (failed.length ? ' / ' + failed.length + ' 个查询失败' : '') +
+    (expired ? ' · 另有 ' + expired + ' 个批次已过期（不计入）' : '');
+  let empty = '';
+  if (!list.length) empty = '没有账号';
+  else if (!rows.length && failed.length === list.length) {
+    empty = list.length + ' 个账号全部查询失败，暂时判断不得到期批次';
+  } else if (!rows.length) {
+    empty = '没有即将到期的积分批次：' + (list.length - failed.length) + ' 个账号的积分都不会自动作废' +
+      (failed.length ? '（另有 ' + failed.length + ' 个账号查询失败）' : '');
+  }
+  const hdr = '<div class="pk-expiry-hdr"><span>剩余天数</span><span>到期日</span>' +
+    '<span class="ta-c">各账号该批剩余</span><b>面额</b><b>剩余积分</b><b>账号数</b></div>';
+  $('expList').innerHTML = rows.length
+    ? hdr + '<div class="pk-expiry-chart">' + nodes + '</div>' +
+      (legend ? '<div class="pk-expiry-legend">' + legend + '</div>' : '') +
+      '<div class="pk-expiry-foot">' + foot + '</div>'
+    : '<div class="pk-expiry-empty">' + esc(empty) + '</div>' +
+      (list.length ? '<div class="pk-expiry-foot">' + foot + '</div>' : '');
+  // 数据新鲜度透明化（上游 bb8fd1d）：走缓存时标注年龄，免得把旧数据误当实时；
+  // 不足 1 分钟仍说「实时」——这个接口逐账号查上游，秒级误差没有意义。
+  const ageMin = lastPackagesAt ? Math.floor((Date.now() - lastPackagesAt) / 60000) : 0;
+  $('expNote').textContent = ageMin > 0
+    ? list.length + ' 个账号 · ' + ageMin + ' 分钟前的数据，可点「检查」刷新'
+    : list.length + ' 个账号 · 实时查询上游';
+  $('expBox').hidden = false;
+  syncExpHeight();
+}
+
+/* syncExpHeight 把「积分到期提醒」卡片的实测高度写进 --exp-h：账号表用的是「撑满视口
+   剩余高度」的预算（index.html 的 #view-accounts .tbl-wrap），卡片插在它上方后不扣掉这
+   段，表底就会被顶出首屏；而卡片高度随到期批次在「空态一行」到「150px 内滚」之间变化，
+   写死常数不是留白就是溢出。node 沙箱没有布局引擎（也没有 getBoundingClientRect），
+   取不到值就保持默认 0 = 与加卡片之前的行为一致。 */
+function syncExpHeight() {
+  try {
+    const box = $('expBox');
+    const root = document.documentElement;
+    if (box && box.getBoundingClientRect && root && root.style && root.style.setProperty) {
+      root.style.setProperty('--exp-h', Math.round(box.getBoundingClientRect().height) + 'px');
+    }
+  } catch (e) { /* 无布局环境：保持默认预算 */ }
+}
+
+/* loadExpiry 取到期数据：缓存新鲜（EXP_FRESH_MS 内）就直接重渲染，不打上游；
+   force（「检查」按钮）跳过新鲜度判断强制重取。 */
+async function loadExpiry(force) {
+  if (!$('expBox')) return;
+  if (expFetching) return;                       // 在途去重：连点两次只打一遍上游
+  const fresh = lastPackages && (Date.now() - lastPackagesAt) < EXP_FRESH_MS;
+  if (fresh && !force) { renderExpiry(lastPackages); return; }
+  expFetching = true;
+  $('expBox').hidden = false;
+  // 只有还没有内容时才摆占位：已有结果时刷新不闪空态，卡片不会跳一下。
+  if (!$('expList').children.length) {
+    $('expList').innerHTML = '<div class="pk-expiry-empty">查询中…（逐账号向上游实时查询）</div>';
+  }
+  $('expNote').textContent = '查询中…';
+  try {
+    const d = await api('packages');
+    lastPackages = d;                            // 与「积分构成」视图共用同一份缓存
+    lastPackagesAt = Date.now();
+    renderExpiry(d);
+  } catch (e) {
+    const msg = (e && e.message) || String(e);
+    // 失败也要落地：有旧数据就继续显示（免得一次抖动把卡片清空），没有就换成空态——
+    // 否则首屏失败会一直停在「查询中…」，看起来像还在转。
+    if (lastPackages) renderExpiry(lastPackages);
+    else $('expList').innerHTML = '<div class="pk-expiry-empty">读取失败：' + esc(msg) + '</div>';
+    // textContent 不进 HTML 解析，这里不需要 esc（esc 反而会把引号显示成实体）。
+    $('expNote').textContent = '查询失败：' + msg;
+  }
+  expFetching = false;
+}
+
+if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);

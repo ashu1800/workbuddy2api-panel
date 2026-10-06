@@ -2589,8 +2589,8 @@ function clickHead(dim, key) {
 		"pure.requests_desc": "乙,丙,甲,丁",
 		"pure.requests_asc":  "丁,甲,乙,丙",
 		// 失败数：4/4 与 0/0 两组并列，两个方向都保持后端顺序（甲在丁前）。
-		"pure.errors_desc": "乙,丙,甲,丁",
-		"pure.errors_asc":  "甲,丁,乙,丙",
+		"pure.errors_desc":     "乙,丙,甲,丁",
+		"pure.errors_asc":      "甲,丁,乙,丙",
 		"pure.prompt_desc":     "乙,甲,丙,丁",
 		"pure.prompt_asc":      "丁,丙,甲,乙",
 		"pure.completion_desc": "乙,甲,丙,丁",
@@ -2622,14 +2622,14 @@ function clickHead(dim, key) {
 	svg := got["chart.svg"]
 	avg := (150 + 1200 + 60) / 3
 	for _, frag := range []string{
-		`<line class="avg"`,                                        // 均值参考线（虚线样式在 CSS 里）
-		`<text class="tk-avg"`,                                     // 均值标签
-		">均值 " + strconv.Itoa(avg) + "<",                         // 470
-		`<text class="tk-peak"`,                                    // 峰值标注
-		">峰值 1.2k<",                                              // 最高桶 1200
+		`<line class="avg"`,              // 均值参考线（虚线样式在 CSS 里）
+		`<text class="tk-avg"`,           // 均值标签
+		">均值 " + strconv.Itoa(avg) + "<", // 470
+		`<text class="tk-peak"`,          // 峰值标注
+		">峰值 1.2k<",                      // 最高桶 1200
 		`<g class="usbar-g">`,
-		`<rect class="usbar"`,                                      // 悬停高亮挂在这个类上
-		`fill="var(--chart-1)"`, `fill="var(--chart-2)"`,           // 仍是本 fork 的平色 token
+		`<rect class="usbar"`,                            // 悬停高亮挂在这个类上
+		`fill="var(--chart-1)"`, `fill="var(--chart-2)"`, // 仍是本 fork 的平色 token
 		`<title>2026-09-28T11  900 prompt / 300 completion / 合计 1.2k / 9 次</title>`,
 		`<title>2026-09-28T10  100 prompt / 50 completion / 合计 150 / 3 次</title>`,
 	} {
@@ -4380,4 +4380,610 @@ func minInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+// TestAppJSExpiryBatchMath 到期批次的纯逻辑（node 沙箱，无 DOM）：
+//
+//	· expBatches 按到期日归并——同日多包求和，顺带带上该批面额与包数；
+//	· 只算 remain>0 且有到期时间的包（没余额 / 长期包的到期没有意义）；
+//	· expDaysLeft 今天=0、未来为正、已过期为负（调用方负责过滤，函数本身不藏）；
+//	· expDayWord 的「今天/明天/N 天后」文案。
+//
+// 用例只由「年-月-日」构造日期（本地自然日），跑在哪个时区都成立。
+func TestAppJSExpiryBatchMath(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry batch math test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function expBatches(packs)');
+const end = src.indexOf('function renderExpiry(d)');
+if (start < 0 || end <= start) throw new Error('expBatches/expDaysLeft slice not found');
+const ctx = { Date, Math, Number, String, Map, Array, Object, isFinite };
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.expBatches = expBatches; this.expDaysLeft = expDaysLeft; this.expDayWord = expDayWord;', ctx);
+const today = new Date(2026, 9, 1); // 2026-10-01 00:00 本地
+const day = n => {
+  const t = new Date(2026, 9, 1 + n);
+  return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' +
+    String(t.getDate()).padStart(2, '0');
+};
+const batches = ctx.expBatches([
+  { name: 'a', remain: 60, size: 100, end_time: day(0) + 'T18:00:00+08:00' },
+  { name: 'b', remain: 40, size: 50, end_time: day(0) + 'T23:00:00+08:00' },
+  { name: 'c', remain: 30, size: 30, end_time: day(3) + ' 00:00:00' },
+  { name: 'expired', remain: 5, size: 5, end_time: day(-2) + 'T00:00:00+08:00' },
+  { name: 'no-end', remain: 99, size: 99 },
+  { name: 'zero', remain: 0, size: 40, end_time: day(1) + 'T00:00:00+08:00' },
+]);
+process.stdout.write(JSON.stringify({
+  batches,
+  today: ctx.expDaysLeft(day(0), today),
+  in3: ctx.expDaysLeft(day(3), today),
+  past: ctx.expDaysLeft(day(-2), today),
+  empty: ctx.expBatches([]),
+  nullish: ctx.expBatches(null),
+  word: [ctx.expDayWord(-1), ctx.expDayWord(0), ctx.expDayWord(1), ctx.expDayWord(5)],
+}));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-math-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry batch math node test failed: %v\n%s", err, out)
+	}
+	// 2026-10-01 今天；+3 天 = 10-04；-2 天 = 09-29（跨月，日期串由本地日历算出）。
+	// 排序按日期串升序：已过的批次排最前（函数不做过滤，过滤是渲染层的事）。
+	const want = `{"batches":[{"date":"2026-09-29","remain":5,"size":5,"n":1},` +
+		`{"date":"2026-10-01","remain":100,"size":150,"n":2},` +
+		`{"date":"2026-10-04","remain":30,"size":30,"n":1}],` +
+		`"today":0,"in3":3,"past":-2,"empty":[],"nullish":[],` +
+		`"word":["已过期","今天到期","明天到期","5 天后到期"]}`
+	if got := strings.TrimSpace(string(out)); got != want {
+		t.Fatalf("expiry batch math=%s\nwant %s", got, want)
+	}
+}
+
+// TestAppJSExpiryCardRender 到期卡片的三态渲染（node + DOM 桩）：
+// 有将到期批次 / 无将到期（只余长期包与已过期包）/ 无数据，外加「全查挂」这一态。
+// 断言口径都在卡片 HTML 自身：剩余天数文案、面额、剩余、涉及账号数、图例配色、
+// FEFO 结论，以及缓存年龄的两条分支（实时 / N 分钟前）。
+// 缓存时间戳用桩注入（setAge），年龄文案的两条分支才能被精确钉住。
+func TestAppJSExpiryCardRender(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry card render test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// 只取纯渲染链路：格式化/转义 + 账号配色与到期工具 + 到期批次聚合 + renderExpiry。
+// （renderExpiry 的切片要用带参数的签名定位——'function renderExpiry' 会先命中
+//  更早出现的 renderExpiryDistribution。）
+const slices = [
+  src.slice(src.indexOf('function esc('), src.indexOf('function veilStack(')),
+  src.slice(src.indexOf('function fmtTok('), src.indexOf('function usStat(')),
+  src.slice(src.indexOf('const PK_ACCOUNT_COLORS'), src.indexOf('function renderExpiryDistribution')),
+  // 缓存变量声明在路由区，这里补一份等价桩：年龄文案要有确定的输入。
+  'let lastPackages = null, lastPackagesLimit; let lastPackagesAt = 0; const EXP_FRESH_MS = 2 * 60 * 1000;',
+  src.slice(src.indexOf('function expBatches(packs)'), src.indexOf('function renderExpiry(d)')),
+  src.slice(src.indexOf('function renderExpiry(d)'), src.indexOf('async function loadExpiry(force)')),
+];
+if (slices.some(s => !s)) throw new Error('expiry render slice not found');
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-10-01T09:00:00'); // 本地 09:00 → 今天 = 10-01
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const day = n => {
+  const t = new RealDate(2026, 9, 1 + n);
+  return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' +
+    String(t.getDate()).padStart(2, '0');
+};
+const PACKS = { accounts: [
+  { uid: 'uid-a', nickname: '号一', realm: 'cn', remain: 150, size: 250, packages: [
+    { name: '裂变包', remain: 60, size: 100, end_time: day(0) + 'T18:00:00+08:00' },
+    { name: '裂变包', remain: 40, size: 100, end_time: day(0) + 'T23:00:00+08:00' },
+    { name: '长期包', remain: 50, size: 50 },
+    { name: '已用完', remain: 0, size: 90, end_time: day(1) + 'T00:00:00+08:00' },
+    { name: '小包', remain: 20, size: 20, end_time: day(3) + 'T00:00:00+08:00' },
+    { name: '中包', remain: 12, size: 12, end_time: day(5) + 'T00:00:00+08:00' },
+    { name: '远包', remain: 8, size: 8, end_time: day(20) + 'T00:00:00+08:00' },
+  ] },
+  { uid: 'uid-b', nickname: '号二', realm: 'global', remain: 35, size: 35, packages: [
+    { name: '拉新包', remain: 30, size: 30, end_time: day(0) + 'T20:00:00+08:00' },
+    { name: '过期包', remain: 5, size: 5, end_time: day(-3) + 'T00:00:00+08:00' },
+  ] },
+  { uid: 'uid-c', nickname: '号三', error: 'token expired' },
+  { uid: 'uid-d', nickname: '号四<script>', realm: 'cn', remain: 3, size: 3, packages: [
+    { name: '活动包', remain: 3, size: 3, end_time: day(5) + 'T00:00:00+08:00' },
+  ] },
+] };
+const NO_EXPIRY = { accounts: [
+  { uid: 'uid-a', nickname: '号一', packages: [
+    { name: '长期包', remain: 10, size: 10 },
+    { name: '过期包', remain: 7, size: 7, end_time: day(-1) + 'T00:00:00+08:00' },
+  ] },
+] };
+const ALL_FAILED = { accounts: [{ uid: 'uid-x', nickname: '号X', error: 'boom' }] };
+const nodes = {};
+const el = id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '', hidden: false, children: [] });
+const ctx = {
+  $: el, Date: FakeDate, Number, String, Boolean, Math, Array, Object, Map, Set, JSON, RegExp, Error,
+  isNaN, isFinite, parseInt, parseFloat,
+};
+vm.createContext(ctx);
+vm.runInContext(slices.join('\n') + '\nthis.renderExpiry = renderExpiry;' +
+  '\nthis.setAge = ms => { lastPackagesAt = ms; };', ctx);
+el('expBox').hidden = true; // 渲染必须把卡片显示出来（不是靠初始值偶然为 false）
+ctx.setAge(FIXED);
+ctx.renderExpiry(PACKS);
+const live = { list: nodes.expList.innerHTML, note: nodes.expNote.textContent, hidden: nodes.expBox.hidden };
+ctx.setAge(FIXED - 7 * 60000);
+ctx.renderExpiry(PACKS);
+const stale = { list: nodes.expList.innerHTML, note: nodes.expNote.textContent };
+ctx.setAge(FIXED);
+ctx.renderExpiry(NO_EXPIRY);
+const noExpiry = { list: nodes.expList.innerHTML, note: nodes.expNote.textContent };
+ctx.renderExpiry(ALL_FAILED);
+const allFailed = { list: nodes.expList.innerHTML, note: nodes.expNote.textContent };
+ctx.renderExpiry({});
+const noData = { list: nodes.expList.innerHTML, note: nodes.expNote.textContent };
+ctx.renderExpiry(null);
+const nullish = { list: nodes.expList.innerHTML };
+process.stdout.write(JSON.stringify({ live, stale, noExpiry, allFailed, noData, nullish }));`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-card-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry card render node test failed: %v\n%s", err, out)
+	}
+	var got map[string]map[string]any
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("expiry card render output is not JSON: %v\n%s", err, out)
+	}
+	str := func(section, key string) string {
+		s, _ := got[section][key].(string)
+		return s
+	}
+	boolean := func(section, key string) bool {
+		b, _ := got[section][key].(bool)
+		return b
+	}
+
+	// ── 态一：有将到期批次（按到期日聚合，最近到期在最上）──────────────
+	live := str("live", "list")
+	for _, want := range []string{
+		`<span class="pk-expiry-days is-bad">今天到期</span>`, // 0 天不是「0 天后」
+		`<span class="pk-expiry-days is-bad">3 天后到期</span>`,
+		`<span class="pk-expiry-days is-warn">5 天后到期</span>`,
+		`<span class="pk-expiry-days is-ok">20 天后到期</span>`,
+		`<span>10-01</span>`,
+		`>剩余天数<`, `>到期日<`, `>面额<`, `>剩余积分<`, `>账号数<`,
+		`<b>230</b><b>130</b><b>2</b>`, // 最近到期那行：面额 230 / 剩余 130 / 2 个账号
+		`<b>15</b><b>15</b><b>2</b>`,   // 5 天后那行：号一 12 + 号四 3 聚合成一批
+		`FEFO 结论`, `先消耗 <b>2026-10-01</b>`, `日均需耗 ≥<b>130</b>`,
+		`7 天内合计 <b>165</b> 积分`, // 130（今天）+ 20（3 天）+ 15（5 天）
+		`共 4 个账号 / 1 个查询失败`, `另有 1 个批次已过期（不计入）`,
+		`--seg-color:var(--chart-1)`, `--seg-color:var(--chart-2)`, `--seg-color:var(--chart-3)`,
+	} {
+		if !strings.Contains(live, want) {
+			t.Errorf("到期卡片（有将到期批次）缺少 %q", want)
+		}
+	}
+	if n := strings.Count(live, `class="pk-expiry-row"`); n != 4 {
+		t.Errorf("到期行数 = %d，期望 4（10-01 / 10-04 / 10-06 / 10-21）", n)
+	}
+	if n := strings.Count(live, `class="pk-expiry-seg"`); n != 6 {
+		t.Errorf("轨道段数 = %d，期望 6（各行按账号构成拆段）", n)
+	}
+	// FEFO：先到期的行必须排在前面。
+	if i, j := strings.Index(live, "今天到期"), strings.Index(live, "3 天后到期"); i < 0 || j < 0 || i > j {
+		t.Errorf("到期行未按到期日升序（FEFO 顺序）排列：idx(今天)=%d idx(3 天后)=%d", i, j)
+	}
+	if strings.Contains(live, "号四<script>") || !strings.Contains(live, "号四&lt;script&gt;") {
+		t.Error("账号昵称里的 HTML 未被转义（图例/title 直接拼进了卡片）")
+	}
+	if strings.Contains(live, `class="pk-expiry-row"`) && !strings.Contains(live, `class="pk-expiry-foot"`) {
+		t.Error("有数据时脚注（FEFO 结论）必须存在")
+	}
+	// 卡片 HTML 不得带静态内联样式（只允许注入 CSS 变量）。
+	for _, m := range regexp.MustCompile(`style="([^"]*)"`).FindAllStringSubmatch(live, -1) {
+		if !strings.HasPrefix(m[1], "--") {
+			t.Errorf("到期卡片 HTML 有静态内联样式：%s", m[0])
+		}
+	}
+	if boolean("live", "hidden") {
+		t.Error("渲染后卡片必须显示（#expBox 的 hidden 应被摘掉）")
+	}
+	if !strings.Contains(str("live", "note"), "4 个账号 · 实时查询上游") {
+		t.Errorf("新鲜数据应标注「实时查询上游」，实际 %q", str("live", "note"))
+	}
+	// ── 缓存年龄：走缓存时标注数据年龄（阈值 EXP_FRESH_MS = 2 分钟）────────
+	if !strings.Contains(str("stale", "note"), "4 个账号 · 7 分钟前的数据，可点「检查」刷新") {
+		t.Errorf("旧数据未标注年龄：%q", str("stale", "note"))
+	}
+	if str("stale", "list") != live {
+		t.Error("同一份缓存的卡片内容应与实时渲染逐字一致（年龄只影响 #expNote）")
+	}
+
+	// ── 态二：没有将到期的批次（只有长期包 + 已过期包）─────────────────
+	noExpiry := str("noExpiry", "list")
+	for _, want := range []string{
+		`<div class="pk-expiry-empty">没有即将到期的积分批次：1 个账号的积分都不会自动作废</div>`,
+		`FEFO 结论：当前没有会到期的积分批次`,
+		`另有 1 个批次已过期（不计入）`,
+	} {
+		if !strings.Contains(noExpiry, want) {
+			t.Errorf("到期卡片（无将到期）缺少 %q：%s", want, noExpiry)
+		}
+	}
+	// 空态不许摆空表头。
+	if strings.Contains(noExpiry, `class="pk-expiry-row"`) || strings.Contains(noExpiry, `>剩余天数<`) {
+		t.Errorf("无将到期时不得渲染空表：%s", noExpiry)
+	}
+	if strings.Contains(noExpiry, "7 天内合计") {
+		t.Errorf("没有将到期批次时不该出现「7 天内合计」：%s", noExpiry)
+	}
+
+	// ── 态三 / 态四：全部查询失败 / 无数据 ─────────────────────────────
+	if !strings.Contains(str("allFailed", "list"), "1 个账号全部查询失败，暂时判断不得到期批次") {
+		t.Errorf("全查挂时的文案不可读：%s", str("allFailed", "list"))
+	}
+	for key, list := range map[string]string{"noData": str("noData", "list"), "nullish": str("nullish", "list")} {
+		if !strings.Contains(list, `<div class="pk-expiry-empty">没有账号</div>`) {
+			t.Errorf("%s 未给出「没有账号」空态：%s", key, list)
+		}
+	}
+	if !strings.Contains(str("noData", "note"), "0 个账号 · 实时查询上游") {
+		t.Errorf("无数据时 #expNote 应给出 0 个账号：%q", str("noData", "note"))
+	}
+}
+
+// TestAppJSExpiryFreshness 到期卡片的取数策略（node + DOM 桩，假 fetch 记录 URL 与次数）：
+//  1. 深链 #accounts 首屏取一次 packages（顶层 go() → loadExpiry 的路径必须通）；
+//  2. 新鲜窗口（EXP_FRESH_MS = 2 分钟，取自上游 acb3830）内切回视图 / 再调 loadExpiry
+//     都不重复请求；
+//  3. 超过窗口重新取；force（「检查」按钮）即使新鲜也重取；
+//  4. 在途去重：连点两次只打一遍上游。
+//
+// 同一沙箱顺带回归本 fork 的三条红线：账号表 7.10M chip、模型锁池表、trange 宿主
+// （7 个预设仍在，且默认仍是「近 3 天」）。
+func TestAppJSExpiryFreshness(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; expiry freshness test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const urls = [];
+// 时钟钉死且可推前：新鲜度判断要用它推进（否则要么立刻过期要么永远新鲜）。
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-10-01T09:00:00');
+let NOW = FIXED;
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(NOW); } }
+  static now() { return NOW; }
+}
+const day = n => {
+  const t = new RealDate(2026, 9, 1 + n);
+  return t.getFullYear() + '-' + String(t.getMonth() + 1).padStart(2, '0') + '-' +
+    String(t.getDate()).padStart(2, '0');
+};
+const body = p => {
+  if (p === 'packages') {
+    if (failNext) return { __status: 500, error: '上游超时' };
+    return { accounts: [
+      { uid: 'uid-a', nickname: '号一', realm: 'cn', remain: 60, size: 100, packages: [
+        { name: '裂变包', remain: 60, size: 100, end_time: day(0) + 'T18:00:00+08:00' },
+      ] },
+    ] };
+  }
+  if (p.startsWith('usage')) return { totals: {}, by_account: [], by_model: [], by_realm: [], series: [] };
+  if (p.startsWith('request_logs')) return { entries: [] };
+  if (p.startsWith('logs')) return { entries: [] };
+  return {};
+};
+let failNext = false;
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; }, has() { return true; },
+});
+const els = {}, qcache = {};
+const mkEl = key => {
+  const classes = new Set();
+  const store = {
+    key, innerHTML: '', textContent: '', value: '', title: '', hidden: false, className: '', disabled: false,
+    dataset: {}, style: {}, children: [], selectedOptions: [],
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    classList: {
+      add: c => classes.add(c), remove: c => classes.delete(c),
+      toggle: (c, on) => { const w = on === undefined ? !classes.has(c) : !!on; if (w) classes.add(c); else classes.delete(c); return w; },
+      contains: c => classes.has(c),
+    },
+    classes,
+    setAttribute() {}, getAttribute: () => null, removeAttribute() {}, hasAttribute: () => false,
+    addEventListener() {}, removeEventListener() {},
+    appendChild(n) { store.children.push(n); return n; },
+    remove() {}, focus() {}, blur() {}, click() {}, closest: () => null, contains: () => false,
+    insertAdjacentHTML() {}, getElementsByTagName: () => [], querySelectorAll: () => [],
+    querySelector: sel => (qcache[key + '|' + sel] = qcache[key + '|' + sel] || mkEl(key + '|' + sel)),
+    get firstElementChild() { return store.children[0] || null; },
+  };
+  return new Proxy(store, { get(t, k) { return k in t ? t[k] : inert; }, set(t, k, v) { t[k] = v; return true; }, has: () => true });
+};
+const el = id => (els[id] = els[id] || mkEl(id));
+const sandbox = {
+  location: { hash: '#accounts' }, // 深链：顶层 go() 会同步调进 loadExpiry（TDZ 敏感路径）
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    getElementById: el, querySelectorAll: () => [], querySelector: () => inert, addEventListener() {},
+    documentElement: el('documentElement'), head: inert, body: inert, cookie: '',
+    createElement: () => mkEl('created'), contains: () => false, activeElement: inert,
+  },
+  fetch: url => {
+    const path = String(url).replace('/panel/api/', '');
+    urls.push(path);
+    const d = body(path);
+    // 与 api() 同判：!ok 时抛 d.error，失败路径才能被真的走到。
+    if (d && d.__status) return Promise.resolve({ status: d.__status, ok: false, json: () => Promise.resolve(d) });
+    return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(d) });
+  },
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date: FakeDate, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src +
+  '\nthis.loadExpiry = loadExpiry; this.go = go; this.EXP_FRESH_MS = EXP_FRESH_MS;' +
+  '\nthis.renderAccounts = renderAccounts; this.renderModelLocks = renderModelLocks;',
+  sandbox, { filename: 'app.js' });
+const tick = () => new Promise(r => setTimeout(r, 5));
+const pkCount = () => urls.filter(u => u === 'packages').length;
+
+(async () => {
+  await tick();
+  const out = {};
+  out.freshMs = sandbox.EXP_FRESH_MS;
+  out.deepLinkCount = pkCount();                       // 进 #accounts 取一次
+  out.deepLinkNote = els.expNote.textContent;
+  out.deepLinkList = els.expList.innerHTML;
+
+  const before = pkCount();
+  sandbox.go('accounts');                              // 切回同一视图：走缓存
+  await tick();
+  out.reuseOnEnter = pkCount() === before;
+  await sandbox.loadExpiry();                          // 显式调用同样复用
+  out.reuseExplicit = pkCount() === before;
+
+  // 「积分构成」视图取到的数据同样进这份缓存：切到账号管理不再打第二遍
+  //（列表页自己仍然实时取数——那里是主视图，不做缓存拦截）。
+  sandbox.go('packages');
+  await tick();
+  const afterPackages = pkCount() - before;
+  sandbox.go('accounts');
+  await tick();
+  out.crossViewPackagesFetch = afterPackages;
+  out.crossViewReuse = pkCount() - before === afterPackages;
+
+  const beforeStale = pkCount();
+  NOW += sandbox.EXP_FRESH_MS + 1000;                  // 越过新鲜窗口 → 自动重取
+  await sandbox.loadExpiry();
+  out.staleRefetch = pkCount() - beforeStale;
+
+  const beforeForce = pkCount();
+  await sandbox.loadExpiry(true);                      // force：新鲜也重取
+  out.forceRefetch = pkCount() - beforeForce;
+
+  const beforeDup = pkCount();
+  await Promise.all([sandbox.loadExpiry(true), sandbox.loadExpiry(true)]);
+  out.dupRefetch = pkCount() - beforeDup;
+
+  // 取数失败：旧数据继续显示，note 说明失败（首屏失败则不留「查询中…」占位）。
+  failNext = true;
+  const beforeFail = pkCount();
+  await sandbox.loadExpiry(true);
+  out.failRefetch = pkCount() - beforeFail;
+  out.failNote = els.expNote.textContent;
+  out.failKeepsData = els.expList.innerHTML.indexOf('pk-expiry-row') >= 0;
+  failNext = false;
+
+  // 回归红线：账号表 chip / 模型锁池 / trange 宿主。
+  const at = s => new RealDate(NOW + s * 1000).toISOString();
+  sandbox.renderAccounts([{
+    uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+    last_success: '2026-09-28T13:00:00Z',
+    today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+    token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  }]);
+  out.accounts = els.accBody.innerHTML;
+  sandbox.renderModelLocks([
+    { model: 'glm-5.3', realm: 'cn', total: 5, servable: 0, locked: 5, state: 'locked',
+      unlock_at: at(3600), fully_unlock_at: at(9000), reason: '上游 <429> 额度不足 & 稍后重试' },
+  ]);
+  out.locks = els.mlBody.innerHTML;
+  out.lockNote = els.mlNote.textContent;
+  sandbox.go('usage');
+  await tick();
+  out.usRange = els.usRange.innerHTML;
+  out.usageUrl = urls.filter(u => u.startsWith('usage?')).slice(-1)[0] || '';
+  return out;
+})().then(out => {
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+}, e => {
+  console.log('EXPIRY FRESHNESS FAIL: ' + (e && e.stack ? e.stack : e));
+  process.exit(1);
+});`
+	f, err := os.CreateTemp(t.TempDir(), "expiry-fresh-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("expiry freshness node test failed: %v\n%s", err, out)
+	}
+	got := map[string]any{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("expiry freshness output is not JSON: %v\n%s", err, out)
+	}
+	str := func(k string) string { s, _ := got[k].(string); return s }
+	boolean := func(k string) bool { b, _ := got[k].(bool); return b }
+	num := func(k string) float64 { n, _ := got[k].(float64); return n }
+
+	if num("freshMs") != 120000 {
+		t.Errorf("EXP_FRESH_MS = %v，期望 120000（2 分钟，取自上游 acb3830）", num("freshMs"))
+	}
+	if num("deepLinkCount") != 1 {
+		t.Errorf("深链 #accounts 首屏应恰好请求一次 packages，实际 %v 次", num("deepLinkCount"))
+	}
+	if !strings.Contains(str("deepLinkList"), "今天到期") {
+		t.Errorf("首屏卡片未渲染出到期批次：%s", str("deepLinkList"))
+	}
+	if !strings.Contains(str("deepLinkNote"), "1 个账号 · 实时查询上游") {
+		t.Errorf("首屏 #expNote 应说明数据是实时的：%q", str("deepLinkNote"))
+	}
+	if !boolean("reuseOnEnter") {
+		t.Error("新鲜窗口内切回账号管理视图不应重复请求上游")
+	}
+	if !boolean("reuseExplicit") {
+		t.Error("新鲜窗口内再调 loadExpiry() 不应重复请求上游")
+	}
+	if num("staleRefetch") != 1 {
+		t.Errorf("越过 %vms 新鲜窗口后应重取一次，实际 %v 次", num("freshMs"), num("staleRefetch"))
+	}
+	if num("forceRefetch") != 1 {
+		t.Errorf("force（「检查」按钮）应忽略缓存重取一次，实际 %v 次", num("forceRefetch"))
+	}
+	if num("dupRefetch") != 1 {
+		t.Errorf("在途去重失效：连点两次发了 %v 次请求", num("dupRefetch"))
+	}
+	if num("crossViewPackagesFetch") != 1 {
+		t.Errorf("「积分构成」视图进视图应取一次数，实际 %v 次", num("crossViewPackagesFetch"))
+	}
+	if !boolean("crossViewReuse") {
+		t.Error("从「积分构成」切到账号管理时未复用刚取到的数据（lastPackagesAt 没盖时间戳）")
+	}
+
+	// 取数失败：旧数据保留 + note 说明；首屏失败不留「查询中…」占位。
+	if num("failRefetch") != 1 {
+		t.Errorf("force 失败时也应发出一次请求，实际 %v 次", num("failRefetch"))
+	}
+	if !strings.HasPrefix(str("failNote"), "查询失败：上游超时") {
+		t.Errorf("失败后 #expNote 应说明原因，实际 %q", str("failNote"))
+	}
+	if !boolean("failKeepsData") {
+		t.Errorf("一次取数失败不应把已有卡片清空（应继续显示上一次的数据）")
+	}
+
+	// 回归红线。
+	if !strings.Contains(str("accounts"), `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
+		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", str("accounts"))
+	}
+	if !strings.Contains(str("locks"), "glm-5.3") || !strings.Contains(str("locks"), `整池不可用`) ||
+		!strings.Contains(str("locks"), `上游 &lt;429&gt; 额度不足 &amp; 稍后重试`) {
+		t.Errorf("模型锁池表渲染异常：%s（note=%q）", str("locks"), str("lockNote"))
+	}
+	if !strings.Contains(str("usRange"), `class="tr-preset"`) || strings.Count(str("usRange"), "<option") != 7 {
+		t.Errorf("时间范围控件未渲染出 7 个预设：%s", str("usRange"))
+	}
+	if str("usageUrl") != "usage?hours=72" {
+		t.Errorf("默认时间范围应仍是「近 3 天」：%q", str("usageUrl"))
+	}
+}
+
+// TestIndexExpiryCardHost 到期卡片的宿主与位置：卡片必须在 #view-accounts 内、
+// 账号表之前（上游位置），不新增导航项；四个挂钩 id 缺一个都会让卡片人间蒸发
+// （app.js 侧是 if ($('expBox')) 守卫写法，删掉宿主不会报错、测试也不会红）。
+// 另钉住 app.js 的缓存声明顺序：顶层 go() 会同步读 lastPackages，声明挪到文件
+// 底部就是 TDZ ReferenceError（整页白屏，Go 侧其它测试全绿）。
+func TestIndexExpiryCardHost(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	viewAt := strings.Index(body, `<section class="view" id="view-accounts">`)
+	nextView := strings.Index(body, `id="view-taskscenter"`)
+	cardAt := strings.Index(body, `<div class="box" id="expBox" hidden>`)
+	tableAt := strings.Index(body, `<tbody id="accBody">`)
+	if viewAt < 0 || nextView <= viewAt || cardAt < 0 || tableAt < 0 {
+		t.Fatalf("index.html 结构变了：view=%d next=%d card=%d table=%d", viewAt, nextView, cardAt, tableAt)
+	}
+	if cardAt < viewAt || cardAt > nextView {
+		t.Errorf("到期卡片不在 #view-accounts 内（card=%d view=%d next=%d）", cardAt, viewAt, nextView)
+	}
+	if tableAt < cardAt {
+		t.Error("到期卡片应在账号表上方（与上游同位置：统计条之下、账号池之上）")
+	}
+	card := body[cardAt:nextView]
+	for _, want := range []string{
+		`<h3>积分到期提醒<span class="hint">`,
+		`FEFO`, // 结论口径写进 hint，卡片里也能看到
+		`<span class="note" id="expNote"></span>`,
+		`<div id="expList"></div>`,
+		`<button class="xs" id="btnExp"`,
+	} {
+		if !strings.Contains(card, want) {
+			t.Errorf("到期卡片缺少 %s", want)
+		}
+	}
+	for _, m := range regexp.MustCompile(`style="[^"]*"`).FindAllString(card, -1) {
+		if !strings.HasPrefix(m, `style="--`) {
+			t.Errorf("到期卡片有静态内联样式：%s", m)
+		}
+	}
+
+	js, err := os.ReadFile("app.js")
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := string(js)
+	declAt := strings.Index(src, "let lastPackages = null, lastPackagesLimit;")
+	goAt := strings.Index(src, "function go(v) {")
+	if declAt < 0 || goAt < 0 || declAt > goAt {
+		t.Fatalf("积分包缓存的声明必须在 go() 之前（decl=%d go=%d）：顶层 go() 会同步读它，挪到后面就是 TDZ", declAt, goAt)
+	}
+	for _, want := range []string{
+		`if (v === 'accounts') loadExpiry();`,
+		`let lastPackagesAt = 0;`,
+		`const EXP_FRESH_MS = 2 * 60 * 1000;`,
+		`function expBatches(packs)`,
+		`function expDaysLeft(dateStr, today)`,
+		`function renderExpiry(d)`,
+		`async function loadExpiry(force)`,
+		`if ($('btnExp')) $('btnExp').onclick = () => loadExpiry(true);`,
+		`lastPackagesAt = Date.now();`,                    // 两条取数路径都要盖时间戳
+		`pkAccountColorMap(list)`,                         // 账号配色与积分构成共用
+		`class="pk-expiry-empty"`,                         // 空态复用既有样式
+		`'<div class="pk-expiry-empty">读取失败：' + esc(msg)`, // 首屏失败不留「查询中…」占位
+	} {
+		if !strings.Contains(src, want) {
+			t.Errorf("app.js 缺少到期卡片的相关实现：%s", want)
+		}
+	}
 }
