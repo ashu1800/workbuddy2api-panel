@@ -65,6 +65,167 @@ func TestArchiveRotationReadAndFilter(t *testing.T) {
 	}
 }
 
+// ReadArchive 的契约是「按事件时间倒序返回最近记录」，与归档文件的 mtime 无关。
+// 快速轮转（FileMaxBytes 很小）时同一秒内会写出多个文件，Linux 下这些文件的 mtime
+// 可能完全相同；把归档目录整体拷贝 / 恢复备份也会打乱 mtime。此用例把所有归档文件的
+// mtime 改成与事件时间相反的顺序，钉住「只能按事件时间排序」。
+func TestReadArchiveOrdersByEventTimeNotFileMtime(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, FileMaxBytes: 1, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Hour)
+	const n = 5
+	for i := 0; i < n; i++ {
+		r.Record(Event{
+			Time:      base.Add(time.Duration(i) * time.Second),
+			RequestID: "ev-" + string(rune('a'+i)),
+			Model:     "glm-5.3",
+			Status:    200,
+			OK:        true,
+			Outcome:   OutcomeSuccess,
+		})
+	}
+	r.Close()
+
+	// FileMaxBytes=1 让每个事件独占一个归档文件：基准文件 requests-<day>.jsonl 装的是
+	// 最早的事件，字典序却排在 requests-<day>.N.jsonl 之后。按 os.ReadDir 顺序递增地
+	// 设置 mtime，最早事件所在文件就拿到最大 mtime、被放在最后读取。
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != n {
+		t.Fatalf("归档文件数 = %d, want %d", len(entries), n)
+	}
+	stamp := time.Unix(1700000000, 0)
+	for i, e := range entries {
+		ts := stamp.Add(time.Duration(i) * time.Second)
+		if err := os.Chtimes(filepath.Join(dir, e.Name()), ts, ts); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	rows, err := r.ReadArchive(n, Filter{Model: "glm"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(rows))
+	for _, e := range rows {
+		got = append(got, e.RequestID)
+	}
+	if len(rows) != n {
+		t.Fatalf("rows = %d, want %d", len(rows), n)
+	}
+	for i := range rows {
+		want := "ev-" + string(rune('a'+n-1-i))
+		if rows[i].RequestID != want {
+			t.Fatalf("rows[%d] = %s, want %s（须按事件时间倒序，与文件 mtime 无关）\n got %v", i, rows[i].RequestID, want, got)
+		}
+	}
+}
+
+// 来源字段随事件落盘并可被 client_ip / user_agent 过滤（包含匹配、大小写不敏感）。
+func TestArchiveFilterByClientInfo(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 7})
+	base := time.Now().Add(-time.Minute)
+	rows := []Event{
+		{RequestID: "a", Model: "glm-5.3", Status: 200, OK: true, Outcome: OutcomeSuccess,
+			ClientIP: "203.0.113.7", UserAgent: "python-requests/2.31.0"},
+		{RequestID: "b", Model: "glm-5.3", Status: 200, OK: true, Outcome: OutcomeSuccess,
+			ClientIP: "198.51.100.4", UserAgent: "Mozilla/5.0 Chrome/120.0.0.0"},
+		{RequestID: "c", Model: "glm-5.3", Status: 200, OK: true, Outcome: OutcomeSuccess},
+	}
+	for i, e := range rows {
+		e.Time = base.Add(time.Duration(i) * time.Second)
+		r.Record(e)
+	}
+	r.Close()
+
+	got, err := r.ReadArchive(10, Filter{ClientIP: "203.0.113."})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "a" {
+		t.Fatalf("client ip filter = %+v", got)
+	}
+	if got[0].UserAgent != "python-requests/2.31.0" {
+		t.Fatalf("user agent not persisted: %+v", got[0])
+	}
+
+	// UA 片段过滤大小写不敏感（面板搜索框直接传用户输入）。
+	got, err = r.ReadArchive(10, Filter{UserAgent: "chrome/120"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || got[0].RequestID != "b" {
+		t.Fatalf("ua filter = %+v", got)
+	}
+
+	// 来源为空的旧事件不该被非空来源条件误命中。
+	got, err = r.ReadArchive(10, Filter{ClientIP: "10.0.0.1"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("unmatched ip filter = %+v", got)
+	}
+}
+
+// 时间区间过滤（「今天」/「自定义」）：闭区间，任一侧为零值即该侧不设界。
+func TestArchiveFilterByTimeRange(t *testing.T) {
+	dir := t.TempDir()
+	r := New(Config{Enabled: true, Dir: dir, MaxBytes: 1 << 20, RetentionDays: 30})
+	base := time.Now().Add(-72 * time.Hour).Truncate(time.Minute)
+	ids := []string{"d3", "d2", "d1", "now"}
+	for i, id := range ids {
+		r.Record(Event{
+			Time: base.Add(time.Duration(i) * 24 * time.Hour), RequestID: id,
+			Status: 200, OK: true, Outcome: OutcomeSuccess,
+		})
+	}
+	r.Close()
+
+	rows, err := r.ReadArchive(10, Filter{From: base.Add(24 * time.Hour), To: base.Add(48 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := make([]string, 0, len(rows))
+	for _, e := range rows {
+		got = append(got, e.RequestID)
+	}
+	// 倒序返回，闭区间命中 d2、d1。
+	if len(got) != 2 || got[0] != "d1" || got[1] != "d2" {
+		t.Fatalf("时间区间过滤 = %v, want [d1 d2]", got)
+	}
+
+	onlyFrom, err := r.ReadArchive(10, Filter{From: base.Add(48 * time.Hour)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyFrom) != 2 || onlyFrom[0].RequestID != "now" {
+		t.Fatalf("仅 From 过滤 = %+v, want 2 条（d1、now）", onlyFrom)
+	}
+
+	onlyTo, err := r.ReadArchive(10, Filter{To: base})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(onlyTo) != 1 || onlyTo[0].RequestID != "d3" {
+		t.Fatalf("仅 To 过滤 = %+v, want 仅 d3", onlyTo)
+	}
+
+	// 时间区间与其它条件是与关系。
+	combined, err := r.ReadArchive(10, Filter{
+		From: base.Add(24 * time.Hour), To: base.Add(48 * time.Hour), Outcome: OutcomeHTTPError,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(combined) != 0 {
+		t.Fatalf("区间+结果组合应为空（这几条都是成功）: %+v", combined)
+	}
+}
+
 func TestArchiveQueueDropCounter(t *testing.T) {
 	w := &archiveWriter{
 		cfg:  Config{Enabled: true, Dir: t.TempDir()},

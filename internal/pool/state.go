@@ -82,6 +82,7 @@ func (p *Pool) Revive(uid string) bool {
 		return false
 	}
 	e.disabled = false
+	e.paused = false // 解冻是全清：暂停选号一并解除
 	e.until = time.Time{}
 	e.coolKind = 0
 	e.reason = ""
@@ -92,6 +93,33 @@ func (p *Pool) Revive(uid string) bool {
 	e.retryCount = 0
 	e.breakerUntil = time.Time{}
 	p.dirty.Store(true)
+	return true
+}
+
+// Pause 暂停选号：账号退出选号候选，但**照常参与**签到 / 活跃上报 / 保活 / 余额刷新。
+// 与 Disable 的区别：不写 reason、不清冷却域、不重置任何计数——账号是「临时让位」
+// 而非「判死」，故无需重登或人工解冻，Resume 即可立刻恢复。
+// uid 不存在返回 false（供调用方区分"账号不存在"与"已暂停"）。
+func (p *Pool) Pause(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.pauseLocked(e)
+	return true
+}
+
+// Resume 解除暂停选号（幂等，对未暂停账号为空操作）。uid 不存在返回 false。
+func (p *Pool) Resume(uid string) bool {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	e, ok := p.byUID[uid]
+	if !ok {
+		return false
+	}
+	p.resumeLocked(e)
 	return true
 }
 
@@ -384,6 +412,17 @@ func (p *Pool) PickByUIDForModel(uid, model string) *auth.Auth {
 	if !e.healthyForModel(now, model) {
 		return nil
 	}
+	// 积分保底（粘性路径）：与 pick 的 floorBlocked 同判据——触底 + 收费即拦
+	// （判据含上游目录倍率兜底，realm 取账号所属域——粘性号已确定，无需外部传入）。
+	// 返回 nil 后 handler 侧解绑粘性（unbindSticky）走普通轮换换号，粘性号回血
+	// 后下次会话重新绑定。
+	// 日志频次：天然每请求至多一条——首次返回 nil 即解绑，后续轮转不再调入本路径
+	// （无需额外节流）；粘性续期中每个新请求一条，恰好是「余额仍在线下」的持续提醒。
+	if p.floorBlockedForRealmModel(e, model, e.a.Realm(), now) {
+		log.Printf("WARN: [pool] credit floor: sticky acct=%s model=%s credits=%d < floor=%d, unbind (paid model held out)",
+			logfmt.Label(e.a.UID, e.a.Nickname), model, e.credits, p.creditFloor)
+		return nil
+	}
 	if p.inFlightFull(e) {
 		return nil
 	}
@@ -441,7 +480,9 @@ func (p *Pool) countsDetailedForRealm(realm string) (total, healthy, cooling, di
 		}
 		total++
 		switch {
-		case e.disabled:
+		case e.disabled || e.paused:
+			// paused（暂停选号）与 disabled 同样不可选，合并计入 disabled 类
+			//（/status 的「不可用」口径）；细粒度区分由 Status.Paused 透出。
 			disabled++
 		case !e.healthy(now):
 			cooling++
@@ -521,6 +562,7 @@ func (p *Pool) statusOf(uid string, e *entry) Status {
 		Cooling:                  now.Before(e.until) || now.Before(e.breakerUntil),
 		Reason:                   e.reason,
 		Disabled:                 e.disabled,
+		Paused:                   e.paused,
 		SuccessCount:             e.successCount,
 		ErrTotal:                 e.errTotal,
 		CheckinDone:              e.lastCheckinDay == now.Format("2006-01-02"),

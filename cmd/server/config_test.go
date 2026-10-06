@@ -56,12 +56,23 @@ func TestLoggingDefaults(t *testing.T) {
 	if !c.Logging.RequestArchiveEnabled || c.Logging.RequestRetentionDays != 7 || c.Logging.RequestArchiveMaxMB != 100 {
 		t.Fatalf("logging defaults = %+v", c.Logging)
 	}
+	// 来源记录（IP/UA）缺省开启：键缺席时必须保持 true，只有显式 false 才关闭。
+	if !c.Logging.RequestClientInfo {
+		t.Fatalf("request_client_info default = false, want true: %+v", c.Logging)
+	}
 	configured, err := ParseConfig([]byte(`{"logging":{"request_archive_enabled":false,"request_retention_days":30,"request_archive_max_mb":500}}`))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if configured.Logging.RequestArchiveEnabled || configured.Logging.RequestRetentionDays != 30 || configured.Logging.RequestArchiveMaxMB != 500 {
 		t.Fatalf("configured logging = %+v", configured.Logging)
+	}
+	off, err := ParseConfig([]byte(`{"logging":{"request_client_info":false}}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if off.Logging.RequestClientInfo {
+		t.Fatalf("explicit false ignored: %+v", off.Logging)
 	}
 	fallback, err := ParseConfig([]byte(`{"logging":{"request_retention_days":0,"request_archive_max_mb":0}}`))
 	if err != nil {
@@ -801,5 +812,50 @@ func TestLoadConfigPathIsDirectory(t *testing.T) {
 	}
 	if !strings.Contains(msg, "config.example.json") {
 		t.Errorf("error should suggest the fix (cp config.example.json): %v", err)
+	}
+}
+
+// TestServerReadTimeout 入站读取上限（issue #100）：空值回落默认 300s；
+// "0" = 显式不限制（0 是合法值不回落）；负值 fail fast（静默钳 0 会把保护悄悄关掉）。
+func TestServerReadTimeout(t *testing.T) {
+	c := Default()
+	if c.Server.ReadTimeout != "300s" {
+		t.Errorf("default read_timeout=%q want 300s", c.Server.ReadTimeout)
+	}
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 300*time.Second {
+		t.Errorf("default dur=%v want 300s", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "" // 显式清空 = 未配置 → 回落默认
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize empty: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 300*time.Second {
+		t.Errorf("empty dur=%v want 300s", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "0" // 显式 0 = 不限制（http.Server ReadTimeout 0 即无超时）
+	if err := c.normalize(); err != nil {
+		t.Fatalf("normalize zero: %v", err)
+	}
+	if c.ServerReadTimeoutDur != 0 {
+		t.Errorf("zero dur=%v want 0", c.ServerReadTimeoutDur)
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "-5s"
+	if err := c.normalize(); err == nil {
+		t.Error("negative read_timeout should fail fast")
+	}
+
+	c = Default()
+	c.Server.ReadTimeout = "bogus"
+	if err := c.normalize(); err == nil {
+		t.Error("unparsable read_timeout should fail fast")
 	}
 }
