@@ -335,9 +335,11 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
 }
 /* 账号表的高度预算是「撑满视口剩余高度」——上方插入「积分到期提醒」卡片后，必须把
    卡片的实测高度一起扣掉，否则表底会被顶出首屏。卡片高度随到期批次在「空态一行」到
-   「150px 内滚」之间变化，写死常数不是留白就是溢出，故由 app.js 的 syncExpHeight 把
-   实测值写进 --exp-h；取不到实测值（无布局环境）时按 0 算，即与加卡片前一致。 */
-#view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 251px - var(--exp-h, 0px))); }
+   「120px 内滚」之间变化，写死常数不是留白就是溢出，故由 app.js 的 syncExpHeight 把
+   实测值写进 --exp-h；取不到实测值（无布局环境）时按 0 算，即与加卡片前一致。
+   267 = 原有的 251 + 卡片下方的 16px 间距：--exp-h 只量卡片自身（getBoundingClientRect
+   不含 margin），不补这 16px 就会稳定多算一行的高度，把表底顶到视口外。 */
+#view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 267px - var(--exp-h, 0px))); }
 #view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 239px)); }
 .dlg .tbl-wrap { max-height: none; overflow: visible; }
 .acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
@@ -670,9 +672,14 @@ th.num, td.num { text-align: right; }
    轨道/图例/脚注/空态），只把列加宽：这边一行是「一个到期日」的汇总，比积分构成
    那张图多两列（面额、账号数），72+52+68+76+52 是这些列在 11px 字号下的内容宽。 */
 #view-accounts .pk-expiry-hdr,
-#view-accounts .pk-expiry-row { grid-template-columns: 72px 52px minmax(80px, 1fr) 68px 76px 52px; }
-/* 卡片就在账号表上方，行数多时卡内滚动（≈5 行）而不是把表一路推下去。 */
-#view-accounts .pk-expiry-chart { max-height: 150px; }
+#view-accounts .pk-expiry-row { grid-template-columns: minmax(72px, auto) 52px minmax(80px, 1fr) 68px 76px 52px; }
+/* 首列用 minmax(72px, auto) 而不是写死 72px：文案会随天数变长（「100 天后到期」约 78px），
+   固定宽度会被撑破并把整个网格挤歪。 */
+#view-accounts .pk-expiry-hdr > span:first-child,
+#view-accounts .pk-expiry-row > span:first-child { min-width: 72px; }
+/* 卡片就在账号表上方，行数多时卡内滚动（≈4 行）而不是把表一路推下去：900px 高的视口里
+   统计条 + 卡片 + 账号表 + 模型锁池本就装不下，卡片每多一行都在把后面的内容往下推。 */
+#view-accounts .pk-expiry-chart { max-height: 120px; }
 /* 危险度落在「剩余天数」的文字上（表格布局没有色点位置）：≤3 天红（不抓紧就真
    没了）、≤7 天琥珀、更远绿——与上游色点的判据完全一致。 */
 #view-accounts .pk-expiry-days { font-weight: 600; }

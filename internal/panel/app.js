@@ -2627,6 +2627,10 @@ function renderUsageChart(series) {
     return;
   }
 
+  // PL 保持原值（绘图区宽度不变）；轴刻度文字改成收在「首根柱子左边缘再往左 4px」处
+  // ——柱子以刻度为中心（x = cx - bw/2），首根最左能到 PL - 15（bw ≤ 30），而刻度文字
+  // 原来收在 PL - 6，于是 `547.2k` 的末位被柱子压住。把标签左移半个柱宽 + 4px 余量后，
+  // 文字右缘恒在柱左缘之左，6 字符的最长标签（约 24 单位）也不会被裁出画布。
   const W = 760, H = 180, PL = 52, PR = 12, PT = 12, PB = 30;
   const iw = W - PL - PR, ih = H - PT - PB;
 
@@ -2659,7 +2663,8 @@ function renderUsageChart(series) {
     const y = PT + ih - (ih * i / 4);
     out += '<line class="gl" x1="' + PL + '" y1="' + y.toFixed(1) + '" x2="' + (W - PR) +
            '" y2="' + y.toFixed(1) + '"/>';
-    out += '<text class="tk" x="' + (PL - 6) + '" y="' + (y + 3.5).toFixed(1) +
+    // 刻度文字右缘 = PL - 4 - bw/2（首根柱子的左边缘再往左 4px），见上方常量处的注释
+    out += '<text class="tk" x="' + (PL - 4 - bw / 2).toFixed(1) + '" y="' + (y + 3.5).toFixed(1) +
            '" text-anchor="end">' + fmtTok(max * i / 4) + '</text>';
   }
 
