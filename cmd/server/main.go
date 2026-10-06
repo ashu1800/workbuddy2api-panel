@@ -31,10 +31,13 @@ import (
 )
 
 // appVersion 网关版本（fork 版：面板 + 任务体系），透出到 /panel/api/overview。
-// 1.14.0：合并上游 linguo2625469/workbuddy2api-panel 至其 1.12.0（52 个提交）——
-// 模型锁池视图、用量页排版重构（请求来源/时间区间）、积分到期卡片、吐字速率扣除首字、
-// 模型级阻塞不再伪装成无可用账号、暂停选号 paused、积分保底 credit_floor、上游超时止损等；
-// 同时保留本 fork 的面板视觉重构、自然日口径、账号表新增列与用量列 7.10M 格式。
+// 1.14.0：合并上游 linguo2625469/workbuddy2api-panel 至其 1.12.0（52 个提交）。后端全量采纳：
+// 吐字速率扣除首字（#34）、模型级阻塞不再伪装成无可用账号（#102）、bad_params 立即 400、
+// 上游超时止损、成功与粘性绑定延后到真成功、error 帧按内容处置、暂停选号 paused、积分保底
+// credit_floor、虚拟实例权重分配快过期账号、调度与探测修复、前缀缓存命中率等。
+// 面板按功能重写到本 fork 的设计系统上：模型锁池表、缓存命中率、调用来源 IP/UA、
+// 时间范围控件、暂停/恢复选号入口、配置表单补 credit_floor 与 include_disabled_in_tasks、
+// 积分构成排序切换；同时保留本 fork 的视觉重构、自然日口径、账号表新增列与用量列 7.10M 格式。
 const appVersion = "1.14.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
