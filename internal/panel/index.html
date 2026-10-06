@@ -542,6 +542,25 @@ th.num, td.num { text-align: right; }
 .us-wrapbar .bar-p { background: var(--chart-1); }
 .us-wrapbar .bar-c { background: var(--chart-2); }
 
+/* ── 时间范围控件（用量 / 请求记录共用）────────────────────────────────
+   预设下拉 + 「自定义」时展开的起止时间。整组是 inline-flex 且允许换行：
+   自定义态在窄屏下整体折到下一行，而不是把标题挤扁。
+   select / input 必须显式写回 width:auto —— 全局 input/select 是 width:100%
+   （栅格用的），这里不在 .box > header 的直接子级上，那个 width:auto 豁免
+   够不到，控件会被拉满整行。高度对齐 button.xs（26px）。 */
+.trange { display: inline-flex; align-items: center; gap: var(--sp-1); flex-wrap: wrap; }
+.trange .tr-custom { display: inline-flex; align-items: center; gap: var(--sp-1); }
+.trange .tr-sep { color: var(--ink-3); font-size: var(--fs-12); }
+.trange select, .trange input {
+  width: auto; height: 26px; padding: 0 var(--sp-2); font-size: var(--fs-12); border-radius: var(--r-sm);
+}
+.trange input[type="datetime-local"] { font-family: var(--mono); }
+/* 原生日期选择器的弹出面板要跟随明暗主题，否则深色下是一块刺眼的白。 */
+.trange input[type="datetime-local"] { color-scheme: light; }
+[data-theme="dark"] .trange input[type="datetime-local"] { color-scheme: dark; }
+/* 起止颠倒：就地标红，与 input.invalid 同款语义色（不靠文字提示）。 */
+.trange .tr-bad { border-color: var(--bad); background: var(--bad-soft); }
+
 /* ════════════════════════════════════════════════════════════════════════
    9. 积分构成
    ════════════════════════════════════════════════════════════════════════ */
@@ -901,13 +920,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
           <h3>用量总览</h3>
           <span class="grow"></span>
           <span class="note" id="usNote">—</span>
-          <select id="usWindow" class="xs auto">
-            <option value="today">今天</option>
-            <option value="72" selected>近 3 天</option>
-            <option value="168">近 7 天</option>
-            <option value="720">近 30 天</option>
-            <option value="0">全部历史</option>
-          </select>
+          <span class="trange" id="usRange"></span>
           <button class="xs" id="btnUsage">刷新</button>
         </header>
         <div class="stats" id="usStats"></div>
@@ -1205,6 +1218,7 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
         <header>
           <h3>请求指标</h3>
           <span class="note" id="reqSummary">—</span>
+          <span class="trange" id="reqRange"></span>
           <span class="grow"></span>
           <span class="note" id="reqNote">—</span>
         </header>

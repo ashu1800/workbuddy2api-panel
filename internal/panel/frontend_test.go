@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestAppJSSyntax app.js 必须能通过 JS 解析器语法校验。
@@ -92,7 +93,7 @@ const sandbox = new Proxy({
   addEventListener() {}, removeEventListener() {},
   matchMedia: () => ({ matches: false, addEventListener() {} }),
   setInterval, clearInterval, setTimeout, clearTimeout,
-  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, Symbol, Proxy, Reflect,
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
 }, { get(t, k) { return t[k]; }, has() { return true; } });
 sandbox.window = sandbox; sandbox.globalThis = sandbox;
 vm.createContext(sandbox);
@@ -662,37 +663,77 @@ func TestIndexDialogsAccessible(t *testing.T) {
 	}
 }
 
-// TestAppJSWindowHours 用量窗口「今天」的换算：后端窗口是 [当前整点-(hours-1)h, now]，
-// 所以只有取「当前小时 + 1」才恰好从今天 00:00 起算。算错不会报错，只会静默地多算
-// 或少算几个小时（页面上表现为数字偏一点，很难发现），故用固定时刻钉住。
-func TestAppJSWindowHours(t *testing.T) {
+// TestAppJSTrangeQuery 时间范围控件（trange，本批从上游移植）的预设 → 查询参数映射，
+// 以及「今天」的自然日口径：
+//   - 「今天」发**浏览器本地时区**的 00:00（服务端时区未必一致），且不带 to
+//     ——多发一个 to=now 会把正在走的那个小时桶切掉半截；
+//   - 滚动预设（用量页）发 hours，服务端按整点对齐，与旧口径逐位一致；
+//   - 「近 N 天」在归档侧（请求记录页）折算成 from：归档是线性日志，没有整点对齐；
+//   - 「全部历史」在用量侧必须显式发 hours=0：后端把"没给参数"当作默认 72 小时，
+//     什么都不发会让「全部历史」静默退化成「近 3 天」（上游正是在这里漏了）；
+//     归档侧没有 hours 口径，什么都不发 = 与移植前的默认展示完全一致。
+//
+// 时刻与 Date.now 都钉死：自然日口径只差几个小时，漂着测等于没测。
+// 旧的 windowHours（today → 当前小时+1 的整点窗口）已随本次移植删除——起点改由
+// 浏览器精确给出，不再依赖"面板与服务端同时区"这一隐含前提。
+func TestAppJSTrangeQuery(t *testing.T) {
 	node, err := exec.LookPath("node")
 	if err != nil {
-		t.Skip("node not installed; JS window-hours check skipped")
+		t.Skip("node not installed; trange query check skipped")
 	}
-	raw, err := os.ReadFile("app.js")
-	if err != nil {
-		t.Fatal(err)
-	}
-	text := string(raw)
-	start := strings.Index(text, "function windowHours")
-	end := strings.Index(text, "async function loadUsage")
-	if start < 0 || end <= start {
-		t.Fatal("windowHours slice not found in app.js")
-	}
-	script := text[start:end] + `
-const at = (h, m) => new Date(2026, 8, 30, h, m, 0);
-console.log(JSON.stringify({
-  midnight: windowHours('today', at(0, 5)),
-  morning: windowHours('today', at(9, 30)),
-  afternoon: windowHours('today', at(14, 30)),
-  lateNight: windowHours('today', at(23, 30)),
-  days3: windowHours('72'),
-  allHistory: windowHours('0'),
-  missing: windowHours(undefined),
-  garbage: windowHours('abc'),
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const TRANGE_PRESETS');
+const end = src.indexOf('function go(v)');
+if (start < 0 || end <= start) throw new Error('trange block not found in app.js');
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-30T14:30:00'); // 本地时区 14:30
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const host = { innerHTML: '', querySelector: () => null };
+const ctx = {
+  Date: FakeDate, Number, String, Boolean, Math, Map, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
+  URLSearchParams, esc: s => String(s == null ? '' : s),
+  $: () => host,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.trangeState=trangeState; this.trangeQuery=trangeQuery; this.trangeLabel=trangeLabel; this.trangeMidnight=trangeMidnight;', ctx);
+const q = (preset, rolling) => { ctx.trangeState('t').preset = preset; return ctx.trangeQuery('t', rolling).toString(); };
+const custom = (from, to, rolling) => {
+  const st = ctx.trangeState('t');
+  st.preset = 'custom';
+  st.from = from === null ? null : new RealDate(from);
+  st.to = to === null ? null : new RealDate(to);
+  return ctx.trangeQuery('t', rolling).toString();
+};
+const m0 = ctx.trangeMidnight();
+const label = preset => { ctx.trangeState('t').preset = preset; return ctx.trangeLabel('t'); };
+process.stdout.write(JSON.stringify({
+  midnightLocal: [m0.getFullYear(), m0.getMonth(), m0.getDate(), m0.getHours(), m0.getMinutes()].join(','),
+  today: q('today', true),
+  todayLogs: q('today', false),
+  roll24: q('24', true),
+  roll72: q('72', true),
+  roll168: q('168', true),
+  roll720: q('720', true),
+  allRolling: q('0', true),
+  allLogs: q('0', false),
+  logs24: q('24', false),
+  logs7d: q('168', false),
+  customBoth: custom('2026-09-30T09:00:00', '2026-09-30T18:30:00', true),
+  customFromOnly: custom('2026-09-30T09:00:00', null, false),
+  customToOnly: custom(null, '2026-09-30T18:30:00', false),
+  labelToday: label('today'),
+  label3d: label('72'),
+  labelAll: label('0'),
+  labelCustom: (function () { custom('2026-09-30T09:00:00', '2026-09-30T18:30:00', true); return label('custom'); })(),
+  labelCustomEmpty: (function () { custom(null, null, true); return label('custom'); })(),
 }));`
-	f, err := os.CreateTemp(t.TempDir(), "wh-*.cjs")
+	f, err := os.CreateTemp(t.TempDir(), "trange-*.cjs")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -700,13 +741,527 @@ console.log(JSON.stringify({
 		t.Fatal(err)
 	}
 	f.Close()
-	out, err := exec.Command(node, f.Name()).CombinedOutput()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
 	if err != nil {
-		t.Fatalf("windowHours node check failed: %v\n%s", err, out)
+		t.Fatalf("trange query node check failed: %v\n%s", err, out)
 	}
-	const want = `{"midnight":1,"morning":10,"afternoon":15,"lateNight":24,"days3":72,"allHistory":0,"missing":72,"garbage":72}`
+	// 期望值用 Go 的 time.Local 算：node 与 Go 取同一个系统时区。
+	local := func(d time.Duration) string {
+		return strconv.FormatInt(time.Date(2026, 9, 30, 14, 30, 0, 0, time.Local).Add(d).Unix(), 10)
+	}
+	sec := func(h, m int) string {
+		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
+	}
+	want := `{"midnightLocal":"2026,8,30,0,0",` +
+		`"today":"from=` + sec(0, 0) + `",` +
+		`"todayLogs":"from=` + sec(0, 0) + `",` +
+		`"roll24":"hours=24","roll72":"hours=72","roll168":"hours=168","roll720":"hours=720",` +
+		`"allRolling":"hours=0","allLogs":"",` +
+		`"logs24":"from=` + local(-24*time.Hour) + `",` +
+		`"logs7d":"from=` + local(-168*time.Hour) + `",` +
+		`"customBoth":"from=` + sec(9, 0) + `&to=` + sec(18, 30) + `",` +
+		`"customFromOnly":"from=` + sec(9, 0) + `",` +
+		`"customToOnly":"to=` + sec(18, 30) + `",` +
+		`"labelToday":"今天","label3d":"近 3 天","labelAll":"全部历史",` +
+		`"labelCustom":"9-30 09:00 → 9-30 18:30","labelCustomEmpty":"自定义"}`
 	if strings.TrimSpace(string(out)) != want {
-		t.Fatalf("windowHours=%s want %s", strings.TrimSpace(string(out)), want)
+		t.Fatalf("trange query=%s\nwant %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSTrangeControl 控件本身的渲染契约（node + DOM 桩）：
+//   - 七个预设齐全，当前项 selected；非自定义态下起止输入是 hidden（不占位）；
+//   - 切到自定义 → 展开起止两个 datetime-local 输入（精度到分钟）；
+//   - 起止颠倒 → 两个输入都加 .tr-bad（就地标红）且**不**发查询（把空区间打给
+//     服务端只会显示「暂无数据」，看不出是自己填反了）；
+//   - 绑定时不触发首次加载（首次加载由 go() 驱动，否则打开页面打两遍接口）。
+func TestAppJSTrangeControl(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; trange control check skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const TRANGE_PRESETS');
+const end = src.indexOf('function go(v)');
+if (start < 0 || end <= start) throw new Error('trange block not found in app.js');
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-30T14:30:00');
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+// 每个 (宿主, 选择器) 一个稳定 stub：trangeRender 每次重画都会重新 querySelector，
+// 同一对象复用才能让测试从"控件自己接上的 onchange"驱动，而不是直接改内部状态。
+const qcache = {};
+const mkEl = key => {
+  const classes = new Set();
+  const store = { key, value: '', classes, _onchange: null };
+  store.classList = {
+    add: c => classes.add(c), remove: c => classes.delete(c),
+    toggle: (c, on) => { const want = on === undefined ? !classes.has(c) : !!on; if (want) classes.add(c); else classes.delete(c); return want; },
+    contains: c => classes.has(c),
+  };
+  Object.defineProperty(store, 'onchange', { get: () => store._onchange, set: fn => { store._onchange = fn; } });
+  return store;
+};
+const host = { innerHTML: '', querySelector: sel => (qcache[sel] = qcache[sel] || mkEl(sel)) };
+const ctx = {
+  Date: FakeDate, Number, String, Boolean, Math, Map, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
+  URLSearchParams, esc: s => String(s == null ? '' : s),
+  $: () => host,
+};
+vm.createContext(ctx);
+vm.runInContext(src.slice(start, end) +
+  '\nthis.trangeState=trangeState; this.trangeQuery=trangeQuery; this.trangeRender=trangeRender; this.trangeBind=trangeBind;', ctx);
+let emits = 0;
+ctx.trangeBind('t', () => { emits++; });
+// innerHTML 是死字符串，真正的 DOM 会把 value 落回 input.value；这里按渲染出的
+// HTML 回填一次，后续才能在"用户改过的值"上触发 onchange。
+const syncInputs = () => {
+  const grab = cls => { const m = new RegExp('class="' + cls + '" value="([^"]*)"').exec(host.innerHTML); return m ? m[1] : ''; };
+  qcache['.tr-from'].value = grab('tr-from');
+  qcache['.tr-to'].value = grab('tr-to');
+};
+syncInputs();
+const htmlDefault = host.innerHTML;
+const emitsOnBind = emits;
+const preset = qcache['.tr-preset'];
+preset.value = 'custom';
+preset.onchange();
+syncInputs();
+const htmlCustom = host.innerHTML;
+const fromEl = qcache['.tr-from'], toEl = qcache['.tr-to'];
+const customInit = { from: fromEl.value, to: toEl.value, emits };
+fromEl.value = '2026-09-30T18:00';
+toEl.value = '2026-09-30T09:00';
+fromEl.onchange();
+const inverted = { bad: fromEl.classList.contains('tr-bad') && toEl.classList.contains('tr-bad'), emits, query: ctx.trangeQuery('t', true).toString() };
+toEl.value = '2026-09-30T19:30';
+toEl.onchange();
+const fixed = { bad: fromEl.classList.contains('tr-bad') || toEl.classList.contains('tr-bad'), emits, query: ctx.trangeQuery('t', true).toString() };
+const presetSel = qcache['.tr-preset'];
+presetSel.value = '24';
+presetSel.onchange();
+const html24 = host.innerHTML;
+process.stdout.write(JSON.stringify({ htmlDefault, emitsOnBind, htmlCustom, customInit, inverted, fixed, html24 }));`
+	f, err := os.CreateTemp(t.TempDir(), "trange-ctl-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("trange control node check failed: %v\n%s", err, out)
+	}
+	got := map[string]any{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("trange control output is not JSON: %v\n%s", err, out)
+	}
+	str := func(k string) string { s, _ := got[k].(string); return s }
+	num := func(k string) float64 { n, _ := got[k].(float64); return n }
+
+	// 默认态：七个预设、当前项 selected（用量页默认「近 3 天」由 TRANGE_DEFAULTS 给）、
+	// 自定义输入组 hidden。
+	def := str("htmlDefault")
+	for _, label := range []string{"今天", "近 24 小时", "近 3 天", "近 7 天", "近 30 天", "全部历史", "自定义…"} {
+		if !strings.Contains(def, ">"+label+"</option>") {
+			t.Errorf("预设缺少「%s」：%s", label, def)
+		}
+	}
+	if !strings.Contains(def, `<option value="72" selected>近 3 天</option>`) {
+		t.Errorf("默认预设不是近 3 天（selected 丢失）：%s", def)
+	}
+	if !strings.Contains(def, `<span class="tr-custom" hidden>`) {
+		t.Errorf("非自定义态下起止输入应 hidden：%s", def)
+	}
+	if strings.Contains(def, "style=") {
+		t.Errorf("控件 HTML 不得带内联样式：%s", def)
+	}
+	if num("emitsOnBind") != 0 {
+		t.Errorf("trangeBind 不应触发首次加载（会打两遍接口），实际触发 %v 次", num("emitsOnBind"))
+	}
+
+	// 自定义态：展开起止输入、值 = 今天 00:00 → 现在（本地 14:30），并触发一次查询。
+	cus := str("htmlCustom")
+	if !strings.Contains(cus, `<span class="tr-custom">`) || strings.Contains(cus, "tr-custom\" hidden") {
+		t.Errorf("切到自定义后起止输入未展开：%s", cus)
+	}
+	if !strings.Contains(cus, `<option value="custom" selected>自定义…</option>`) {
+		t.Errorf("自定义项未成为当前项：%s", cus)
+	}
+	if !strings.Contains(cus, `class="tr-from" value="2026-09-30T00:00"`) ||
+		!strings.Contains(cus, `class="tr-to" value="2026-09-30T14:30"`) {
+		t.Errorf("自定义初始区间应为「今天 00:00 → 现在」：%s", cus)
+	}
+	init, _ := got["customInit"].(map[string]any)
+	if init == nil || init["from"] != "2026-09-30T00:00" || init["to"] != "2026-09-30T14:30" || init["emits"] != float64(1) {
+		t.Errorf("切到自定义后应带默认区间并触发一次查询，实际 %v", got["customInit"])
+	}
+
+	// 起止颠倒：就地标红且不发查询。
+	inv, _ := got["inverted"].(map[string]any)
+	if inv == nil || inv["bad"] != true {
+		t.Errorf("起止颠倒时两个输入都应带 tr-bad：%v", got["inverted"])
+	}
+	if inv != nil && inv["emits"] != float64(1) {
+		t.Errorf("起止颠倒不应发起查询（emits 应停在 1），实际 %v", inv["emits"])
+	}
+	fx, _ := got["fixed"].(map[string]any)
+	if fx == nil || fx["bad"] != false || fx["emits"] != float64(2) {
+		t.Errorf("改回正序后应清掉 tr-bad 并重新查询：%v", got["fixed"])
+	}
+	if fx != nil {
+		if q, _ := fx["query"].(string); !strings.Contains(q, "from=") || !strings.Contains(q, "to=") {
+			t.Errorf("自定义区间的查询串应带 from/to：%v", q)
+		}
+	}
+
+	// 切回滚动预设：输入组重新收起，且不再有 tr-bad 残留。
+	if !strings.Contains(str("html24"), `<span class="tr-custom" hidden>`) ||
+		!strings.Contains(str("html24"), `<option value="24" selected>近 24 小时</option>`) {
+		t.Errorf("切回滚动预设后应收起自定义输入：%s", str("html24"))
+	}
+}
+
+// TestAppJSTrangeRequests 端到端：整份 app.js 在 DOM 桩里真实求值（含深链 #usage 的
+// 顶层 go()），用假 fetch 记录真正发出的查询串，再通过控件自己的 onchange 逐个切换
+// 预设，看 loadUsage / loadLogs 到底请求了什么。
+//
+// 为什么必须端到端：只求值 trange 那一段时，「onchange 有没有接上加载函数」「查询串
+// 有没有真的拼进 URL」「#usNote 有没有回显服务端区间」三件事全都测不到——控件画得
+// 再对，没接上线也是死的。同一个沙箱里顺带回归本 fork 的两条红线：账号表今日用量
+// 仍是 7.10M 的 chip（不带 tok 后缀）、请求行格式未变。
+func TestAppJSTrangeRequests(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; trange request test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const urls = [];
+// 假后端：只有显式区间口径才回显 window_from/to（与 internal/usage 的
+// SnapshotWindow 一致），滚动窗口不回显——这样 #usNote 的两条分支都能被覆盖。
+const body = p => {
+  if (p.startsWith('usage')) {
+    const d = { totals: {}, by_account: [], by_model: [], by_realm: [], series: [] };
+    if (/[?&]from=/.test(p)) { d.window_from = '2026-09-30T00:00:00+08:00'; d.window_to = '2026-09-30T14:30:00+08:00'; }
+    return d;
+  }
+  if (p.startsWith('request_logs')) return { entries: [] };
+  // 内存指标里留一条"最近请求"：用来验证时间范围生效时不会回落显示范围外的记录
+  // （默认「全部历史」仍走原来的回落逻辑，展示不变）。
+  if (p.startsWith('request_metrics')) return { archive: { enabled: true, bytes: 0 }, recent: [{
+    time: '2026-09-20T10:00:00.000Z', status: 200, outcome: 'success', model: 'glm-5.3', account: '旧号(uid8)',
+    duration_ms: 1000, total_tokens: 100, request_id: 'req-old',
+  }] };
+  if (p.startsWith('logs')) return { entries: [] };
+  return {};
+};
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; }, has() { return true; },
+});
+// 时钟钉死：断言落在具体的 from/to 秒数上（否则「今天」会随真实日期漂）。
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-30T14:30:00');
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const els = {}, qcache = {};
+const mkEl = key => {
+  const classes = new Set();
+  const store = {
+    key, innerHTML: '', textContent: '', value: '', title: '', hidden: false, className: '', disabled: false,
+    dataset: {}, style: {}, children: [], selectedOptions: [],
+    scrollTop: 0, scrollHeight: 0, clientHeight: 0,
+    classList: {
+      add: c => classes.add(c), remove: c => classes.delete(c),
+      toggle: (c, on) => { const w = on === undefined ? !classes.has(c) : !!on; if (w) classes.add(c); else classes.delete(c); return w; },
+      contains: c => classes.has(c),
+    },
+    classes,
+    setAttribute() {}, getAttribute: () => null, removeAttribute() {}, hasAttribute: () => false,
+    addEventListener() {}, removeEventListener() {},
+    appendChild(n) { store.children.push(n); return n; },
+    remove() {}, focus() {}, blur() {}, click() {}, closest: () => null, contains: () => false,
+    insertAdjacentHTML() {}, getElementsByTagName: () => [], querySelectorAll: () => [],
+    querySelector: sel => (qcache[key + '|' + sel] = qcache[key + '|' + sel] || mkEl(key + '|' + sel)),
+    get firstElementChild() { return store.children[0] || null; },
+  };
+  return new Proxy(store, { get(t, k) { return k in t ? t[k] : inert; }, set(t, k, v) { t[k] = v; return true; }, has: () => true });
+};
+const el = id => (els[id] = els[id] || mkEl(id));
+const sandbox = {
+  location: { hash: '#usage' }, // 深链：顶层 go() 会同步调进 loadUsage（TDZ 敏感路径）
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  document: {
+    getElementById: el, querySelectorAll: () => [], querySelector: () => inert, addEventListener() {},
+    documentElement: el('documentElement'), head: inert, body: inert, cookie: '',
+    createElement: () => mkEl('created'), contains: () => false, activeElement: inert,
+  },
+  fetch: url => {
+    const path = String(url).replace('/panel/api/', '');
+    urls.push(path);
+    return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(body(path)) });
+  },
+  addEventListener() {}, removeEventListener() {},
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  console, JSON, Math, Date: FakeDate, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent, URL, URLSearchParams, Symbol, Proxy, Reflect,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src +
+  '\nthis.loadUsage=loadUsage; this.loadLogs=loadLogs; this.renderAccounts=renderAccounts; this.renderRequestMetrics=renderRequestMetrics;',
+  sandbox, { filename: 'app.js' });
+
+const tick = () => new Promise(r => setTimeout(r, 5));
+const usageUrls = () => urls.filter(u => u.startsWith('usage?'));
+const reqUrls = () => urls.filter(u => u.startsWith('request_logs?'));
+// 走控件自己的 onchange（不是直接改内部状态）：预设有没有真的接上加载函数，
+// 只有这条路径能证明。
+const setPreset = (id, v) => { const s = el(id).querySelector('.tr-preset'); s.value = v; s.onchange(); };
+const setCustom = (id, from, to) => {
+  const host = el(id);
+  const f = host.querySelector('.tr-from'), t = host.querySelector('.tr-to');
+  f.value = from; t.value = to;
+  f.onchange();
+  return t;
+};
+
+(async () => {
+  await tick();
+  // 深链 #usage 首屏：usage 接口必须恰好被请求一次（trangeBind 不得额外触发回调，
+  // 否则打开页面就打两遍接口），且默认预设是「近 3 天」。
+  const deepLink = usageUrls()[0] || '';
+  const openUsage = usageUrls().length;
+  urls.length = 0;
+  const out = { deepLink, emitsOnOpen: openUsage };
+  const usageQ = async preset => {
+    setPreset('usRange', preset);
+    await sandbox.loadUsage();
+    return usageUrls().slice(-1)[0] || '';
+  };
+  out.qToday = await usageQ('today');
+  out.noteToday = els.usNote.textContent;
+  out.q24 = await usageQ('24');
+  out.note24 = els.usNote.textContent;
+  out.q3d = await usageQ('72');
+  out.q7d = await usageQ('168');
+  out.q30d = await usageQ('720');
+  out.qAll = await usageQ('0');
+
+  // 自定义：展开 → 填起止 → 触发控件 onchange。
+  setPreset('usRange', 'custom');
+  out.htmlCustom = els.usRange.innerHTML;
+  const n0 = urls.length;
+  setCustom('usRange', '2026-09-30T09:00', '2026-09-30T18:30');
+  await tick();
+  out.qCustom = usageUrls().slice(-1)[0] || '';
+  out.customFetched = urls.length > n0;
+
+  // 自定义区间起止颠倒：就地标红且不发请求。
+  const n1 = urls.length;
+  const toEl = setCustom('usRange', '2026-09-30T18:00', '2026-09-30T09:00');
+  out.badMarked = els.usRange.querySelector('.tr-from').classList.contains('tr-bad') && toEl.classList.contains('tr-bad');
+  await tick();
+  out.badFetched = urls.length > n1;
+
+  // 请求记录：默认「全部历史」不发 from/to（与移植前逐字一致），选定区间才带。
+  const logQ = async preset => {
+    if (preset) setPreset('reqRange', preset);
+    await sandbox.loadLogs();
+    return reqUrls().slice(-1)[0] || '';
+  };
+  out.qLogDefault = await logQ(null);
+  out.logRowsDefault = els.reqLogBox.innerHTML;
+  out.qLogToday = await logQ('today');
+  out.logRowsToday = els.reqLogBox.innerHTML;
+  out.qLog24 = await logQ('24');
+  out.qLogAll = await logQ('0');
+  out.logRowsAll = els.reqLogBox.innerHTML;
+  out.htmlUsage = els.usRange.innerHTML;
+  out.htmlLogs = els.reqRange.innerHTML;
+
+  // 回归红线：账号表今日用量列、请求行格式。
+  sandbox.renderAccounts([{
+    uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+    last_success: '2026-09-28T13:00:00Z',
+    today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+    token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  }]);
+  out.accounts = els.accBody.innerHTML;
+  sandbox.renderRequestMetrics({ completed: 2, success_rate: 100, http_success_rate: 100, avg_duration_ms: 1250, in_flight: 0,
+    archive: { enabled: true, bytes: 20480 } }, [{
+    time: new Date(2026, 8, 28, 14, 5, 6).toISOString(), status: 200, outcome: 'success', model: 'glm-5.3',
+    account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12,
+    request_id: 'req-2', client_ip: '203.0.113.7', user_agent: 'curl/8.4.0',
+    cache_hit_tokens: 2257, cache_miss_tokens: 43,
+  }]);
+  out.reqLogBox = els.reqLogBox.innerHTML;
+  return out;
+})().then(out => {
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+}, e => {
+  console.log('TRANGE FAIL: ' + (e && e.stack ? e.stack : e));
+  process.exit(1);
+});`
+	f, err := os.CreateTemp(t.TempDir(), "trange-req-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("trange request node test failed: %v\n%s", err, out)
+	}
+	got := map[string]any{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("trange request output is not JSON: %v\n%s", err, out)
+	}
+	str := func(k string) string { s, _ := got[k].(string); return s }
+	boolean := func(k string) bool { b, _ := got[k].(bool); return b }
+	num := func(k string) float64 { n, _ := got[k].(float64); return n }
+	sec := func(h, m int) string {
+		return strconv.FormatInt(time.Date(2026, 9, 30, h, m, 0, 0, time.Local).Unix(), 10)
+	}
+
+	// 深链首屏：默认「近 3 天」→ hours=72（不是空查询串，也不是 72 小时以外的口径）。
+	if str("deepLink") != "usage?hours=72" {
+		t.Errorf("深链 #usage 首屏应请求 usage?hours=72，实际 %q", str("deepLink"))
+	}
+	if num("emitsOnOpen") != 1 {
+		t.Errorf("深链打开用量页应恰好请求一次 usage（trangeBind 不得额外触发），实际 %v 次", num("emitsOnOpen"))
+	}
+
+	// 用量页：预设 → 查询串。
+	for _, c := range []struct{ key, want string }{
+		{"qToday", "usage?from=" + sec(0, 0)},
+		{"q24", "usage?hours=24"},
+		{"q3d", "usage?hours=72"},
+		{"q7d", "usage?hours=168"},
+		{"q30d", "usage?hours=720"},
+		{"qAll", "usage?hours=0"},
+		{"qCustom", "usage?from=" + sec(9, 0) + "&to=" + sec(18, 30)},
+	} {
+		if str(c.key) != c.want {
+			t.Errorf("用量页 %s=%q，期望 %q", c.key, str(c.key), c.want)
+		}
+	}
+	// 「今天」不带 to：多发 to=now 会把正在走的那个小时桶切掉半截。
+	if strings.Contains(str("qToday"), "to=") || strings.Contains(str("qToday"), "hours=") {
+		t.Errorf("「今天」只应发浏览器本地的 from：%q", str("qToday"))
+	}
+	if !boolean("customFetched") {
+		t.Error("自定义区间填完起止后没有发起请求（控件没接上加载函数）")
+	}
+	if !boolean("badMarked") {
+		t.Error("起止颠倒时未标红 tr-bad")
+	}
+	if boolean("badFetched") {
+		t.Error("起止颠倒不应发起请求（空区间会显示成「暂无数据」，看不出是自己填反了）")
+	}
+
+	// 区间回显：显式区间用服务端 window_from/to，滚动窗口回落成控件标签。
+	if !strings.HasPrefix(str("noteToday"), "2026-09-30 00:00 → 2026-09-30 14:30 · ") {
+		t.Errorf("#usNote 未优先回显服务端区间：%q", str("noteToday"))
+	}
+	if !strings.HasPrefix(str("note24"), "近 24 小时 · ") {
+		t.Errorf("滚动窗口下 #usNote 应用控件标签兜底：%q", str("note24"))
+	}
+
+	// 请求记录：默认不发 from/to（= 移植前的 ?limit=100），选定区间才带上，且不发 hours。
+	if str("qLogDefault") != "request_logs?limit=100" {
+		t.Errorf("请求记录默认应是 request_logs?limit=100，实际 %q", str("qLogDefault"))
+	}
+	if str("qLogToday") != "request_logs?from="+sec(0, 0)+"&limit=100" {
+		t.Errorf("请求记录「今天」应带本地 00:00 的 from：%q", str("qLogToday"))
+	}
+	if !strings.Contains(str("qLog24"), "from=") || strings.Contains(str("qLog24"), "hours=") {
+		t.Errorf("请求记录「近 24 小时」应折算成 from（归档没有 hours 口径）：%q", str("qLog24"))
+	}
+	if str("qLogAll") != "request_logs?limit=100" {
+		t.Errorf("请求记录「全部历史」不应带任何时间参数：%q", str("qLogAll"))
+	}
+	// 归档在区间内没有记录时不回落内存里的"最近请求"——否则选中区间后屏幕上仍是
+	// 范围之外的记录；默认（全部历史）保持原来的回落行为不变。
+	if !strings.Contains(str("logRowsDefault"), "req-old") {
+		t.Errorf("默认（全部历史）应保持原有的回落行为：%s", str("logRowsDefault"))
+	}
+	if strings.Contains(str("logRowsToday"), "req-old") {
+		t.Errorf("选中区间后显示了区间外的内存记录（筛选形同失效）：%s", str("logRowsToday"))
+	}
+	if !strings.Contains(str("logRowsToday"), "暂无请求记录") {
+		t.Errorf("区间内无记录时应显示空态：%s", str("logRowsToday"))
+	}
+	if !strings.Contains(str("logRowsAll"), "req-old") {
+		t.Errorf("切回「全部历史」应恢复回落行为：%s", str("logRowsAll"))
+	}
+
+	// 两个宿主的控件 HTML 都画出来了，且带完整预设。
+	for key, html := range map[string]string{"htmlUsage": str("htmlUsage"), "htmlLogs": str("htmlLogs")} {
+		if !strings.Contains(html, `class="tr-preset"`) || strings.Count(html, "<option") != 7 {
+			t.Errorf("%s 控件未渲染出 7 个预设：%s", key, html)
+		}
+		if strings.Contains(html, "style=") {
+			t.Errorf("%s 控件 HTML 不得带内联样式：%s", key, html)
+		}
+	}
+	if !strings.Contains(str("htmlCustom"), `<span class="tr-custom">`) ||
+		!strings.Contains(str("htmlCustom"), `type="datetime-local"`) {
+		t.Errorf("自定义态未展开起止输入：%s", str("htmlCustom"))
+	}
+
+	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），请求行格式不变。
+	if !strings.Contains(str("accounts"), `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", str("accounts"))
+	}
+	line := `<span class="ln">14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit` +
+		` | 命中 98.1%（2.3k tok） | src=203.0.113.7 ua=&quot;curl/8.4.0&quot; | req-2</span>`
+	if !strings.Contains(str("reqLogBox"), line) {
+		t.Errorf("请求行格式变了：%s", str("reqLogBox"))
+	}
+}
+
+// TestIndexTimeRangeHosts 时间范围控件的两个宿主必须真的在 index.html 里。app.js 侧
+// 是 `if ($('usRange')) trangeBind(...)` 的守卫写法：宿主被删掉时 JS 不报错、测试全绿，
+// 只是控件人间蒸发——用量页退回"只有刷新按钮"，日志页重新没有任何时间过滤。
+func TestIndexTimeRangeHosts(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+	for _, want := range []string{
+		`<span class="trange" id="usRange"></span>`,
+		`<span class="trange" id="reqRange"></span>`,
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少时间范围控件宿主：%s", want)
+		}
+	}
+	// 旧的窗口下拉必须彻底退场：两套窗口口径并存会互相打架（今天到底按谁算）。
+	if strings.Contains(body, `id="usWindow"`) {
+		t.Error("index.html 仍有旧的 #usWindow 下拉")
+	}
+	// 控件样式：整组 inline-flex 且允许换行（窄屏自定义态折行，不挤扁标题）、
+	// 起止颠倒要有标红规则，否则只是加了类名而看不出错。
+	for _, want := range []string{".trange {", ".trange .tr-custom", ".trange .tr-bad"} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少 .trange 样式：%s", want)
+		}
 	}
 }
 
@@ -1045,6 +1600,8 @@ const ctx = {
   Date, Number, String, Boolean, Math, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
   $: el,
   renderUsageChart: () => { el('usChart').innerHTML = 'CHART'; },
+  // renderUsage 把窗口标签写进 #usNote（本段只关心卡片/表格，标签另有 trange 测试钉住）。
+  trangeLabel: () => '近 3 天',
 };
 vm.createContext(ctx);
 vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d +

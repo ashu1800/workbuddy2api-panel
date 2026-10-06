@@ -225,6 +225,160 @@ $('btnKey').onclick = async () => {
 };
 $('keyInput').addEventListener('keydown', e => { if (e.key === 'Enter') $('btnKey').click(); });
 
+/* ── 时间范围控件（用量 / 请求记录共用）──────────────────────────────
+   一个控件适配两种宿主：
+     · 用量页 rolling=true → 滚动预设发 hours：服务端按整点对齐的滚动窗口与旧
+       行为逐位一致；前端自己减 N 小时会多算/少算一个边界桶。
+     · 请求记录 rolling=false → 一律折算成 from/to：归档是线性日志，没有「整点
+       对齐」这回事，「近 3 天」就是「三天前这一刻起」。
+   「今天」与「自定义」在两种宿主下都发浏览器本地时区算好的 from/to。服务端
+   时区未必与浏览器一致（容器常挂 TZ=Asia/Shanghai，浏览器可能在任意时区），
+   让服务端算「今天」会在跨时区时切错日子。
+   「今天」= 本地 00:00 起（自然日口径，本 fork 的既有特性），只发 from，上界
+   交给服务端「到现在」：多发一个 to=now 会把正在走的那个小时桶切掉半截。
+   旧实现把「今天」换算成 hours=当前小时+1 去套服务端的整点窗口，只有浏览器与
+   服务端同时区时才等价；现在起点由浏览器精确给出，那层隐含依赖没有了。
+
+   本段必须放在顶层 go()（路由首次分发）之前求值：深链 #usage / #logs 时 go()
+   会同步调进 loadUsage/loadLogs 并读到这里的 const，位置太靠后就是 TDZ
+   ReferenceError——首屏该页显示「读取失败」，点导航进去却正常。 */
+const TRANGE_PRESETS = [
+  ['today', '今天'],
+  ['24', '近 24 小时'],
+  ['72', '近 3 天'],
+  ['168', '近 7 天'],
+  ['720', '近 30 天'],
+  ['0', '全部历史'],
+  ['custom', '自定义…'],
+];
+/* 两个宿主的默认预设：用量页沿用旧 #usWindow 的「近 3 天」；请求记录默认
+   「全部历史」——该页移植前没有任何时间过滤，不发 from/to 才是「默认展示不变」。 */
+const TRANGE_DEFAULTS = { usRange: '72', reqRange: '0' };
+const trangeStates = new Map(); // hostId → { preset, from: Date|null, to: Date|null }
+
+// dtLocalValue / dtLocalParse 与 <input type=datetime-local> 的取值格式互转
+// （YYYY-MM-DDTHH:mm，本地时区；ES 里"带时间的日期串"按本地解析，正是我们要的）。
+function dtLocalValue(d) {
+  const p = n => String(n).padStart(2, '0');
+  return d.getFullYear() + '-' + p(d.getMonth() + 1) + '-' + p(d.getDate()) + 'T' +
+    p(d.getHours()) + ':' + p(d.getMinutes());
+}
+function dtLocalParse(s) {
+  if (!s) return null;
+  const d = new Date(s);
+  return isNaN(d.getTime()) ? null : d;
+}
+
+// trangeMidnight 今天 00:00（浏览器本地时区）——「今天」预设的唯一权威起点。
+function trangeMidnight() {
+  const d = new Date();
+  d.setHours(0, 0, 0, 0);
+  return d;
+}
+
+function trangeState(id) {
+  if (!trangeStates.has(id)) {
+    // 「自定义」的初始值给一段有意义的默认：今天 00:00 → 现在。
+    trangeStates.set(id, { preset: TRANGE_DEFAULTS[id] || '72', from: trangeMidnight(), to: new Date() });
+  }
+  return trangeStates.get(id);
+}
+
+// trangeRender 画出控件骨架（幂等：重复调用会保留当前状态）。
+function trangeRender(id) {
+  const host = $(id);
+  if (!host) return;
+  const st = trangeState(id);
+  const custom = st.preset === 'custom';
+  host.innerHTML =
+    '<select class="tr-preset" aria-label="时间范围">' +
+    TRANGE_PRESETS.map(([v, label]) =>
+      '<option value="' + v + '"' + (v === st.preset ? ' selected' : '') + '>' + esc(label) + '</option>').join('') +
+    '</select>' +
+    '<span class="tr-custom"' + (custom ? '' : ' hidden') + '>' +
+    '<input type="datetime-local" class="tr-from" value="' + esc(st.from ? dtLocalValue(st.from) : '') + '" aria-label="起始时间">' +
+    '<span class="tr-sep">→</span>' +
+    '<input type="datetime-local" class="tr-to" value="' + esc(st.to ? dtLocalValue(st.to) : '') + '" aria-label="结束时间">' +
+    '</span>';
+  const preset = host.querySelector('.tr-preset');
+  if (preset) preset.onchange = () => {
+    st.preset = preset.value;
+    // 从别的预设切到自定义时，把区间重置为「今天 00:00 → 现在」，
+    // 免得用户上次留下的半年区间被无声沿用。
+    if (st.preset === 'custom' && (!st.from || !st.to)) { st.from = trangeMidnight(); st.to = new Date(); }
+    trangeRender(id);
+    trangeEmit(id);
+  };
+  const fromEl = host.querySelector('.tr-from');
+  const toEl = host.querySelector('.tr-to');
+  const readCustom = () => {
+    st.from = dtLocalParse(fromEl.value);
+    st.to = dtLocalParse(toEl.value);
+    // 起止颠倒就地标红，且**不**发起查询：否则会把一个 to<from 的空区间当成
+    // 有效条件打给服务端，页面上只剩「暂无数据」，看不出是自己填反了。
+    // 不静默纠正——用户可能正输到一半（先改起点再改终点）。
+    const bad = st.from && st.to && st.from > st.to;
+    fromEl.classList.toggle('tr-bad', !!bad);
+    toEl.classList.toggle('tr-bad', !!bad);
+    if (bad) return;
+    trangeEmit(id);
+  };
+  if (fromEl) fromEl.onchange = readCustom;
+  if (toEl) toEl.onchange = readCustom;
+}
+
+const trangeHandlers = new Map();
+// trangeBind 渲染控件并登记变化回调。**不**在绑定时触发回调：各视图的首次加载
+// 由 go() 统一驱动，这里再触发一次会让打开页面时打两遍接口。
+function trangeBind(id, onChange) {
+  trangeHandlers.set(id, onChange);
+  trangeRender(id);
+}
+function trangeEmit(id) {
+  const fn = trangeHandlers.get(id);
+  if (fn) fn();
+}
+
+// trangeQuery 把当前选择翻译成查询参数。
+//   rolling=true  → 滚动预设发 hours（服务端整点对齐）；今天 / 自定义发 from/to
+//   rolling=false → 一律发 from/to
+// 「全部历史」在用量侧显式发 hours=0：后端把"没给参数"当作默认 72 小时，什么都不
+// 发会让「全部历史」静默退化成「近 3 天」；归档侧没有 hours 口径，什么都不发。
+function trangeQuery(id, rolling) {
+  const st = trangeState(id);
+  const q = new URLSearchParams();
+  const sec = d => Math.floor(d.getTime() / 1000);
+  if (st.preset === 'custom') {
+    if (st.from) q.set('from', sec(st.from));
+    if (st.to) q.set('to', sec(st.to));
+    return q;
+  }
+  if (st.preset === 'today') {
+    q.set('from', sec(trangeMidnight()));
+    return q;
+  }
+  if (st.preset === '0') {
+    if (rolling) q.set('hours', '0');
+    return q;
+  }
+  if (rolling) { q.set('hours', st.preset); return q; }
+  q.set('from', sec(new Date(Date.now() - Number(st.preset) * 3600 * 1000)));
+  return q;
+}
+
+// trangeLabel 人读口径，用于「用量总览」这类需要回显当前选择的位置。
+// 自定义区间给到分钟（与输入框精度一致）；服务端回显的 window_from/to 优先，
+// 这里只是滚动窗口（没有回显）下的兜底。
+function trangeLabel(id) {
+  const st = trangeState(id);
+  const found = TRANGE_PRESETS.find(p => p[0] === st.preset);
+  if (st.preset !== 'custom') return found ? found[1] : '';
+  if (!st.from && !st.to) return '自定义';
+  const f = d => d ? (d.getMonth() + 1) + '-' + String(d.getDate()).padStart(2, '0') + ' ' +
+    String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0') : '…';
+  return f(st.from) + ' → ' + f(st.to);
+}
+
 /* ── 路由 ─────────────────────────────────────────────────────────── */
 /* 视图标题：导航与顶栏共用，统一 4 字（导航栏宽度固定 216px，标题长度一致
    才能让 7 个条目左对齐成一条竖线）。 */
@@ -680,13 +834,24 @@ $('logChips').addEventListener('click', ev => {
 async function loadLogs() {
   const box = $('logBox');
   const atEnd = box.scrollTop + box.clientHeight >= box.scrollHeight - 24;
+  // 时间范围交给归档侧过滤，不是前端筛已拉取的行：区间落在更早的时间段时，
+  // 「最近 100 条」里根本不会有那些记录，必须让服务端按时间取。
+  // 默认「全部历史」→ 查询串与移植前逐字相同（request_logs?limit=100）。
+  const rq = trangeQuery('reqRange', false);
+  rq.set('limit', '100');
   try {
     const [d, metrics, requestRows] = await Promise.all([
       api('logs'),
       api('request_metrics').catch(() => ({})),
-      api('request_logs?limit=100').catch(() => ({ entries: [] })),
+      api('request_logs?' + rq.toString()).catch(() => ({ entries: [] })),
     ]);
-    const recent = (requestRows.entries && requestRows.entries.length) ? requestRows.entries : (metrics.recent || []);
+    // 时间范围生效时**不**回落到内存里的「最近请求」：那是另一套口径。「区间内没有
+    // 记录」是一个真实结果，回落会把范围之外的请求显示出来，看着像筛选没生效。
+    // 默认（全部历史，不发 from/to）保持原来的回落行为逐字不变。
+    const rangeOn = rq.has('from') || rq.has('to');
+    const recent = rangeOn
+      ? (requestRows.entries || [])
+      : ((requestRows.entries && requestRows.entries.length) ? requestRows.entries : (metrics.recent || []));
     renderRequestMetrics(metrics, recent);
     const entries = (d.entries || []).filter(e => logCh === 'all' || e.ch === logCh);
     box.innerHTML = entries.length
@@ -705,6 +870,10 @@ async function loadLogs() {
       : (logCh === 'task' ? '任务' : logCh === 'chat' ? '对话' : '系统') + ' ' + entries.length + ' 行';
   } catch (e) { /* 概览已提示 */ }
 }
+
+// 请求记录的时间范围控件：任何改动（预设切换 / 自定义起止）都重新拉一次归档。
+// 绑定本身不发请求——首次加载由 go() 驱动，否则打开日志页会打两遍接口。
+if ($('reqRange')) trangeBind('reqRange', loadLogs);
 
 function renderRequestMetrics(m, entries) {
   m = m || {};
@@ -1772,11 +1941,17 @@ function renderUsage(d) {
   ]);
 
   // 卡片、三张表与时序图全部按所选窗口统计（切窗口数字随之变化）；
-  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点。
-  const winLabel = ($('usWindow') && $('usWindow').selectedOptions[0]) ?
-    $('usWindow').selectedOptions[0].textContent.trim() : '';
+  // 「全部历史」含 90 天前折叠出的日桶。这里标注当前口径与数据起点：
+  // 服务端回显的 window_from/window_to 优先——「今天」与自定义区间都由浏览器算
+  // 好发过去，回显是"服务端真的按这一段统计"的唯一凭据；滚动窗口没有回显，
+  // 回落成控件自己的标签。
+  const rangeEcho = d.window_from
+    ? String(d.window_from).replace('T', ' ').slice(0, 16) +
+      (d.window_to ? ' → ' + String(d.window_to).replace('T', ' ').slice(0, 16) : ' → 现在')
+    : '';
+  const winLabel = trangeLabel('usRange');
   $('usNote').textContent =
-    (winLabel ? winLabel + ' · ' : '') +
+    (rangeEcho || winLabel ? (rangeEcho || winLabel) + ' · ' : '') +
     (d.buckets || 0) + ' 个分桶' +
     (d.since ? ' · 数据自 ' + d.since.replace('T', ' ') : '') +
     (d.file_bytes ? ' · 文件 ' + (d.file_bytes / 1024).toFixed(1) + ' KB' : '');
@@ -1987,25 +2162,10 @@ async function warmUsageModelRates() {
   usageRateWarmAt = Date.now();
 }
 
-/* windowHours 把用量窗口下拉的取值换算成后端认识的「小时数」。
-   后端窗口是 [当前整点-(hours-1)h, now]（小时粒度、含当前整点），所以：
-     · "today"（今天，自然日口径）= 当前小时 + 1 → 窗口恰好从今天 00:00 开始
-       （00:30 → hours=1 即 [00:00, now]；23:30 → hours=24 即 [00:00, now]）。
-       注意这与"近 24 小时"不是一回事：后者是滚动窗口，只在 23 点后才与今天重合。
-     · 数字 = 直接透传（0 表示全部历史）。
-   now 可注入，便于单测固定时刻。跨时区部署时以浏览器本地小时为准，故面板与服务
-   需在同一时区（本项目默认 TZ=Asia/Shanghai）。 */
-function windowHours(raw, now) {
-  if (raw === 'today') return ((now || new Date()).getHours()) + 1;
-  const n = Number(raw);
-  return Number.isFinite(n) && n >= 0 ? n : 72;
-}
-
 async function loadUsage() {
-  const hours = windowHours($('usWindow') && $('usWindow').value);
   try {
     await warmUsageModelRates();
-    const d = await api('usage?hours=' + encodeURIComponent(hours));
+    const d = await api('usage?' + trangeQuery('usRange', true).toString());
     renderUsage(d);
   } catch (e) {
     $('usChart').innerHTML = '<div class="us-empty">读取用量失败：' + esc(e.message) + '</div>';
@@ -2013,7 +2173,8 @@ async function loadUsage() {
 }
 
 if ($('btnUsage')) $('btnUsage').onclick = loadUsage;
-if ($('usWindow')) $('usWindow').onchange = loadUsage;
+// 时间范围控件（替换旧的 #usWindow 下拉）：预设或自定义起止一变就重拉用量。
+if ($('usRange')) trangeBind('usRange', loadUsage);
 
 /* ── 积分构成 ─────────────────────────────────────────────────────── */
 /* 一个账号的余额是若干积分包之和。包按来源命名（「国内运营裂变包」「拉新权益包」
