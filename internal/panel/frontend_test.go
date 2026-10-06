@@ -1404,6 +1404,342 @@ process.stdout.write(JSON.stringify({ locks, note, emptyNull, emptyNote, emptyAr
 	}
 }
 
+// pausedActionResultJS 是 DOM 桩里一次按钮点击的结果：假 fetch 记下的请求、toast 文案、
+// 点击后（finally 里 loadOverview 重渲染过）同一行的按钮，以及这次点击弹了几次 confirm。
+type pausedActionResultJS struct {
+	Calls []struct {
+		URL    string `json:"url"`
+		Method string `json:"method"`
+	} `json:"calls"`
+	Toasts       []string `json:"toasts"`
+	ButtonAfter  string   `json:"buttonAfter"`
+	ConfirmCount int      `json:"confirmCount"`
+}
+
+// TestAppJSPausedAccountsControl 上游 paused（暂停选号：退出选号候选，但签到 / 活跃上报 /
+// 保活 / 刷新余额照常）在本 fork 面板侧的入口。后端 POST accounts/{uid}/pause|resume 早已
+// 随上游合并进来，缺的是「用户点得到」，所以这一批全部是前端契约：
+//   - (a) 状态标签四态组合：正常 / paused / disabled / disabled+paused，disabled 优先；
+//     paused 用 mute 中性色（运维主动让位，不是故障，别占用告警色），色条复用 tr.cool 的琥珀档
+//     （账号表只有 绿在服务 / 琥珀暂不服务 / 红禁用 三档，红的 off 只留给 disabled）；
+//     悬浮提示必须写清「照常签到 / 活跃上报 / 保活 / 刷新余额」。
+//   - (b) 行内按钮：「解冻 / 禁用」旁并列的暂停选号 / 恢复选号；已禁用账号两者都不给——
+//     禁用已含「不参与选号」，并列会让人以为效果能叠加。
+//   - (c) disable 的确认文案点名「暂停选号」：不可逆的禁用 vs 可逆的暂停，别让人走错门。
+//   - (d) 点击后真的发出 POST accounts/{uid}/pause|resume（假 fetch 记录），且 pause 不弹确认。
+//   - (e) 回归：账号表用量列仍是 7.10M 的 chip、行仍是 11 列。
+//
+// 沙箱与 TestAppJSTopLevelSmoke 同源（真跑整个 app.js），只是把 DOM 换成一堆会记录
+// innerHTML / addEventListener 的桩对象，再用桩事件触发 #accBody 的点击处理器。
+// 无 node 时跳过（与其余前端测试一致，不阻塞无 Node 的构建机）。
+func TestAppJSPausedAccountsControl(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; paused accounts control test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// DOM 桩：每个 id 一个对象；addEventListener 把处理器留在 _h 上，测试用桩事件直接触发点击。
+const nodes = {};
+function mkEl(id) {
+  return {
+    id, innerHTML: '', textContent: '', title: '', value: '', checked: false, disabled: false,
+    className: '', hidden: false, dataset: {}, style: {}, children: [], firstElementChild: null,
+    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    addEventListener(ev, fn) { (this._h || (this._h = {}))[ev] = fn; },
+    removeEventListener() {},
+    appendChild(c) { this.children.push(c); if (!this.firstElementChild) this.firstElementChild = c; return c; },
+    remove() {}, focus() {}, blur() {}, click() {},
+    setAttribute() {}, removeAttribute() {}, getAttribute() { return null; },
+    querySelector() { return null; }, querySelectorAll() { return []; }, closest() { return null; },
+    replaceChildren() { this.children = []; this.firstElementChild = null; },
+  };
+}
+const $ = id => (nodes[id] || (nodes[id] = mkEl(id)));
+const calls = [], confirms = [];
+const state = { accounts: [], confirmReturn: true };
+const tick = () => new Promise(r => setTimeout(r, 0));
+function account(uid, extra) {
+  return Object.assign({
+    uid, nickname: '号 ' + uid, credits: 10, credits_total: 100,
+    last_success: '2026-09-28T13:00:00Z',
+    today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+    token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+  }, extra || {});
+}
+state.accounts = [account('uid-normal'), account('uid-paused', { paused: true }),
+  account('uid-disabled', { disabled: true }), account('uid-both', { disabled: true, paused: true }),
+  account('uid-cooling', { cool_remaining_sec: 300 }),
+  account('uid-paused-cool', { paused: true, cool_remaining_sec: 300 })];
+const sandbox = {
+  console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp,
+  Error, TypeError, isNaN, isFinite, parseInt, parseFloat, encodeURIComponent, decodeURIComponent,
+  URL, URLSearchParams, Symbol, Proxy, Reflect,
+  setInterval, clearInterval, setTimeout, clearTimeout,
+  location: { hash: '#accounts' },
+  history: { replaceState() {} },
+  localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  navigator: { clipboard: { writeText: () => Promise.resolve() } },
+  matchMedia: () => ({ matches: false, addEventListener() {} }),
+  addEventListener() {}, removeEventListener() {},
+  confirm: m => { confirms.push(String(m)); return state.confirmReturn; },
+  alert() {}, open() {},
+  document: {
+    documentElement: mkEl('html'), head: mkEl('head'), body: mkEl('body'),
+    getElementById: $, querySelector: () => null, querySelectorAll: () => [],
+    createElement: () => mkEl('created'), contains: () => false, execCommand: () => true,
+  },
+  // 假 fetch：记录 URL / 方法，并按 URL 真的改掉池状态——这样 finally 里的 loadOverview
+  // 重渲染拿到的是「服务端已生效」的数据，能验证点击后同一行的按钮真的翻面。
+  fetch: async (url, opts) => {
+    const u = String(url);
+    calls.push({ url: u, method: (opts && opts.method) || 'GET' });
+    state.accounts.forEach(a => {
+      const hit = u.indexOf(encodeURIComponent(a.uid)) >= 0;
+      if (hit && u.indexOf('/pause') >= 0) a.paused = true;
+      if (hit && u.indexOf('/resume') >= 0) a.paused = false;
+      if (hit && u.indexOf('/disable') >= 0) a.disabled = true;
+    });
+    const body = u.indexOf('overview') >= 0
+      ? { total: 4, healthy: 0, cooling: 0, disabled: 2, sticky_sessions: 0, version: '9.9.9',
+          uptime_sec: 0, redis_mode: 'local', accounts: state.accounts, model_locks: [] }
+      : {};
+    return { status: 200, ok: true, json: async () => body };
+  },
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(src + '\nthis.__statusTagOf = statusTagOf;', sandbox, { filename: 'app.js' });
+(async () => {
+  await tick();
+  // rowOf 每次都重新切当前 innerHTML：点击后 finally 里的 loadOverview 会整表重渲染，
+  // 缓存的 rows 数组会停在点击前的那一版（按钮「翻面」就验证不出来了）。
+  const rowOf = uid => (nodes.accBody.innerHTML.split('<tr class=').slice(1)
+    .map(s => '<tr class=' + s).find(r => r.indexOf('title="uid: ' + uid + '"') >= 0) || '');
+  const tagOf = o => o.cls + '|' + o.tone + '|' + o.label + '|' + (o.title ? 'T' : '-');
+  const at = i => state.accounts[i];
+  const out = {
+    tags: {
+      normal: tagOf(sandbox.__statusTagOf(at(0), '', [])),
+      paused: tagOf(sandbox.__statusTagOf(at(1), '', [])),
+      disabled: tagOf(sandbox.__statusTagOf(at(2), '', [])),
+      both: tagOf(sandbox.__statusTagOf(at(3), '', [])),
+    },
+    pausedTitle: sandbox.__statusTagOf(at(1), '', []).title,
+    bothTitle: sandbox.__statusTagOf(at(3), '', []).title,
+    rows: { normal: rowOf('uid-normal'), paused: rowOf('uid-paused'),
+            disabled: rowOf('uid-disabled'), both: rowOf('uid-both'),
+            cooling: rowOf('uid-cooling'), pausedCool: rowOf('uid-paused-cool') },
+    usageTokSuffix: nodes.accBody.innerHTML.indexOf('<em>tok</em>') >= 0,
+    pause: null, resume: null, disable: null,
+  };
+  const click = nodes.accBody._h.click;
+  const btn = (a, u) => ({ target: { closest: () => ({ dataset: { a: a, u: u }, disabled: false }) } });
+  const acts = { pause: ['pause', 'uid-normal'], resume: ['resume', 'uid-paused'] };
+  for (const key of Object.keys(acts)) {
+    calls.length = 0; confirms.length = 0;
+    await click(btn(acts[key][0], acts[key][1]));
+    await tick(); await tick(); // finally 里的 loadOverview 没有被 await：等它把行重渲染出来
+    const row = rowOf(acts[key][1]);
+    out[key] = {
+      calls: calls.slice(), toasts: nodes.toasts.children.map(c => c.textContent), confirmCount: confirms.length,
+      buttonAfter: row.indexOf('data-a="resume"') >= 0 ? 'resume' : (row.indexOf('data-a="pause"') >= 0 ? 'pause' : 'none'),
+    };
+  }
+  const disableCalls = () => calls.filter(c => c.url.indexOf('/disable') >= 0).length;
+  calls.length = 0; confirms.length = 0;
+  state.confirmReturn = false;
+  await click(btn('disable', 'uid-normal'));
+  await tick();
+  const cancelled = disableCalls(), confirmText = confirms[0] || '';
+  calls.length = 0; confirms.length = 0;
+  state.confirmReturn = true;
+  await click(btn('disable', 'uid-normal'));
+  await tick();
+  out.disable = { confirm: confirmText, cancelled: cancelled, confirmed: disableCalls() };
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})();
+`
+	f, err := os.CreateTemp(t.TempDir(), "paused-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cmd := exec.Command(node, f.Name(), "app.js")
+	cmd.Dir = "." // 测试工作目录 = internal/panel
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("paused accounts node render failed: %v\n%s", err, out)
+	}
+	var got struct {
+		Tags        map[string]string `json:"tags"`
+		PausedTitle string            `json:"pausedTitle"`
+		BothTitle   string            `json:"bothTitle"`
+		Rows        map[string]string `json:"rows"`
+		UsageTok    bool              `json:"usageTokSuffix"`
+		Pause       pausedActionResultJS
+		Resume      pausedActionResultJS
+		Disable     struct {
+			Confirm   string `json:"confirm"`
+			Cancelled int    `json:"cancelled"`
+			Confirmed int    `json:"confirmed"`
+		} `json:"disable"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("paused accounts output is not JSON: %v\n%s", err, out)
+	}
+
+	// (a) 四种组合的状态标签：disabled 优先于 paused；paused 既不占 bad（故障红）也不占
+	// warn（冷却/限流的琥珀），用中性 mute；色条走 tr.cool（琥珀）而不是 off（红）。
+	for _, tc := range []struct{ name, want string }{
+		{"normal", "|ok|可用|-"},
+		{"paused", "cool|mute|已暂停选号|T"},
+		{"disabled", "off|bad|已禁用|-"},
+		{"both", "off|bad|已禁用|T"}, // disabled+paused：结论取已禁用，暂停只进悬浮提示
+	} {
+		if got.Tags[tc.name] != tc.want {
+			t.Errorf("statusTagOf(%s)=%q want %q", tc.name, got.Tags[tc.name], tc.want)
+		}
+	}
+	for _, want := range []string{"照常签到", "活跃上报", "保活", "刷新余额", "恢复选号"} {
+		if !strings.Contains(got.PausedTitle, want) {
+			t.Errorf("已暂停选号的悬浮提示缺 %q：%s", want, got.PausedTitle)
+		}
+	}
+	if !strings.Contains(got.BothTitle, "恢复选号") {
+		t.Errorf("disabled+paused 的悬浮提示要提醒解冻后仍需恢复选号：%s", got.BothTitle)
+	}
+
+	// (b) 行内按钮 + 行 HTML（标签、按钮、色条 class 一起钉）。
+	rowWant := map[string][]string{
+		"normal": {`<tr class=""`, `<span class="tag ok"`, `>可用</span>`,
+			`<button class="xs ghost" data-a="pause" data-u="uid-normal" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>`,
+			`<button class="xs ghost" data-a="disable"`},
+		"paused": {`<tr class="cool"`, `<span class="tag mute"`, `>已暂停选号</span>`,
+			`<button class="xs primary" data-a="resume" data-u="uid-paused">恢复选号</button>`,
+			`<button class="xs ghost" data-a="disable"`},
+		"disabled": {`<tr class="off"`, `<span class="tag bad"`, `>已禁用</span>`,
+			`<button class="xs primary" data-a="revive"`},
+		"both": {`<tr class="off"`, `<span class="tag bad"`, `>已禁用</span>`,
+			`<button class="xs primary" data-a="revive"`},
+	}
+	for name, frags := range rowWant {
+		if got.Rows[name] == "" {
+			t.Fatalf("%s 行没渲染出来", name)
+		}
+		for _, frag := range frags {
+			if !strings.Contains(got.Rows[name], frag) {
+				t.Errorf("%s 行缺片段 %q\n实际：%s", name, frag, got.Rows[name])
+			}
+		}
+	}
+	// 已禁用账号不得出现暂停/恢复/禁用三者中的任何一个（禁用已含不参与选号，并列即误导）。
+	for _, name := range []string{"disabled", "both"} {
+		for _, bad := range []string{`data-a="pause"`, `data-a="resume"`, `data-a="disable"`} {
+			if strings.Contains(got.Rows[name], bad) {
+				t.Errorf("%s 行不该有 %s（已禁用账号不给暂停/禁用入口）\n实际：%s", name, bad, got.Rows[name])
+			}
+		}
+	}
+	if strings.Contains(got.Rows["paused"], `data-a="pause"`) {
+		t.Errorf("已暂停的行应给「恢复选号」而不是「暂停选号」：%s", got.Rows["paused"])
+	}
+	if strings.Contains(got.Rows["normal"], `data-a="resume"`) {
+		t.Errorf("未暂停的行不该出现「恢复选号」：%s", got.Rows["normal"])
+	}
+	// 暂停与冷却正交：本 fork 在这里刻意比上游多给一个入口——上游把暂停/恢复挂在
+	// frozen（禁用或冷却）的 else 分支里，冷却中的号只能「解冻」，既没法主动让位，
+	// 已暂停的号也得等冷却走完才能恢复。这里让两个按钮各管各的状态。
+	if !strings.Contains(got.Rows["cooling"], `<tr class="cool"`) ||
+		!strings.Contains(got.Rows["cooling"], `data-a="revive"`) ||
+		!strings.Contains(got.Rows["cooling"], `data-a="pause"`) {
+		t.Errorf("冷却中的号应同时给出「解冻」与「暂停选号」：%s", got.Rows["cooling"])
+	}
+	if !strings.Contains(got.Rows["pausedCool"], `>已暂停选号</span>`) ||
+		!strings.Contains(got.Rows["pausedCool"], `data-a="revive"`) ||
+		!strings.Contains(got.Rows["pausedCool"], `data-a="resume"`) {
+		t.Errorf("暂停 + 冷却的号：标签取 paused，且「解冻」「恢复选号」都要在：%s", got.Rows["pausedCool"])
+	}
+
+	// (e) 回归：用量列仍是 7.10M 的 chip（不带 tok 后缀），行仍是 11 列。
+	for name, row := range got.Rows {
+		if !strings.Contains(row, `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+			t.Errorf("%s 行今日用量不再是 7.10M 的 chip：%s", name, row)
+		}
+		if n := strings.Count(row, "<td"); n != 11 {
+			t.Errorf("%s 行有 %d 个 <td>，账号表是 11 列", name, n)
+		}
+	}
+	if got.UsageTok {
+		t.Error("账号表用量列又带上了 tok 后缀")
+	}
+
+	// (d) 点击后真的发出请求：URL + 方法都要对，且重渲染后同一行的按钮翻面。
+	for _, tc := range []struct {
+		name   string
+		res    pausedActionResultJS
+		url    string
+		button string
+		toast  string
+	}{
+		{"pause", got.Pause, "/panel/api/accounts/uid-normal/pause", "resume", "已暂停选号"},
+		{"resume", got.Resume, "/panel/api/accounts/uid-paused/resume", "pause", "已恢复选号"},
+	} {
+		if len(tc.res.Calls) == 0 {
+			t.Fatalf("%s 点击没有发出任何请求", tc.name)
+		}
+		if tc.res.Calls[0].URL != tc.url || tc.res.Calls[0].Method != "POST" {
+			t.Errorf("%s 点击发出 %s %s，want POST %s", tc.name, tc.res.Calls[0].Method, tc.res.Calls[0].URL, tc.url)
+		}
+		if tc.res.ButtonAfter != tc.button {
+			t.Errorf("%s 后同一行按钮变成 %q，want %q", tc.name, tc.res.ButtonAfter, tc.button)
+		}
+		if n := len(tc.res.Toasts); n == 0 || !strings.Contains(tc.res.Toasts[n-1], tc.toast) {
+			t.Errorf("%s 的 toast 文案缺 %q：%v", tc.name, tc.toast, tc.res.Toasts)
+		}
+	}
+	// pause 不弹确认（可逆、无损、保号任务照常）：与 disable 的差别就在这里。
+	if got.Pause.ConfirmCount != 0 {
+		t.Errorf("pause 不该弹 confirm（可逆无损，上游也不弹），实际弹了 %d 次", got.Pause.ConfirmCount)
+	}
+
+	// (c) disable 的 confirm 文案必须把「暂停选号」这条更轻的路指出来；取消时不得发请求。
+	if !strings.Contains(got.Disable.Confirm, "暂停选号") {
+		t.Errorf("disable 的确认文案没提到「暂停选号」：%s", got.Disable.Confirm)
+	}
+	if got.Disable.Cancelled != 0 {
+		t.Errorf("confirm 取消后仍发出了 %d 次 disable 请求", got.Disable.Cancelled)
+	}
+	if got.Disable.Confirmed != 1 {
+		t.Errorf("confirm 确认后 disable 请求数=%d，want 1", got.Disable.Confirmed)
+	}
+
+	// 色条不是随便挑的 class：账号表只有三档（index.html 的 tr.cool / tr.rl / tr.off），
+	// 把「暂停 → tr.cool → 琥珀条」这条链的另一端（CSS）也钉住。
+	html, err := os.ReadFile("index.html")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, rule := range []string{
+		`.acc tbody tr.cool .mark i { background: var(--warn-mark); }`,
+		`.acc tbody tr.off .mark i { background: var(--bad-mark); }`,
+	} {
+		if !strings.Contains(string(html), rule) {
+			t.Errorf("index.html 缺少色条规则 %q（行 class 是色条的唯一来源）", rule)
+		}
+	}
+	// 配置页 include_disabled_in_tasks 的说明要指向账号行的「暂停选号」按钮：那个开关是
+	// 全局的（且面向「确实要禁用」的场景），单号临时让位不该为了它改全局配置。
+	if !strings.Contains(string(html), `账号行的「<b>暂停选号</b>」按钮`) {
+		t.Error("include_disabled_in_tasks 的说明没指向账号行的「暂停选号」按钮")
+	}
+}
+
 // TestAppJSRequestLogSourceAndCache 请求行的「调用来源 + 缓存命中率」两段增量（本批从
 // 上游移植，形态适配本 fork 的行式日志）：
 //   - 来源段与 stdout 流水行同款（`src=IP ua="客户端标签"`），且**只有采集到才追加**：

@@ -470,10 +470,37 @@ function todayRateOf(td) {
    让人以为它完全健康（实测：标签写着可用，下面挂着「预计 10-01 11:14 解封」的琥珀条）。
    状态列只渲染这一个标签：具体原因（哪些模型、何时解封、禁用原因）全部放进 title，
    悬浮才显示——常显的原因会把行高撑得参差不齐，也让「状态」这一列喧宾夺主。
-   coolText 由调用方格式化（本函数不依赖 dur）；rlMetas 是 rateLimitMeta 的结果数组。 */
+   coolText 由调用方格式化（本函数不依赖 dur）；rlMetas 是 rateLimitMeta 的结果数组。
+   优先级：disabled > paused > 账号级冷却 > 模型级受限 > 可用——disabled 与 paused 同时
+   置位时只报「已禁用」：禁用是更彻底的结论（保号任务默认也停），显示暂停会让人以为
+   点一下「恢复选号」就能出量；paused 又排在冷却之前，因为「我手动按下的暂停」才是这个
+   号眼下不出量的原因，只显示倒计时会让人以为等一等就自动回候选（点「解冻」同样不会）。 */
 function statusTagOf(s, coolText, rlMetas) {
   const reason = (s && s.reason) ? String(s.reason) : '';
-  if (s.disabled) return { cls: 'off', tone: 'bad', label: '已禁用', title: reason };
+  if (s.disabled) {
+    // 已禁用 + 已暂停：暂停标记被结论盖住，但仍是解冻后不出量的原因，放进悬浮提示里，
+    // 免得运维解冻完盯着一个照常签到的号找不到「为什么还是选不上」。
+    const bits = [];
+    if (reason) bits.push(reason);
+    if (s.paused) bits.push('同时处于暂停选号状态：解冻后还需点「恢复选号」才会回到候选。');
+    return { cls: 'off', tone: 'bad', label: '已禁用', title: bits.join('\n') };
+  }
+  /* 已暂停选号（paused）：运维主动让位，不是故障。
+     配色取舍：不用 bad——红在本 fork 专指需要干预的故障（禁用 / 熔断）；也不用 warn——
+     琥珀在这里专指「冷却 / 熔断 / 模型限流」这类只能等它自己恢复的被动异常，运维扫视时
+     会条件反射地去排查，而暂停点一下就能改回来。mute 的中性灰正是「人为、无需处理」。
+     色条不新起一档：账号表只有 绿(在服务) / 琥珀(暂不服务) / 红(禁用) 三档（index.html
+     的 tr.cool / tr.rl / tr.off），暂停属「暂不服务」，故复用 tr.cool 的琥珀条，红的 off
+     只留给 disabled。 */
+  if (s.paused) {
+    return {
+      cls: 'cool',
+      tone: 'mute',
+      label: '已暂停选号',
+      title: (reason ? reason + '\n' : '') +
+        '暂停期间照常签到 / 活跃上报 / 保活 / 刷新余额，只是退出选号候选。\n点「恢复选号」重新参与选号。',
+    };
+  }
   if (coolText) {
     return {
       cls: 'cool', tone: 'warn', label: coolText,
@@ -605,6 +632,18 @@ function renderAccounts(list) {
         '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
         (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
                 : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
+        /* 暂停 / 恢复选号（上游 paused 合并过来的操作）：「解冻/禁用」旁并列的第二个开关，
+           与 disable 正交且不能互相替代——pause 只退出选号，签到 / 活跃上报 / 保活 /
+           刷新余额照常；disable 默认连保号任务一起停（include_disabled_in_tasks 才是例外）。
+           也不与冷却互斥：冷却中的号同样可以主动让位，已暂停的号在冷却期间也应能立刻恢复
+           （意图立即生效，不必等冷却走完），故这一个按钮不看 frozen，只看 paused。
+           已禁用账号不渲染它：禁用已含「不参与选号」，两个按钮并列会让人以为效果能叠加，
+           也容易误以为禁用号的任务还能靠暂停挽回（本 fork 的 include_disabled_in_tasks
+           是全局开关，不是账号级补救）。 */
+        (s.disabled ? ''
+          : (s.paused
+              ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
+              : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
         '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>' +
       '</td></tr>';
   }).join('');
@@ -693,7 +732,9 @@ $('accBody').addEventListener('click', async ev => {
   if (!b) return;
   const u = b.dataset.u, a = b.dataset.a;
   if (a === 'remove' && !confirm('移除账号将删除池状态与 auths/ 下的凭证文件，且不可恢复。确认移除？')) return;
-  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。确认禁用？')) return;
+  // disable 的确认文案里点名「暂停选号」：两者都让账号退出选号，但暂停可逆、保号任务照常，
+  // 正是「只想临时让位」的人要的那个——不问一句，多数人会直接用更重的禁用。
+  if (a === 'disable' && !confirm('禁用后该账号不再参与选号，需手动解冻才能恢复。若只是想临时让位、仍要保号，可改用「暂停选号」。确认禁用？')) return;
   b.disabled = true;
   try {
     if (a === 'checkin') {
@@ -708,6 +749,15 @@ $('accBody').addEventListener('click', async ev => {
     } else if (a === 'disable') {
       await api('accounts/' + encodeURIComponent(u) + '/disable', { method: 'POST' });
       toast('已禁用', 'ok');
+    } else if (a === 'pause') {
+      /* 刻意不弹确认（与 disable 不同）：pause 可逆、无损，保号任务照常跑，点错了再点
+         「恢复选号」即可；「让某个号临时让位」是高频运维动作，每次都多一次点击只增加
+         摩擦。remove / disable 这类不可逆或有副作用的操作才需要确认。 */
+      await api('accounts/' + encodeURIComponent(u) + '/pause', { method: 'POST' });
+      toast('已暂停选号（签到 / 保活照常）', 'ok');
+    } else if (a === 'resume') {
+      await api('accounts/' + encodeURIComponent(u) + '/resume', { method: 'POST' });
+      toast('已恢复选号', 'ok');
     } else if (a === 'tasks') {
       openTasks(u);
     } else if (a === 'remove') {
