@@ -3927,6 +3927,453 @@ runScenario(async () => {
 	}
 }
 
+// modelPanelStubJS 是「模型条件查询」用例共用的 node 沙箱骨架（沙箱写法与
+// reqPanelStubJS / TestAppJSTopLevelSmoke 同款）：
+//   - 真实切片 app.js 的 api / $ / esc / skeletonRows 与整个模型区段；用例只通过控件
+//     自己的 oninput / onchange / onclick 驱动（接线断了这条路径就失败），不直接改状态；
+//   - 假 fetch 记录每条 /panel/api/… URL：「筛选与排序零新请求」的断言就是比对这份清单；
+//   - 上游目录 / 探测结果由用例改写（devModels / devProbes），断言全部落在 mdBody 的
+//     innerHTML 与计数条上——那是真实渲染产物，不是内部状态。
+const modelPanelStubJS = `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const apiSrc = src.slice(src.indexOf('async function api('), src.indexOf('/* toast 提示'));
+const dollarSrc = src.slice(src.indexOf('const $ = id =>'), src.indexOf('/* ── 主题'));
+const escSrc = src.slice(src.indexOf('function esc('), src.indexOf('function ago('));
+const skelSrc = src.slice(src.indexOf('function skeletonRows('), src.indexOf('function go(v)'));
+const mdStart = src.indexOf('/* ── 模型 ──');
+const mdEnd = src.indexOf('/* ── 日志（频道');
+if (!apiSrc || !dollarSrc || !escSrc || !skelSrc || mdStart < 0 || mdEnd <= mdStart) {
+  throw new Error('模型筛选区段或依赖切片未找到');
+}
+const mdSrc = src.slice(mdStart, mdEnd);
+
+let devModels = [], devProbes = {};
+const urls = [];
+const body = p => p.startsWith('model_probes') ? { probes: devProbes, exists: true } : { models: devModels };
+
+// DOM 桩：元素是 Proxy，未实现的成员回落到 inert（跑通整段模型代码不必实现所有 DOM 方法）。
+const inert = new Proxy(function () {}, {
+  get(t, k) { if (k === Symbol.toPrimitive) return () => ''; return inert; },
+  set() { return true; }, apply() { return inert; }, construct() { return inert; }, has() { return true; },
+});
+const nodes = {}, qcache = {};
+const mkEl = key => {
+  const classes = new Set(), handlers = {};
+  const store = {
+    key, innerHTML: '', textContent: '', value: '', className: '', hidden: false, dataset: {}, children: [], __h: handlers,
+    classList: {
+      add: c => classes.add(c), remove: c => classes.delete(c),
+      toggle: (c, on) => { const w = on === undefined ? !classes.has(c) : !!on; if (w) classes.add(c); else classes.delete(c); return w; },
+      contains: c => classes.has(c),
+    },
+    setAttribute() {}, getAttribute: () => null, addEventListener(t, fn) { handlers[t] = fn; },
+    appendChild(n) { store.children.push(n); return n; }, remove() {}, closest: () => null,
+    querySelector: sel => (qcache[key + '|' + sel] = qcache[key + '|' + sel] || mkEl(key + '|' + sel)),
+    querySelectorAll: () => [],
+  };
+  return new Proxy(store, { get(t, k) { return k in t ? t[k] : inert; }, set(t, k, v) { t[k] = v; return true; }, has: () => true });
+};
+const el = id => (nodes[id] = nodes[id] || mkEl(id));
+
+const sandbox = {
+  localStorage: { getItem: () => null, setItem() {}, removeItem() {} },
+  fetch: url => {
+    urls.push(String(url));
+    return Promise.resolve({ status: 200, ok: true, json: () => Promise.resolve(body(String(url).replace('/panel/api/', ''))) });
+  },
+  LS_KEY: 'wb2api.key', openKey: () => {},
+  document: { getElementById: el },
+  setTimeout, clearTimeout, console, JSON, Math, Date, Number, String, Boolean, Object, Array, Promise, Map, Set, RegExp, Error, TypeError, isNaN, parseInt, parseFloat, encodeURIComponent, decodeURIComponent,
+};
+sandbox.window = sandbox; sandbox.globalThis = sandbox;
+vm.createContext(sandbox);
+vm.runInContext(apiSrc + '\n' + dollarSrc + '\n' + escSrc + '\n' + skelSrc + '\n' + mdSrc +
+  '\nthis.loadModels = loadModels; this.mdFilter = () => mdFilter; this.mdAll = () => mdAll;',
+  sandbox, { filename: 'app.js' });
+
+const sleep = ms => new Promise(r => setTimeout(r, ms));
+const rowsOf = html => html.split('<tr>').slice(1).map(s => '<tr>' + s);
+// 模型行唯一标识是首列的 <div class="nm">id</div>（<div class="nm"> 恰好 16 字符）。
+const idsOf = html => (html.match(/<div class="nm">[^<]*<\/div>/g) || []).map(s => s.slice(16, -6));
+const cells = r => (r.replace(/^<tr[^>]*>/, '').replace(/<\/tr>$/, '').match(/<td[^>]*>.*?<\/td>/g) || []);
+const runScenario = fn => fn().then(
+  out => { process.stdout.write(JSON.stringify(out)); process.exit(0); },
+  e => { console.log('MODEL FILTER FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// TestAppJSModelFilterAndSort 钉住模型档位页的条件查询（上游 981bbe2 的模型筛选部分）：
+// 关键词（空格分词 AND、大小写不敏感、命中 ID/名称/描述/厂商/标签）、域、能力、思考档位、
+// 价格五个维度的结果行集合，四种排序，清除筛选回到全量，以及两条行为红线——
+// 筛选/排序绝不重新请求上游（假 fetch 清单只该有首屏那两条），空结果走既有 .empty 空态。
+//
+// 模型行集合用「渲染出来的 id 列表」比对而不是内部数组：筛选对了但渲染没跟上
+// （例如 renderModels 忘了重画 tbody）同样要失败。
+func TestAppJSModelFilterAndSort(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model filter test skipped")
+	}
+	script := modelPanelStubJS + `
+// 目录桩：五个模型刻意覆盖各维度的边界——无倍率（排尾）、context 并列（验证排序稳定）、
+// 无 max_output、只有 promo_label 没有 factor（错峰类算「有优惠」但没有折扣倍率）。
+const MODELS = [
+  { id: 'cn:glm-5.2', name: 'GLM-5.2 旗舰', vendor: 'Zhipu', description: '国内旗舰对话模型', tags: ['旗舰', '长上下文'],
+    is_default: true, supports_tool_call: true, supports_images: true, supports_reasoning: true,
+    can_disable_thinking: true, supported_efforts: ['high', 'xhigh'], default_effort: 'high',
+    credits: 'x2', promo_factor: 0, promo_credits: 'x0', promo_label: '限时免费', promo_note: '9 月限时',
+    context_length: 200000, max_output_tokens: 96000 },
+  { id: 'cn:glm-4.5-air', name: 'GLM-4.5 Air', vendor: 'Zhipu', description: '轻量快速', tags: ['轻量'],
+    is_default: false, supports_tool_call: true, supports_images: false, supports_reasoning: false,
+    can_disable_thinking: false, supported_efforts: [], default_effort: '',
+    credits: 'x0.5', promo_factor: 0.5, promo_credits: 'x0.25', promo_label: '夜间五折',
+    context_length: 128000, max_output_tokens: 32000 },
+  { id: 'global:gpt-5.6-luna', name: 'GPT-5.6 Luna', vendor: 'OpenAI', description: '国际版旗舰', tags: ['实验'],
+    is_default: false, supports_tool_call: true, supports_images: true, supports_reasoning: true,
+    can_disable_thinking: false, supported_efforts: ['low', 'medium', 'high', 'xhigh', 'max'], default_effort: 'high',
+    credits: 'x8.88', promo_label: '错峰优惠',
+    context_length: 400000, max_output_tokens: 128000 },
+  { id: 'global:deepseek-v4-pro', name: 'DeepSeek V4 Pro', vendor: 'DeepSeek', description: '推理模型', tags: ['推理', '便宜'],
+    is_default: false, supports_tool_call: false, supports_images: false, supports_reasoning: true,
+    can_disable_thinking: false, supported_efforts: ['low', 'high', 'xhigh'], default_effort: 'high',
+    context_length: 128000 },
+  { id: 'cn:glm-4.6-vision', name: 'GLM-4.6 视觉版', vendor: 'Zhipu', description: '多模态', tags: ['多模态'],
+    is_default: false, supports_tool_call: false, supports_images: true, supports_reasoning: false,
+    can_disable_thinking: true, supported_efforts: ['off', 'high'], default_effort: 'high',
+    credits: 'x3', context_length: 64000, max_output_tokens: 16000 },
+];
+// 探测结果只给第一个模型：实测上限标注（钳制告警）必须随筛选后的行一起保留。
+const PROBES = { 'cn:glm-5.2': { claimed: 96000, measured: 24000, verdict: 'clamped',
+  tested_at: '2026-09-20 10:00:00', note: '截断于 24K' } };
+
+runScenario(async () => {
+  const out = {};
+  devModels = MODELS; devProbes = PROBES;
+  await sandbox.loadModels();
+  out.urls = urls.join(' ');
+  out.all = idsOf(el('mdBody').innerHTML).join(',');
+  out.allCount = el('mdCount').textContent;
+  out.allCountCls = el('mdCount').className;
+  out.note = el('mdNote').textContent;
+  // 本 fork 的七列与信息逐字保留：积分倍率（生效价 + 划线牌价 + 标签）、支持档位含
+  // off（可关）、上下文长度、最大输出含实测值与钳制告警。
+  const rows = rowsOf(el('mdBody').innerHTML);
+  out.rowCols = String((rows[0].match(/<td/g) || []).length);
+  out.rowRate = cells(rows[0])[2];
+  out.rowEff = cells(rows[0])[4];
+  out.rowCtx = cells(rows[0])[5];
+  out.rowOut = cells(rows[0])[6];
+
+  // 之后的断言只看控件驱动的变化：这里的基线长度就是「零新请求」的分母。
+  const before = urls.length;
+  const type = async v => { el('mdQ').value = v; el('mdQ').oninput(); await sleep(150); };
+  const pick = (id, v) => { el(id).value = v; el(id).onchange(); };
+  const now = () => idsOf(el('mdBody').innerHTML).join(',');
+
+  // 关键词：大小写不敏感；空格分词 AND；ID / 名称 / 描述 / 厂商 / 标签都参与匹配。
+  await type('GLM'); out.qUpper = now();
+  out.qUpperCount = el('mdCount').textContent;
+  out.qUpperCls = el('mdCount').className;
+  await type('zhipu 旗舰'); out.qAnd = now();
+  await type('视觉'); out.qName = now();
+  await type('多模态'); out.qTag = now();
+  await type('快速'); out.qDesc = now();
+  await type('deepseek'); out.qVendorId = now();
+  await type('不存在的模型'); out.qMiss = now();
+  out.qMissHtml = el('mdBody').innerHTML;
+  out.qMissCount = el('mdCount').textContent;
+  out.qMissCls = el('mdCount').className;
+  await type('');
+
+  // 域 / 能力 / 思考档位 / 价格：下拉不防抖，一次切换就是一次（纯前端）重画。
+  pick('mdRealm', 'cn'); out.realmCn = now();
+  pick('mdRealm', 'global'); out.realmGlobal = now();
+  pick('mdRealm', '');
+  pick('mdCap', 'tool'); out.capTool = now();
+  pick('mdCap', 'vision'); out.capVision = now();
+  pick('mdCap', 'reasoning'); out.capReasoning = now();
+  pick('mdCap', 'default'); out.capDefault = now();
+  pick('mdCap', '');
+  pick('mdEffort', 'off'); out.effortOff = now();
+  pick('mdEffort', 'xhigh'); out.effortXhigh = now();
+  pick('mdEffort', 'max'); out.effortMax = now();
+  pick('mdEffort', '');
+  pick('mdPromo', 'promo'); out.promoAny = now();
+  pick('mdPromo', 'free'); out.promoFree = now();
+  pick('mdPromo', 'discount'); out.promoDiscount = now();
+  pick('mdPromo', '');
+
+  // 条件之间是 AND：域 + 能力 + 排序同时生效。
+  pick('mdRealm', 'cn'); pick('mdCap', 'vision'); pick('mdSort', 'rate'); out.combo = now();
+  pick('mdRealm', ''); pick('mdCap', '');
+
+  // 排序四键 + 默认档（后端原顺序）。context 一列刻意造了并列（两个 128000）：
+  // 稳定排序必须保持它们在目录里的相对顺序，否则「同长度」的展示顺序会随机跳动。
+  pick('mdSort', 'rate'); out.sortRate = now();
+  pick('mdSort', 'context'); out.sortContext = now();
+  pick('mdSort', 'output'); out.sortOutput = now();
+  pick('mdSort', 'name'); out.sortName = now();
+  pick('mdSort', 'default'); out.sortDefault = now();
+  out.fetches = String(urls.length - before);
+
+  // 清除筛选：控件与状态一起复位，行集合回到全量，且不触发请求。
+  await type('GLM'); pick('mdSort', 'rate');
+  el('mdReset').onclick();
+  out.reset = now();
+  out.resetQ = el('mdQ').value;
+  out.resetSort = el('mdSort').value;
+  out.resetRealm = el('mdRealm').value;
+  out.resetCount = el('mdCount').textContent;
+  out.resetCls = el('mdCount').className;
+  out.resetFetches = String(urls.length - before);
+  out.filterState = JSON.stringify(sandbox.mdFilter());
+  out.mdAllLen = String(sandbox.mdAll().length);
+
+  // 重新获取（用户点「重新获取」）：沿用当前筛选条件，不因为刷新把条件悄悄清掉。
+  pick('mdCap', 'vision');
+  await sandbox.loadModels();
+  out.reloadKept = now();
+  out.reloadFetches = String(urls.length - before);
+
+  // 上游未返回模型：走「上游未返回模型」空态，并清掉计数条。
+  devModels = [];
+  await sandbox.loadModels();
+  out.emptyUpstream = el('mdBody').innerHTML;
+  out.emptyUpstreamCount = el('mdCount').textContent;
+  return out;
+});`
+	f, err := os.CreateTemp(t.TempDir(), "model-filter-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("模型筛选 node 测试失败: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("模型筛选输出不是 JSON: %v\n%s", err, out)
+	}
+	// 目录里的 id 在 Go 侧也留一份名字：断言读起来是「哪些模型」，不是一长串前缀。
+	const (
+		mGlm   = "cn:glm-5.2"
+		mAir   = "cn:glm-4.5-air"
+		mLuna  = "global:gpt-5.6-luna"
+		mDeep  = "global:deepseek-v4-pro"
+		mVis   = "cn:glm-4.6-vision"
+		allIDs = mGlm + "," + mAir + "," + mLuna + "," + mDeep + "," + mVis
+	)
+	rows := func(ids ...string) string { return strings.Join(ids, ",") }
+	for _, tc := range []struct{ key, want string }{
+		// 首屏：两条请求（目录 + 可选探测），无筛选时计数条不转琥珀。
+		{"urls", "/panel/api/models /panel/api/model_probes"},
+		{"all", allIDs},
+		{"allCount", "5 个模型"},
+		{"allCountCls", "note"},
+		{"note", "5 个模型 · 已刷新降级缓存 · 1 个有实测上限"},
+		{"rowCols", "7"},
+		{"rowRate", `<td class="num"><span title="9 月限时" class="help"><b>x0</b> <span class="tag info">限时免费</span> <s class="c-muted fs-12">x2</s></span></td>`},
+		{"rowEff", `<td class="efs"><span class="tag info">high</span> <span class="tag info">xhigh</span> <span class="tag info">off（可关）</span></td>`},
+		{"rowCtx", `<td class="num">200K</td>`},
+		{"rowOut", `<td class="num" title="声称 96K · 实测 24K · 截断于 24K · 探测于 2026-09-20 10:00:00"><span class="c-warn strong">24K ⚠</span><div class="note">钳制 4×</div></td>`},
+		// 关键词：大写 GLM 命中三个（id/名称都含）、空格分词 AND、名称/描述/标签/ID 各一遍
+		{"qUpper", rows(mGlm, mAir, mVis)},
+		{"qUpperCount", "命中 3 / 5 个模型"},
+		{"qUpperCls", "note src-off"},
+		{"qAnd", rows(mGlm)},       // 厂商 Zhipu AND 标签 旗舰
+		{"qName", rows(mVis)},      // 命中名称「GLM-4.6 视觉版」
+		{"qTag", rows(mVis)},       // 命中标签「多模态」
+		{"qDesc", rows(mAir)},      // 命中描述「轻量快速」
+		{"qVendorId", rows(mDeep)}, // 命中 id 与厂商 DeepSeek
+		// 空结果：既有 .empty 写法 + 「N / M」计数 + 琥珀提示
+		{"qMiss", ""},
+		{"qMissHtml", `<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>`},
+		{"qMissCount", "命中 0 / 5 个模型"},
+		{"qMissCls", "note src-off"},
+		// 域：按 id 前缀（= 调用时该填的 model 值）判定
+		{"realmCn", rows(mGlm, mAir, mVis)},
+		{"realmGlobal", rows(mLuna, mDeep)},
+		// 能力：工具 / 视觉 / 思考 / 默认
+		{"capTool", rows(mGlm, mAir, mLuna)},
+		{"capVision", rows(mGlm, mLuna, mVis)},
+		{"capReasoning", rows(mGlm, mLuna, mDeep)},
+		{"capDefault", rows(mGlm)},
+		// 思考档位：off = 可关闭思考；其余档位看 supported_efforts
+		{"effortOff", rows(mGlm, mVis)},
+		{"effortXhigh", rows(mGlm, mLuna, mDeep)},
+		{"effortMax", rows(mLuna)},
+		// 价格：有优惠（含错峰标签）/ 限时免费（factor 0）/ 打折但非免费
+		{"promoAny", rows(mGlm, mAir, mLuna)},
+		{"promoFree", rows(mGlm)},
+		{"promoDiscount", rows(mAir)},
+		// 域 + 能力 + 排序三条件 AND
+		{"combo", rows(mGlm, mVis)},
+		// 排序四键：倍率升序（无倍率的 mDeep 排尾）、上下文/最大输出降序、ID A→Z
+		{"sortRate", rows(mGlm, mAir, mVis, mLuna, mDeep)},
+		{"sortContext", rows(mLuna, mGlm, mAir, mDeep, mVis)},
+		{"sortOutput", rows(mLuna, mGlm, mAir, mVis, mDeep)},
+		{"sortName", rows(mAir, mVis, mGlm, mDeep, mLuna)},
+		{"sortDefault", allIDs},
+		// 红线：上面所有筛选与排序一次请求都没发（before 之后 urls 长度不变）
+		{"fetches", "0"},
+		{"reset", allIDs},
+		{"resetQ", ""},
+		{"resetSort", "default"},
+		{"resetRealm", ""},
+		{"resetCount", "5 个模型"},
+		{"resetCls", "note"},
+		{"resetFetches", "0"},
+		{"filterState", `{"q":"","realm":"","cap":"","effort":"","promo":"","sort":"default"}`},
+		{"mdAllLen", "5"},
+		// 重新获取沿用筛选条件：cap=vision 仍然生效，且确实重新拉了目录（2 条请求）
+		{"reloadKept", rows(mGlm, mLuna, mVis)},
+		{"reloadFetches", "2"},
+		{"emptyUpstream", `<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>`},
+		{"emptyUpstreamCount", ""},
+	} {
+		if got[tc.key] != tc.want {
+			t.Errorf("%s=%q\nwant %q", tc.key, got[tc.key], tc.want)
+		}
+	}
+}
+
+// TestAppJSCollectConfigClearable 钉住 collectConfig 的空串语义（上游 10e17ef）。
+//
+// 覆盖型字段（user_agent / prompt_file）空串必须照发：mergeConfigMaps 是深合并，
+// 未提交的键原样保留，漏发会让面板显示「已保存」而 config.json 里的值没变——
+// 「清空 = 回落默认」这条路径就彻底没了。
+//
+// 反面同样重要：其余文本字段空串仍然不下发（表单里没填的框 = 没改，不是「请清空」）；
+// api_key 刻意不在 CLEARABLE_CFG 里——清空它等于关掉整个鉴权。
+func TestAppJSCollectConfigClearable(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; collectConfig test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('const CFG_MAP');
+const end = src.indexOf('/* Go 时长字段即时校验');
+if (start < 0 || end < 0 || end < start) throw new Error('collectConfig region not found');
+const mk = v => ({ type: 'text', value: v });
+const cfgForm = { elements: {
+  listen: mk(''),
+  api_key: mk(''),
+  user_agent: mk(''),
+  prompt_file: mk(''),
+  prompt_mode: mk(''),
+  checkin_hours: mk(''),
+}};
+const ctx = {
+  Date, Number, String, Math, Map, Array, Object, isNaN, URLSearchParams, Set,
+  document: { getElementById: id => (id === 'cfgForm' ? cfgForm : null) },
+  $: id => (id === 'cfgForm' ? cfgForm : null),
+};
+vm.createContext(ctx);
+// const 声明只活在脚本文法作用域里，不会挂到 context 全局上，故显式导出这两个符号。
+vm.runInContext(src.slice(start, end) +
+  '\nthis.collectConfig = collectConfig; this.CLEARABLE_CFG = CLEARABLE_CFG;', ctx);
+const out = ctx.collectConfig();
+const has = (o, k) => Object.prototype.hasOwnProperty.call(o || {}, k);
+process.stdout.write(JSON.stringify([
+  has(out.upstream, 'user_agent'), (out.upstream || {}).user_agent,
+  has(out.prompt, 'file'), (out.prompt || {}).file,
+  has(out.prompt, 'mode'),
+  has(out, 'listen'),
+  has(out, 'api_key'),
+  has(out.schedule, 'checkin_hours'),
+  ctx.CLEARABLE_CFG ? ctx.CLEARABLE_CFG.has('api_key') : 'no-set'
+]));`
+	f, err := os.CreateTemp(t.TempDir(), "cfgc-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("collectConfig node test failed: %v\n%s", err, out)
+	}
+	// [user_agent 已发, 其值 "", prompt.file 已发, 其值 "", prompt.mode 未发,
+	//  listen 未发, api_key 未发, checkin_hours 未发, CLEARABLE_CFG 不含 api_key]
+	const want = `[true,"",true,"",false,false,false,false,false]`
+	if strings.TrimSpace(string(out)) != want {
+		t.Fatalf("collectConfig=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestIndexModelFilterBar 模型页筛选栏的静态结构（不依赖 node）：
+//   - 复用既有 .fbar 体系（第 7 批为请求记录引入），不新造一套筛选栏样式；
+//   - 五个筛选 + 排序 + 计数 + 清除筛选的控件 id / option 取值必须与应用层判定一致
+//     （值拼错不报错，只是该筛选项永远筛不出东西）；
+//   - 模型表仍是本 fork 的七列，表格高度预算把新增的筛选栏算进去。
+func TestIndexModelFilterBar(t *testing.T) {
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	body := rec.Body.String()
+
+	const fbarStart = `<div class="fbar" id="mdFilterBar">`
+	const tbodyStart = `<tbody id="mdBody"></tbody>`
+	viewAt := strings.Index(body, `<section class="view" id="view-models"`)
+	i, j := strings.Index(body, fbarStart), strings.Index(body, tbodyStart)
+	if viewAt < 0 || i < 0 || j < 0 || j < i || i < viewAt {
+		t.Fatalf("index.html 缺少模型筛选栏或表格：view=%d fbar=%d tbody=%d", viewAt, i, j)
+	}
+	fbar := body[i:j]
+	for _, want := range []string{
+		`<input id="mdQ" type="search"`,
+		`<select id="mdRealm" class="xs"`,
+		`<select id="mdCap" class="xs"`,
+		`<select id="mdEffort" class="xs"`,
+		`<select id="mdPromo" class="xs"`,
+		`<select id="mdSort" class="xs"`,
+		`<span class="grow"></span>`,
+		`<span class="note" id="mdCount"></span>`,
+		`<button class="xs" id="mdReset"`,
+	} {
+		if !strings.Contains(fbar, want) {
+			t.Errorf("模型筛选栏缺少控件 %s\n实际：%s", want, fbar)
+		}
+	}
+	// 各维度取值必须与应用层判定字面量一一对应（不发明取值）。
+	for _, want := range []string{
+		`<option value="">全部域</option>`, `<option value="cn">`, `<option value="global">`,
+		`<option value="tool">`, `<option value="vision">`, `<option value="reasoning">`, `<option value="default">`,
+		`<option value="off">`, `<option value="minimal">`, `<option value="low">`, `<option value="medium">`,
+		`<option value="high">`, `<option value="xhigh">`, `<option value="max">`,
+		`<option value="promo">`, `<option value="free">`, `<option value="discount">`,
+		`<option value="default">上游默认顺序</option>`, `<option value="rate">`, `<option value="context">`,
+		`<option value="output">`, `<option value="name">`,
+	} {
+		if !strings.Contains(fbar, want) {
+			t.Errorf("模型筛选缺少选项 %s", want)
+		}
+	}
+	// 表头仍是七列：筛选不该动模型表的信息集（列数对不上整行错位）。
+	head := body[viewAt:j]
+	if n := strings.Count(head, "</th>"); n != 7 {
+		t.Errorf("模型表头应为 7 列，实际 %d", n)
+	}
+	// 样式与高度预算：.fbar 体系复用 + 表格高度把新增的 43px 筛选栏算进去。
+	for _, want := range []string{
+		".fbar {", ".fbar > input, .fbar > select", "select.xs",
+		"#view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 239px)); }",
+		".empty {", ".src-off {",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("index.html 缺少模型筛选相关样式：%s", want)
+		}
+	}
+}
+
 // minInt / maxInt 是本文件里既有 maxInt 的补充（截断取尾片段时用）。
 func minInt(a, b int) int {
 	if a < b {

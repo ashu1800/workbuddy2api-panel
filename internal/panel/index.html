@@ -324,7 +324,8 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
    62vh 在 989px 高的窗口里只给到 613px，而表格顶部在 161px —— 下方白空 187px，
    同时 37 个模型被压在滚动区里（该用的空间没用、该看的内容被藏）。
    单表视图（账号管理 / 模型档位）用 calc(100dvh - 表格以上所有内容高度 - 28px 呼吸位)：
-     · 模型档位：顶栏 56 + 视图内边距 20 + 卡片头 48 + 说明条 34 + 描边 ≈ 161
+     · 模型档位：顶栏 56 + 视图内边距 20 + 卡片头 48 + 说明条 34 + 描边 ≈ 161，
+       再加本批新增的筛选栏 43px（26 控件 + 8+8 内边距 + 1 描边）→ 239
      · 账号管理：再多一条统计条（73 + 16 外边距）≈ 216
    max(240px, …) 兜住极矮窗口，避免表格被压成一条缝；不支持 dvh 的浏览器
    回落上一行的 60vh。用量统计是四张表纵向排列的长页面，保持 60vh 让它自然滚动。 */
@@ -333,7 +334,7 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
   scrollbar-gutter: stable;
 }
 #view-accounts .tbl-wrap { max-height: max(240px, calc(100dvh - 251px)); }
-#view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 196px)); }
+#view-models .tbl-wrap { max-height: max(240px, calc(100dvh - 239px)); }
 .dlg .tbl-wrap { max-height: none; overflow: visible; }
 .acc { width: 100%; border-collapse: separate; border-spacing: 0; font-size: var(--fs-13); }
 .acc caption { text-align: left; }
@@ -944,6 +945,50 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
           <button class="xs" id="btnModels">重新获取</button>
         </header>
         <div class="subnote">max_tokens 透传已修复；官方返回的最大输出仅为参考值，不保证完全正确。</div>
+        <!-- 条件查询：目录一次拉全，筛选与排序全在内存完成（改条件不打上游），条件之间
+             是 AND。控件沿用运行日志那条 .fbar（input[type=search] + select.xs + button.xs），
+             不另起一套样式。 -->
+        <div class="fbar" id="mdFilterBar">
+          <input id="mdQ" type="search" placeholder="搜索 ID / 名称 / 描述 / 厂商 / 标签" aria-label="搜索模型">
+          <select id="mdRealm" class="xs" aria-label="按域筛选">
+            <option value="">全部域</option>
+            <option value="cn">国内版 CN</option>
+            <option value="global">国际版 Global</option>
+          </select>
+          <select id="mdCap" class="xs" aria-label="按能力筛选">
+            <option value="">全部能力</option>
+            <option value="tool">支持工具调用</option>
+            <option value="vision">支持视觉</option>
+            <option value="reasoning">支持思考</option>
+            <option value="default">默认模型</option>
+          </select>
+          <select id="mdEffort" class="xs" aria-label="按思考档位筛选">
+            <option value="">全部档位</option>
+            <option value="off">可关闭思考</option>
+            <option value="minimal">minimal</option>
+            <option value="low">low</option>
+            <option value="medium">medium</option>
+            <option value="high">high</option>
+            <option value="xhigh">xhigh</option>
+            <option value="max">max</option>
+          </select>
+          <select id="mdPromo" class="xs" aria-label="按价格筛选">
+            <option value="">全部价格</option>
+            <option value="promo">有折扣 / 限时免费</option>
+            <option value="free">限时免费</option>
+            <option value="discount">打折（非免费）</option>
+          </select>
+          <select id="mdSort" class="xs" aria-label="排序方式">
+            <option value="default">上游默认顺序</option>
+            <option value="rate">积分倍率 低 → 高</option>
+            <option value="context">上下文长度 大 → 小</option>
+            <option value="output">最大输出 大 → 小</option>
+            <option value="name">模型 ID A → Z</option>
+          </select>
+          <span class="grow"></span>
+          <span class="note" id="mdCount"></span>
+          <button class="xs" id="mdReset" title="清空全部筛选条件并回到上游默认顺序">清除筛选</button>
+        </div>
         <div class="tbl-wrap">
         <table class="acc md">
           <caption class="sr-only">上游模型能力：积分倍率、思考档位、上下文长度与最大输出</caption>
@@ -1113,9 +1158,9 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
                 <input name="listen" placeholder=":7863">
                 <span class="hint">改动需重启进程</span></label>
               <label class="fld"><span class="lb">API 密钥</span>
-                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 不鉴权" autocomplete="off">
+                <div class="inline"><input name="api_key" id="cfgKey" type="password" placeholder="留空 = 保持现值（不下发）" autocomplete="off">
                 <button type="button" class="xs" id="btnEye">显示</button></div>
-                <span class="hint">立即生效（含面板自身）</span></label>
+                <span class="hint">立即生效（含面板自身）。留空保存不改动现值——清空 = 关闭鉴权这条路径刻意不提供，要关请手工删除 config.json 里的 api_key</span></label>
             </div>
             <label class="fld"><span class="lb">单账号明细默认展示条数</span>
               <input name="package_detail_limit" type="number" min="1" placeholder="5">
@@ -1257,8 +1302,8 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
             <div class="hr"></div>
             <div class="grid2">
               <label class="fld"><span class="lb">出站 User-Agent</span>
-                <input name="user_agent" placeholder="留空 = CLI/2.63.2 CodeBuddy/2.63.2">
-                <span class="hint">影响官网积分记录「使用端」显示；需重启</span></label>
+                <input name="user_agent" placeholder="留空并保存 = 回落默认 CLI/2.63.2 CodeBuddy/2.63.2">
+                <span class="hint">清空保存即回落到内置默认 UA（覆盖型字段，空串会照发）；影响官网积分记录「使用端」显示；需重启</span></label>
             </div>
             <div class="hr"></div>
             <div class="grid2">
@@ -1270,8 +1315,8 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
                 </select>
                 <span class="hint">需重启</span></label>
               <label class="fld"><span class="lb">提示词文件路径</span>
-                <input name="prompt_file" placeholder="留空 = 内置默认提示词">
-                <span class="hint">需重启</span></label>
+                <input name="prompt_file" placeholder="留空并保存 = 回落内置默认提示词">
+                <span class="hint">清空保存即回落到内置默认提示词（覆盖型字段，空串会照发）；需重启</span></label>
             </div>
             <div class="hr"></div>
             <div class="switch"><span class="lb">出站请求指纹脱敏</span>

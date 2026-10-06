@@ -854,6 +854,123 @@ function rateCell(m) {
   return m.credits ? esc(m.credits) : '—';
 }
 
+/* ── 模型条件查询（筛选 + 排序全在内存，零额外上游请求）──────────────────
+   模型目录一次拉全（几十条），关键词 / 域 / 能力 / 思考档位 / 价格与四种排序都在前端
+   完成：改条件零延迟，也不会因为调一次筛选就打一次上游——/panel/api/models 是直连
+   上游的实时查询，很贵。条件之间是 AND，每个条件为空即不参与判定。
+   控件沿用第 7 批为请求记录引入的 .fbar 体系（#mdFilterBar），不另起一套。 */
+let mdAll = [];                  // 最近一次拉取的完整目录：筛选/排序的唯一数据源，永不被改写
+let mdProbeOf = () => undefined; // 实测上限按 id 关联（见 outCell 上方的探测键说明）
+let mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+
+// mdRateValue 当前生效的积分倍率数值：优先促销价（限时免费 = 0），无倍率记为
+// Infinity 排到最后——排序时「没有价格」不该冒充最便宜。
+function mdRateValue(m) {
+  const raw = (m.promo_credits != null && m.promo_credits !== '') ? m.promo_credits : m.credits;
+  const n = parseFloat(String(raw == null ? '' : raw).replace(/[^\d.]/g, ''));
+  return Number.isFinite(n) ? n : Infinity;
+}
+
+// mdSearchText 参与关键词搜索的字段（ID / 名称 / 描述 / 厂商 / 标签），统一小写：
+// 用户在搜索框里敲大小写都该命中同一批模型。
+function mdSearchText(m) {
+  return [m.id, m.name, m.vendor, m.description, (m.tags || []).join(' ')]
+    .filter(Boolean).join(' ').toLowerCase();
+}
+
+// mdMatch 单个模型是否满足全部筛选条件（f 缺省取当前筛选状态，用例也可直接喂条件）。
+function mdMatch(m, f) {
+  f = f || mdFilter;
+  if (f.q) {
+    const text = mdSearchText(m);
+    // 空格分词后逐个匹配：多关键词是 AND，便于「zhipu 旗舰」这类组合查询。
+    for (const kw of f.q.toLowerCase().split(/\s+/).filter(Boolean)) {
+      if (!text.includes(kw)) return false;
+    }
+  }
+  // 域：id 前缀就是调用值（后端 panelModelEntry 按 realm 拼 id），按前缀判定与调用口径一致。
+  if (f.realm && !String(m.id || '').startsWith(f.realm + ':')) return false;
+  if (f.cap === 'tool' && !m.supports_tool_call) return false;
+  if (f.cap === 'vision' && !m.supports_images) return false;
+  if (f.cap === 'reasoning' && !m.supports_reasoning) return false;
+  if (f.cap === 'default' && !m.is_default) return false;
+  // 思考档位：off 不是目录里的一个档位而是「能关掉思考」这个能力，单独判定；
+  // 其余档位必须在 supported_efforts 里（模型表那一列显示什么就能筛什么）。
+  if (f.effort === 'off') {
+    if (!m.can_disable_thinking) return false;
+  } else if (f.effort && !(m.supported_efforts || []).includes(f.effort)) {
+    return false;
+  }
+  // 价格三档：promo = 有任何优惠（含限时免费），free = 生效倍率为 0，discount = 打折但非免费。
+  // promo_factor 缺失但有 promo_label（错峰类）算「有优惠」但没有折扣倍率，故计入 promo 而不计 discount。
+  const factor = m.promo_factor == null ? null : Number(m.promo_factor);
+  if (f.promo === 'promo' && factor == null && !m.promo_label) return false;
+  if (f.promo === 'free' && !(factor === 0)) return false;
+  if (f.promo === 'discount' && !(factor != null && factor > 0)) return false;
+  return true;
+}
+
+// mdSortList 按当前排序返回新数组：不改动入参，默认档即后端原顺序（永远可回溯）。
+function mdSortList(list, f) {
+  f = f || mdFilter;
+  const out = list.slice();
+  const num = v => { const n = Number(v || 0); return Number.isFinite(n) ? n : 0; };
+  if (f.sort === 'rate') out.sort((a, b) => mdRateValue(a) - mdRateValue(b));
+  else if (f.sort === 'context') out.sort((a, b) => num(b.context_length) - num(a.context_length));
+  else if (f.sort === 'output') out.sort((a, b) => num(b.max_output_tokens) - num(a.max_output_tokens));
+  else if (f.sort === 'name') out.sort((a, b) => String(a.id || '').localeCompare(String(b.id || '')));
+  return out;
+}
+
+// mdRowHtml 单个模型行（纯渲染，便于独立测试）。本 fork 的七列信息逐字保留：
+// 积分倍率含生效价与划线牌价、默认思考档、支持档位含 off（可关）、上下文长度、
+// 最大输出含实测上限与钳制告警。
+function mdRowHtml(m, pr) {
+  const eff = (m.supported_efforts || []).slice();
+  if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
+  const effs = eff.length ? eff.map(e => '<span class="tag info">' + esc(e) + '</span>').join(' ')
+    : '<span class="c-muted fs-12">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
+  // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）。
+  // 能力是中性元信息，用 mute；只有「需要你关注」的状态才用琥珀。
+  const caps = [];
+  if (m.is_default) caps.push('<span class="tag ok">默认</span>');
+  if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
+  if (m.supports_images) caps.push('<span class="tag mute">视觉</span>');
+  if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag mute">思考常开</span>');
+  const capHtml = caps.length ? '<div class="id mt-1">' + caps.join(' ') + '</div>' : '';
+  const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
+  return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
+    '<td class="num">' + rateCell(m) + '</td>' +
+    '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span class="c-muted">—</span>') + '</td>' +
+    '<td class="efs">' + effs + '</td>' +
+    '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
+    outCell(m, pr) + '</tr>';
+}
+
+// renderModels 只重画 tbody 与计数条：筛选/排序不重新请求上游（mdAll 是唯一数据源）。
+function renderModels() {
+  const tb = $('mdBody');
+  const list = mdSortList(mdAll.filter(m => mdMatch(m)));
+  tb.innerHTML = list.length
+    ? list.map(m => mdRowHtml(m, mdProbeOf(m.id))).join('')
+    : '<tr><td colspan="7"><div class="empty">没有符合当前筛选条件的模型</div></td></tr>';
+  const filtered = list.length !== mdAll.length;
+  $('mdCount').textContent = !mdAll.length ? ''
+    : filtered ? '命中 ' + list.length + ' / ' + mdAll.length + ' 个模型'
+      : mdAll.length + ' 个模型';
+  // 筛选中转琥珀（.src-off 与请求记录计数条同一语义色）：提示「看到的不是全部」。
+  $('mdCount').className = filtered ? 'note src-off' : 'note';
+}
+
+// resetModelFilter 清除筛选：控件与状态一起复位——只清状态会让按钮按下去看不出变化；
+// 排序一并回到上游默认顺序，然后就地重画（不重新请求）。
+function resetModelFilter() {
+  mdFilter = { q: '', realm: '', cap: '', effort: '', promo: '', sort: 'default' };
+  $('mdQ').value = ''; $('mdRealm').value = ''; $('mdCap').value = '';
+  $('mdEffort').value = ''; $('mdPromo').value = ''; $('mdSort').value = 'default';
+  renderModels();
+}
+
 async function loadModels() {
   const tb = $('mdBody');
   tb.innerHTML = skeletonRows(7, 4);
@@ -863,37 +980,40 @@ async function loadModels() {
     //   否则一个可选接口的畸形响应会让整张模型表塌成一行报错。）
     const [d, pr] = await Promise.all([api('models'), api('model_probes').catch(() => null)]);
     const list = (d && d.models) || [];
-    if (!list.length) { tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>'; return; }
+    mdAll = list;   // 目录进模块级状态，之后的筛选/排序都在它上面做
+    if (!list.length) {
+      tb.innerHTML = '<tr><td colspan="7"><div class="empty">上游未返回模型</div></td></tr>';
+      $('mdCount').textContent = '';
+      return;
+    }
     const probes = (pr && pr.probes) || {};
     const probeKeys = Object.keys(probes);
-    const probeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
-    tb.innerHTML = list.map(m => {
-      const eff = (m.supported_efforts || []).slice();
-      if (m.can_disable_thinking && eff.length && !eff.includes('off')) eff.push('off（可关）');
-      const effs = eff.length ? eff.map(e => '<span class="tag info">' + esc(e) + '</span>').join(' ')
-        : '<span class="c-muted fs-12">' + (m.supports_reasoning ? '固定档 · 默认 ' + esc(m.default_effort || '?') : '不支持思考') + '</span>';
-      // 能力徽标：默认模型 / 工具调用 / 视觉 / 纯推理（上游目录全字段透出，缺失不显示）。
-      // 能力是中性元信息，用 mute；只有「需要你关注」的状态才用琥珀。
-      const caps = [];
-      if (m.is_default) caps.push('<span class="tag ok">默认</span>');
-      if (m.supports_tool_call) caps.push('<span class="tag mute">工具</span>');
-      if (m.supports_images) caps.push('<span class="tag mute">视觉</span>');
-      if (m.supports_reasoning && !m.can_disable_thinking) caps.push('<span class="tag mute">思考常开</span>');
-      const capHtml = caps.length ? '<div class="id mt-1">' + caps.join(' ') + '</div>' : '';
-      const tip = m.description ? ' title="' + esc(m.description) + '"' : '';
-      return '<tr><td class="mark" aria-hidden="true"><i></i></td><td class="who"' + tip + '><div class="nm">' + esc(m.id) + '</div><div class="id">' + esc(m.name || '') + '</div>' + capHtml + '</td>' +
-        '<td class="num">' + rateCell(m) + '</td>' +
-        '<td>' + (m.default_effort ? '<span class="tag ok">' + esc(m.default_effort) + '</span>' : '<span class="c-muted">—</span>') + '</td>' +
-        '<td class="efs">' + effs + '</td>' +
-        '<td class="num">' + (m.context_length ? Math.round(m.context_length / 1000) + 'K' : '—') + '</td>' +
-        outCell(m, probeOf(m.id)) + '</tr>';
-    }).join('');
-    const hit = list.filter(m => probeOf(m.id)).length;
+    mdProbeOf = id => probes[id] || probes[probeKeys.find(k => k.endsWith(':' + id))];
+    const hit = list.filter(m => mdProbeOf(m.id)).length;
     $('mdNote').textContent = list.length + ' 个模型 · 已刷新降级缓存' + (hit ? ' · ' + hit + ' 个有实测上限' : '');
+    // 重新获取后沿用当前筛选条件：用户没点「清除筛选」就不该被悄悄重置。
+    renderModels();
   } catch (e) {
+    mdAll = [];
+    mdProbeOf = () => undefined;
     tb.innerHTML = '<tr><td colspan="7"><div class="empty">' + esc(e.message) + '</div></td></tr>';
+    $('mdCount').textContent = '';
   }
 }
+
+/* 筛选控件接线：关键词防抖 120ms（长列表逐字符重排不必每键一次），下拉即时。
+   所有处理函数只改 mdFilter 再 renderModels()——绝不重新请求上游。 */
+let mdQTimer = null;
+$('mdQ').oninput = () => {
+  clearTimeout(mdQTimer);
+  mdQTimer = setTimeout(() => { mdFilter.q = $('mdQ').value.trim(); renderModels(); }, 120);
+};
+for (const [id, key] of [['mdRealm', 'realm'], ['mdCap', 'cap'], ['mdEffort', 'effort'], ['mdPromo', 'promo'], ['mdSort', 'sort']]) {
+  const ctrl = $(id);
+  if (!ctrl) continue;
+  ctrl.onchange = () => { mdFilter[key] = ctrl.value; renderModels(); };
+}
+$('mdReset').onclick = resetModelFilter;
 $('btnModels').onclick = loadModels;
 
 /* ── 日志（频道：全部/任务/对话/系统） ─────────────────────────────── */
@@ -1340,6 +1460,18 @@ const CFG_MAP = {
   // 后端缺省 true、热生效（无需重启），面板只负责回填/保存这一个布尔值。
   request_client_info: ['logging', 'request_client_info'],
 };
+/* 「覆盖型」文本字段：空串本身就是有意义的取值（= 回落到内置默认），必须照发。
+ *
+ * 其余文本字段保持「空 = 不下发」——那是防误清空的保护，不是 bug：表单里某个框没填，
+ * 通常意味着「没改」，把它当成「请清空」会静默抹掉配置。
+ *
+ * 覆盖型字段正好相反：清空就是明确要求回到默认。漏发它们会让面板显示「已保存」而
+ * config.json 里的值没变（mergeConfigMaps 是深合并，未提交的键原样保留）。
+ *
+ * 刻意不含 api_key：清空它 = 关闭整个鉴权（网关变成无鉴权公开服务），误触代价太大；
+ * 该字段仍是「空 = 不下发」，要关鉴权请在配置文件里手工删除该键。
+ */
+const CLEARABLE_CFG = new Set(['user_agent', 'prompt_file']);
 function dig(obj, path) { return path.reduce((o, k) => (o == null ? undefined : o[k]), obj); }
 function put(obj, path, val) {
   let o = obj;
@@ -1375,7 +1507,8 @@ function collectConfig() {
     else if (el.type === 'number') { v = el.value.trim() === '' ? undefined : Number(el.value); }
     else {
       const raw = el.value.trim();
-      if (raw === '') v = undefined;
+      // 覆盖型字段空串照发（见 CLEARABLE_CFG）；其余空 = 不下发。
+      if (raw === '') v = CLEARABLE_CFG.has(name) ? '' : undefined;
       else if (name.endsWith('_hours')) v = raw.split(/[,，\s]+/).filter(Boolean).map(Number);
       else v = raw;
     }
