@@ -525,6 +525,17 @@ function statusTagOf(s, coolText, rlMetas) {
   return { cls: '', tone: 'ok', label: '可用', title: reason };
 }
 
+/* tokenChipHTML 把 formatTokenCount 的结果拆成「数值 + 单位」两段，单位包一层
+   .usage-unit 拿到 2px 左间距：单位字母与数字同字号，紧贴时 110.98M 会被读成一个小
+   数词，列内扫视只能靠字形差分辨量纲。没有单位的精确整数（320）与无数据的 '—' 原样
+   输出，不产生多余元素（多出来的空 span 会让 chip 内边距看着变宽）。返回值是 HTML，
+   故带 HTML 后缀，且两段都过 esc()。 */
+function tokenChipHTML(value) {
+  const m = /^([0-9][0-9.,]*)([KMB])$/.exec(String(value));
+  if (!m) return esc(value);
+  return esc(m[1]) + '<span class="usage-unit">' + esc(m[2]) + '</span>';
+}
+
 function renderAccounts(list) {
   const tb = $('accBody');
   if (!list.length) {
@@ -616,7 +627,7 @@ function renderAccounts(list) {
         '<span class="' + rateCls + '">' + (okRate == null ? '—' : okRate.toFixed(2) + '%') + '</span></td>' +
       '<td class="num">' + (s.in_flight || 0) + '</td>' +
       '<td class="num usage-cell" title="' + esc(usageTitle) + '"><span class="usage-line">' +
-        '<span class="usage-item usage-total"><b>' + todayTok + '</b></span>' +
+        '<span class="usage-item usage-total"><b>' + tokenChipHTML(todayTok) + '</b></span>' +
       '</span></td>' +
       // 首字/推理：无样本时不渲染空 chip（旧版恒渲染会留下一个绿色的「—」）
       '<td class="num ttfb-cell" title="' + esc(ttfbTitle) + '">' +

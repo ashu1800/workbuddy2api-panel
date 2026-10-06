@@ -425,6 +425,10 @@ th.num, td.num { text-align: right; }
 }
 .usage-item { display: inline-flex; align-items: baseline; padding: 2px var(--sp-1); border-radius: var(--r-sm); background: var(--surface-3); }
 .usage-item b { font-weight: 600; }
+/* 数值与单位之间留 2px（.usage-unit 由 tokenChipHTML 包在单位字母上）：单位与数字同
+   字号同字重，紧贴时「110.98M」会被读成一个小数词。不用 --sp-1(4px)——chip 自身左右
+   内边距才 4px，单位再加 4px 会让「数字 + 单位」看着断成两段。 */
+.usage-item .usage-unit { margin-left: 2px; }
 .usage-total { color: var(--accent-ink); background: var(--accent-soft); }
 
 /* ════════════════════════════════════════════════════════════════════════

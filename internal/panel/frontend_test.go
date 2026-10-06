@@ -1226,7 +1226,7 @@ const setCustom = (id, from, to) => {
 	}
 
 	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），请求行格式不变。
-	if !strings.Contains(str("accounts"), `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+	if !strings.Contains(str("accounts"), `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
 		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", str("accounts"))
 	}
 	line := `<span class="ln">14:05:06 | 200 成功 | glm-5.3 | 账号(uid8) | 1.25s | 2.3k tok | 0.12 credit` +
@@ -1384,7 +1384,7 @@ process.stdout.write(JSON.stringify({ locks, note, emptyNull, emptyNote, emptyAr
 	}
 
 	// 回归：账号表「今日用量」chip 仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
-	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
 		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got["accounts"])
 	}
 	if strings.Contains(got["accounts"], "Mtok") || strings.Contains(got["accounts"], "<em>tok</em>") {
@@ -1668,7 +1668,7 @@ vm.runInContext(src + '\nthis.__statusTagOf = statusTagOf;', sandbox, { filename
 
 	// (e) 回归：用量列仍是 7.10M 的 chip（不带 tok 后缀），行仍是 11 列。
 	for name, row := range got.Rows {
-		if !strings.Contains(row, `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+		if !strings.Contains(row, `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
 			t.Errorf("%s 行今日用量不再是 7.10M 的 chip：%s", name, row)
 		}
 		if n := strings.Count(row, "<td"); n != 11 {
@@ -1943,7 +1943,8 @@ vm.createContext(ctx);
 vm.runInContext(a + '\n' + b + '\n' + c + '\n' + d +
   '\nthis.renderRequestMetrics = renderRequestMetrics;' +
   '\nthis.renderUsage = renderUsage;' +
-  '\nthis.renderAccounts = renderAccounts;\n', ctx);
+  '\nthis.renderAccounts = renderAccounts;' +
+  '\nthis.tokenChipHTML = tokenChipHTML;\n', ctx);
 
 const time = new Date(2026, 8, 28, 14, 5, 6).toISOString();
 const base = { time, status: 200, outcome: 'success', model: 'glm-5.3', account: '账号(uid8)', duration_ms: 1250, total_tokens: 2300, credit_known: true, credit: 0.12 };
@@ -1997,6 +1998,7 @@ ctx.renderAccounts([{
 const accounts = nodes.accBody.innerHTML;
 process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSource, usStats, usAcc, usModel, usRealm,
   creditStats, creditNote, usStatsCards: String(usStatsCards), usStatsBlanks: String(usStatsBlanks),
+  chipUnit: ctx.tokenChipHTML('7.10M'), chipPlain: ctx.tokenChipHTML('320'), chipDash: ctx.tokenChipHTML('—'),
   emptyAcc, emptyModel, emptyRealm, emptyStats, emptyCreditStats, emptyCreditNote, accounts }));`
 	f, err := os.CreateTemp(t.TempDir(), "usage-cache-render-*.cjs")
 	if err != nil {
@@ -2071,11 +2073,20 @@ process.stdout.write(JSON.stringify({ reqLogBox, reqNoteWithSource, reqNoteNoSou
 	}
 
 	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
-	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+	// 单位字母要求单独包一层 .usage-unit（值/单位之间留 2px 间隔，见 index.html 注释）：
+	// 没有单位（不足 1000 的精确整数）与无数据的 '—' 不得凭空多出这个 span，否则 chip
+	// 内会多出一个空元素、把内边距撑宽。
+	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
 		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got["accounts"])
 	}
 	if strings.Contains(got["accounts"], "Mtok") || strings.Contains(got["accounts"], "<em>tok</em>") {
 		t.Errorf("账号表用量列又带上了 tok 后缀：%s", got["accounts"])
+	}
+	if got["chipUnit"] != `7.10<span class="usage-unit">M</span>` {
+		t.Errorf("带单位的值应拆出 .usage-unit：%s", got["chipUnit"])
+	}
+	if got["chipPlain"] != "320" || got["chipDash"] != "—" {
+		t.Errorf("无单位/无数据不应插入 .usage-unit：plain=%q dash=%q", got["chipPlain"], got["chipDash"])
 	}
 }
 
@@ -2734,7 +2745,7 @@ const acctNoteOf = html => { const m = html.match(/<span class="note">([^<]*)<\/
 	}
 
 	// 回归红线：账号表「今日用量」仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
-	if !strings.Contains(got.Accounts, `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+	if !strings.Contains(got.Accounts, `<span class="usage-item usage-total"><b>7.10<span class="usage-unit">M</span></b></span>`) {
 		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got.Accounts)
 	}
 	if strings.Contains(got.Accounts, "Mtok") || strings.Contains(got.Accounts, "<em>tok</em>") {
