@@ -451,6 +451,57 @@ function renderAccounts(list) {
   }).join('');
 }
 
+// renderModelLocks 模型锁池：哪些模型不能用、锁了几个号、还要锁多久。
+// 后端 model_locks 已按「整池不可用 → 没号可用 → 部分限流」排好序，这里只做展示。
+// 本 fork 的改写：域复用账号表的 .realm-tag、状态复用 .tag 体系（不另起平行徽标），
+// 倒计时复用 dur()（绝对时刻进 title——列里塞长日期会把表顶宽），空态复用 .empty 卡。
+function renderModelLocks(rows) {
+  const tb = $('mlBody');
+  if (!tb) return;
+  const note = $('mlNote');
+  const list = Array.isArray(rows) ? rows.filter(r => r && r.model) : [];
+  if (!list.length) {
+    // 无锁时不渲染空表：空 tbody 只剩表头，看着像功能坏了，给一句结论。
+    tb.innerHTML = '<tr><td colspan="8"><div class="empty">' +
+      '<div class="big">所有模型均可选</div>' +
+      '当前没有模型级限流 —— 没有任何账号因某个模型被挡</div></td></tr>';
+    if (note) note.textContent = '';
+    return;
+  }
+  const STATE = { locked: ['bad', '整池不可用'], starved: ['warn', '没号可用'], partial: ['warn', '部分限流'] };
+  // 解锁时刻：列里只放「还剩多久」（倒计时才是运维要判断的量），绝对时刻进 title。
+  const left = iso => {
+    const ms = parseAPITime(iso);
+    if (!ms) return { t: '—', title: '无明确解锁时刻' };
+    const sec = Math.max(0, Math.round((ms - Date.now()) / 1000));
+    return {
+      t: dur(sec),
+      title: '解锁于 ' + fmtLocalDateTime(ms) + (sec > 0 ? '（' + dur(sec) + '后）' : '（已到点，等待下一轮探测）'),
+    };
+  };
+  tb.innerHTML = list.map(r => {
+    const st = STATE[r.state] || ['mute', esc(r.state || '—')];
+    const realm = r.realm === 'global' ? '国际版' : '国内版';
+    // 最早解锁兜底用全池解锁：后端两字段同时给出，缺一列也不至于空着。
+    const first = left(r.unlock_at || r.fully_unlock_at);
+    const full = left(r.fully_unlock_at);
+    return '<tr>' +
+      '<td>' + esc(r.model) + '</td>' +
+      '<td><span class="realm-tag">' + realm + '</span></td>' +
+      '<td><span class="tag ' + st[0] + '">' + st[1] + '</span></td>' +
+      '<td class="num">' + (r.servable || 0) + ' <span class="c-muted">/</span> ' + (r.total || 0) + '</td>' +
+      '<td class="num">' + (r.locked || 0) + '</td>' +
+      '<td class="num" title="' + esc(first.title) + '">' + first.t + '</td>' +
+      '<td class="num" title="' + esc(full.title) + '">' + full.t + '</td>' +
+      '<td class="reason">' + (r.reason ? esc(r.reason) : '<span class="c-muted">—</span>') + '</td>' +
+      '</tr>';
+  }).join('');
+  if (note) {
+    const bad = list.filter(r => r.state === 'locked' || r.state === 'starved').length;
+    note.textContent = bad ? bad + ' 个模型整池不可用' : list.length + ' 个模型部分限流';
+  }
+}
+
 async function loadOverview(quiet) {
   try {
     const d = await api('overview');
@@ -474,6 +525,7 @@ async function loadOverview(quiet) {
     const up = Math.floor(d.uptime_sec);
     $('subMeta').textContent = '运行 ' + (up >= 86400 ? Math.floor(up / 86400) + ' 天 ' : '') + Math.floor(up % 86400 / 3600) + ' 时 ' + Math.floor(up % 3600 / 60) + ' 分';
     renderAccounts(d.accounts || []);
+    renderModelLocks(d.model_locks);
   } catch (e) { if (!quiet) toast(e.message, 'err'); }
 }
 

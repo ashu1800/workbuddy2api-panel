@@ -2,6 +2,7 @@ package panel
 
 import (
 	"bytes"
+	"encoding/json"
 	"net/http/httptest"
 	"os"
 	"os/exec"
@@ -706,5 +707,144 @@ console.log(JSON.stringify({
 	const want = `{"midnight":1,"morning":10,"afternoon":15,"lateNight":24,"days3":72,"allHistory":0,"missing":72,"garbage":72}`
 	if strings.TrimSpace(string(out)) != want {
 		t.Fatalf("windowHours=%s want %s", strings.TrimSpace(string(out)), want)
+	}
+}
+
+// TestAppJSModelLocks 「模型锁池」表（从上游移植）的渲染契约：
+//   - 有锁 → 每个 (域, 模型) 一行：可选/总数、锁定账号数、最早与全池解锁倒计时、
+//     限流原因齐全；状态走本 fork 既有的 .tag 体系、域走 .realm-tag，不另起徽标；
+//   - 无锁（null / []）→ 「所有模型均可选」空态，而不是只剩表头的空表；
+//   - 同一沙箱内顺带回归账号表「今日用量」列：chip 里仍是 7.10M，不带 tok 后缀。
+//
+// 倒计时是相对量，脚本把 Date.now 钉死，断言才能落在具体文案上（否则
+// 「1时00分」会随测试耗时漂成「59分59秒」）。无 node 环境跳过。
+func TestAppJSModelLocks(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; model locks render test skipped")
+	}
+	script := `const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+// 两段纯函数切片（各自的下界都是下一个函数声明，中间没有顶层副作用语句——
+// 整段 [esc … loadOverview) 会带上顶层的 addEventListener，在沙箱里跑不起来）：
+//   A = 格式化/转义工具，B = 统计口径 + renderAccounts + renderModelLocks。
+const a = src.slice(src.indexOf('function esc('), src.indexOf('function veilStack('));
+const b = src.slice(src.indexOf('function avgTTFB('), src.indexOf('async function loadOverview('));
+if (!a || !b) throw new Error('render slice not found in app.js');
+const code = a + '\n' + b;
+const RealDate = Date;
+const FIXED = RealDate.parse('2026-09-28T14:00:00Z');
+class FakeDate extends RealDate {
+  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
+  static now() { return FIXED; }
+}
+const nodes = {};
+const el = id => (nodes[id] = nodes[id] || { innerHTML: '', textContent: '' });
+const ctx = {
+  Date: FakeDate, Number, String, Boolean, Math, Array, Object, JSON, RegExp, Error, isNaN, parseInt, parseFloat,
+  $: el,
+};
+vm.createContext(ctx);
+vm.runInContext(code + '\nthis.renderAccounts = renderAccounts; this.renderModelLocks = renderModelLocks;', ctx);
+const at = s => new RealDate(FIXED + s * 1000).toISOString();
+ctx.renderModelLocks([
+  { model: 'glm-5.3', realm: 'cn', total: 5, servable: 0, locked: 5, state: 'locked',
+    unlock_at: at(3600), fully_unlock_at: at(9000), reason: '上游 <429> 额度不足 & 稍后重试' },
+  { model: 'gpt-5.2', realm: 'global', total: 3, servable: 2, locked: 1, state: 'partial',
+    unlock_at: at(1800), fully_unlock_at: at(1800) },
+  { model: 'x-preview', realm: 'cn', total: 2, servable: 0, locked: 1, state: 'starved',
+    unlock_at: null, fully_unlock_at: null },
+]);
+const locks = nodes.mlBody.innerHTML;
+const note = nodes.mlNote.textContent;
+ctx.renderModelLocks(null);
+const emptyNull = nodes.mlBody.innerHTML;
+const emptyNote = nodes.mlNote.textContent;
+ctx.renderModelLocks([]);
+const emptyArr = nodes.mlBody.innerHTML;
+ctx.renderAccounts([{
+  uid: 'uid-0000000000000001', nickname: '号一', credits: 10, credits_total: 100,
+  last_success: '2026-09-28T13:00:00Z',
+  today: { day: '2026-09-28', requests: 1771, errors: 3, total_tokens: 7100000 },
+  token_usage: { request_count: 1771, ok_count: 1768, total_tokens: 18700000, last_latency_ms: 1500 },
+}]);
+const accounts = nodes.accBody.innerHTML;
+process.stdout.write(JSON.stringify({ locks, note, emptyNull, emptyNote, emptyArr, accounts }));`
+	f, err := os.CreateTemp(t.TempDir(), "model-locks-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(script); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	out, err := exec.Command(node, f.Name(), "app.js").CombinedOutput()
+	if err != nil {
+		t.Fatalf("model locks node render failed: %v\n%s", err, out)
+	}
+	got := map[string]string{}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("model locks render output is not JSON: %v\n%s", err, out)
+	}
+
+	// 有锁：一行一模型，八列缺一不可（上游信息量不缩水）。
+	for _, frag := range []string{
+		`<td>glm-5.3</td><td><span class="realm-tag">国内版</span></td><td><span class="tag bad">整池不可用</span></td><td class="num">0 <span class="c-muted">/</span> 5</td><td class="num">5</td>`,
+		`>1时00分</td>`, // 最早解锁倒计时
+		`>2时30分</td>`, // 全池解锁倒计时
+		`（1时00分后）`,    // 绝对时刻 + 相对量进 title
+		`<td>gpt-5.2</td><td><span class="realm-tag">国际版</span></td><td><span class="tag warn">部分限流</span></td><td class="num">2 <span class="c-muted">/</span> 3</td><td class="num">1</td>`,
+		`>30分00秒</td>`,
+		`<span class="tag warn">没号可用</span>`,
+		`<td class="num" title="无明确解锁时刻">—</td>`, // 无解锁时刻不编造倒计时
+		`<td class="reason">上游 &lt;429&gt; 额度不足 &amp; 稍后重试</td>`,
+		`<td class="reason"><span class="c-muted">—</span></td>`,
+	} {
+		if !strings.Contains(got["locks"], frag) {
+			t.Errorf("模型锁池缺少片段 %q\n实际：%s", frag, got["locks"])
+		}
+	}
+	if strings.Contains(got["locks"], "<429>") {
+		t.Errorf("限流原因未转义：%s", got["locks"])
+	}
+	if got["note"] != "2 个模型整池不可用" {
+		t.Errorf("模型锁池表头摘要=%q want %q", got["note"], "2 个模型整池不可用")
+	}
+
+	// 无锁：可读空态，不渲染空表；null 与 [] 表现一致。
+	for _, empty := range []string{got["emptyNull"], got["emptyArr"]} {
+		if !strings.Contains(empty, `colspan="8"`) || !strings.Contains(empty, "所有模型均可选") {
+			t.Errorf("模型锁池空态缺少 colspan/文案：%s", empty)
+		}
+		if strings.Contains(empty, `<span class="tag`) {
+			t.Errorf("模型锁池空态不应渲染数据行：%s", empty)
+		}
+	}
+	if got["emptyNote"] != "" {
+		t.Errorf("无锁时表头摘要应为空，实际 %q", got["emptyNote"])
+	}
+	if got["emptyNull"] != got["emptyArr"] {
+		t.Errorf("model_locks 为 null 与 [] 的空态必须一致：\n%s\n%s", got["emptyNull"], got["emptyArr"])
+	}
+
+	// 回归：账号表「今日用量」chip 仍是 7.10M（大写单位 + 两位小数），且不带 tok 后缀。
+	if !strings.Contains(got["accounts"], `<span class="usage-item usage-total"><b>7.10M</b></span>`) {
+		t.Errorf("账号表今日用量不再是 7.10M 的 chip：%s", got["accounts"])
+	}
+	if strings.Contains(got["accounts"], "Mtok") || strings.Contains(got["accounts"], "<em>tok</em>") {
+		t.Errorf("账号表用量列又带上了 tok 后缀：%s", got["accounts"])
+	}
+
+	// 空态 colspan 必须与 index.html 里模型锁池表头的列数一致（漏加列时最易错位）。
+	p := newTestPanel()
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, httptest.NewRequest("GET", "/panel/", nil))
+	head := regexp.MustCompile(`(?s)<table class="acc ml">.*?</thead>`).FindString(rec.Body.String())
+	if head == "" {
+		t.Fatal("index.html 缺少模型锁池表（table.acc.ml）")
+	}
+	if ths := regexp.MustCompile(`<th[ >]`).FindAllString(head, -1); len(ths) != 8 {
+		t.Errorf("模型锁池表有 %d 个 <th>，空态 colspan=8", len(ths))
 	}
 }
