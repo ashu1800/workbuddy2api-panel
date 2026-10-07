@@ -5026,11 +5026,17 @@ function mkTd() {
   const td = {
     tagName: 'TD', _cls: '', _title: '', _html: '', _text: null, _bar: null, parent: null,
     writes: { cls: 0, html: 0, text: 0, title: 0, style: 0 },
-    flashAdds: 0, flashRemoves: 0, dataset: {}, children: [],
+    flashAdds: 0, flashRemoves: 0, flashOn: false, flashOps: [], offsetWidth: 0,
+    dataset: {}, children: [],
+    /* classList 记账到「操作序列」而不只是次数：.cell-flash 的动画只有在 class 先被
+       摘掉、再被加回来时才会重启，只看 add 次数分辨不出「重启」与「空操作」。 */
     classList: {
-      add(c) { if (c === 'cell-flash') td.flashAdds++; },
-      remove(c) { if (c === 'cell-flash') td.flashRemoves++; },
-      contains() { return false; }, toggle() {},
+      add(c) { if (c !== 'cell-flash') return; td.flashAdds++; td.flashOn = true; td.flashOps.push('add'); },
+      remove(c) {
+        if (c !== 'cell-flash' || !td.flashOn) return;
+        td.flashRemoves++; td.flashOn = false; td.flashOps.push('remove');
+      },
+      contains(c) { return c === 'cell-flash' ? td.flashOn : false; }, toggle() {},
     },
     addEventListener() {}, removeEventListener() {}, appendChild(c) { td.children.push(c); return c; },
     querySelector(sel) { if (sel !== 'i') return null; if (!td._bar) td._bar = mkBar(td); return td._bar; },
@@ -5103,10 +5109,15 @@ function parseRows(html, parent) {
 
 function mkBody(id) {
   const body = {
-    id, rows: [], htmlWrites: 0, _html: '',
+    id, rows: [], htmlWrites: 0, moves: 0, _html: '',
+    /* children 是真实 DOM 的 tbody.children（HTMLCollection）：补丁层的重排靠它判断
+       「目标顺序是否已经就是当前顺序」，从而在顺序没变时一次都不搬节点。桩里它就是
+       rows 的实时视图（getter，innerHTML 重建后自动跟着新数组）。 */
+    get children() { return body.rows; },
     detach(node) { const i = body.rows.indexOf(node); if (i >= 0) body.rows.splice(i, 1); },
-    appendChild(node) { body.detach(node); node.parent = body; body.rows.push(node); return node; },
+    appendChild(node) { body.moves++; body.detach(node); node.parent = body; body.rows.push(node); return node; },
     insertBefore(node, ref) {
+      body.moves++;
       body.detach(node);
       const i = ref ? body.rows.indexOf(ref) : -1;
       if (i < 0) body.rows.push(node); else body.rows.splice(i, 0, node);
@@ -5133,8 +5144,12 @@ function mkBody(id) {
 function mkEl(id) {
   const el = {
     id, innerHTML: '', _text: '', title: '', value: '', checked: false, disabled: false, className: '',
-    hidden: false, dataset: {}, style: {}, children: [], firstElementChild: null, writes: { text: 0 },
-    classList: { add() {}, remove() {}, toggle() {}, contains() { return false; } },
+    hidden: false, dataset: {}, style: {}, children: [], firstElementChild: null,
+    writes: { text: 0 }, classListOps: [],
+    classList: {
+      add(c) { el.classListOps.push('+' + c); }, remove(c) { el.classListOps.push('-' + c); },
+      toggle() {}, contains() { return false; },
+    },
     addEventListener(ev, fn) { (this._h || (this._h = {}))[ev] = fn; },
     removeEventListener() {},
     appendChild(c) { this.children.push(c); if (!this.firstElementChild) this.firstElementChild = c; return c; },
@@ -5182,10 +5197,15 @@ function overviewBody() {
 }
 /* 载荷在 json() 时才构建：fetch 的函数体会在 app.js 顶层 start() 里同步跑到第一个
    await，若在这里就把 body 拍下来，测试还没赋值账号池就已经定稿了。顺带做一次
-   JSON 往返，避免桩把对象引用直接交给 app.js（真实链路必然是新对象）。 */
+   JSON 往返，避免桩把对象引用直接交给 app.js（真实链路必然是新对象）。
+   ticketStatus 是场景可改的开关：401 用来验证「后台换票失败不该弹出密钥门」。 */
+let ticketStatus = 200;
 const fetchStub = async (url, opts) => {
   const u = String(url);
   fetchLog.push({ url: u, method: (opts && opts.method) || 'GET' });
+  if (u.indexOf('live/ticket') >= 0 && ticketStatus !== 200) {
+    return { status: ticketStatus, ok: false, json: async () => ({ error: '密钥无效或未填写' }) };
+  }
   return {
     status: 200, ok: true,
     json: async () => {
@@ -5216,10 +5236,14 @@ const document = {
 };
 const RealDate = Date;
 const FIXED = RealDate.parse('2026-09-28T14:00:00Z');
+/* NOW 是可推进的假时钟：默认钉死在 FIXED（倒计时/相对时间断言都靠它稳定），
+   只有需要跨过「重同步 3s 去抖窗口」的场景才显式 advance()。 */
+let NOW = FIXED;
 class FakeDate extends RealDate {
-  constructor(...a) { if (a.length) { super(...a); } else { super(FIXED); } }
-  static now() { return FIXED; }
+  constructor(...a) { if (a.length) { super(...a); } else { super(NOW); } }
+  static now() { return NOW; }
 }
+const advance = ms => { NOW += ms; };
 const at = s => new RealDate(FIXED + s * 1000).toISOString();
 
 const sandbox = {
@@ -5249,6 +5273,12 @@ vm.runInContext(src + '\nthis.__dsh = {' +
   '\n  refTimer: () => refTimer,' +
   '\n  accList: () => accList.map(s => s.uid),' +
   '\n  accRowKeys: () => Object.keys(accRows),' +
+  '\n  started: () => liveStarted,' +
+  '\n  start: () => start(),' +
+  '\n  resyncAt: () => liveResyncAt,' +
+  '\n  stale: ms => { liveLastMsgAt = Date.now() - ms; },' +
+  '\n  tick: () => refreshVisible(),' +
+  '\n  setHidden: v => { document.hidden = !!v; },' +
   '\n};', sandbox, { filename: 'app.js' });
 /* app.js 里的顶层 let/const 挂在沙箱的词法环境上，取不到；这一组 getter 是脚本
    自己挂到 global 上的观测口（同样的写法见既有测试的 this.__statusTagOf）。 */
@@ -5468,6 +5498,51 @@ const totalWrites = el => {
   ws1.frame('{oops not json');
   out.badFrame = { warns: warns.length - warns0, rev: __dsh.live().rev, uids: body.rows.map(r => r.dataset.uid) };
 
+  /* S8b D5：order 与当前 DOM 顺序完全一致 → 一个节点都不许搬
+     （appendChild 会把节点摘下来再插回去：顺序没变也搬 = 丢 hover/焦点 + 强制重排）。 */
+  const mv0 = body.moves;
+  const idS8 = body.rows.slice();
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 6, order: ['uid-e', 'uid-c', 'uid-b', 'uid-d'] });
+  out.orderSame = {
+    moves: body.moves - mv0,
+    uids: body.rows.map(r => r.dataset.uid),
+    identity: body.rows.map((r, i) => r === idS8[i]),
+    accList: __dsh.accList(),
+  };
+
+  /* S8c D5：锁池表同理——行集与顺序都没变时 0 次搬动。 */
+  const mvm0 = ml.moves;
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 7, model_locks: LOCKS2 });
+  out.mlOrderSame = { moves: ml.moves - mvm0, keys: ml.rows.map(r => r.dataset.mkey) };
+
+  /* S8d D7：同一格 600ms 内连续两次变化 → class 必须先摘再加（否则动画不重放，
+     第二次变化看不出来）。样本用 uid-d 的积分格：它的高亮序列从零开始（uid-b 那格
+     在本场景 S2 就闪过，而 600ms 的假定时器不会自己跑，class 一直挂着）。 */
+  const cellD = rowOf('uid-d').children[3];
+  const ops0 = cellD.flashOps.length;
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 8, accounts: { 'uid-d': { credits: 66 } } });
+  const afterOne = cellD.flashOps.slice(ops0);
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 9, accounts: { 'uid-d': { credits: 77 } } });
+  out.flashRestart = {
+    firstOps: afterOne,
+    ops: cellD.flashOps.slice(ops0),
+    adds: cellD.flashAdds,
+    on: cellD.classList.contains('cell-flash'),
+    credHtml: cellD.innerHTML,
+  };
+
+  /* S8e D5：顺序真的变了 → 必须搬（且节点身份不变、内容一个字节不改）。 */
+  const mv1 = body.moves;
+  const idS8e = body.rows.slice();
+  const d1 = dump(body);
+  ws1.frame({ type: 'patch', boot: 'b2', rev: 10, order: ['uid-d', 'uid-e', 'uid-c', 'uid-b'] });
+  out.orderChanged = {
+    moves: body.moves - mv1,
+    uids: body.rows.map(r => r.dataset.uid),
+    identity: idS8e.map(r => body.rows.indexOf(r) >= 0),
+    delta: delta(d1, dump(body)),
+  };
+
   /* S9 降级：liveOk 时 5s 轮询不打 overview；断开后立刻恢复轮询。 */
   const poll = intervals.filter(i => i.ms === 5000)[0];
   out.poll = { registered: !!poll, refTimer: __dsh.refTimer() != null };
@@ -5551,6 +5626,18 @@ const totalWrites = el => {
   await tick(); await tick();
   out.unload = { closed: lastSocket().closed === true, pending: pendingBackoff().filter(t => !t.dead).length };
 
+  /* S15 D8：密钥门通过后 start() 会再被调用一次 → liveStart 必须幂等，
+     visibilitychange / beforeunload 仍然各只有 1 个监听（否则隐藏/卸载都会跑两遍）。 */
+  __dsh.start();
+  await tick(); await tick();
+  out.restart = {
+    handlers: (docHandlers.visibilitychange || []).length,
+    unload: (winHandlers.beforeunload || []).length,
+    started: __dsh.started(),
+    refTimer: __dsh.refTimer() != null,
+    sockets: sockets.length,
+  };
+
   out.warns = warns.slice();
   process.stdout.write(JSON.stringify(out));
   process.exit(0);
@@ -5576,6 +5663,243 @@ const liveNoWSScenarioJS = `
   await tick(); await tick();
   out.overviewFetches = overviewFetches() - f0;
   out.uids = $('accBody').rows.map(r => r.dataset.uid);
+  out.warns = warns.slice();
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { process.stderr.write('SCENARIO FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// liveReconnectScenarioJS 是 TestAppJSLiveReconnect 的场景：只走「连接生命周期」相关的
+// 三条契约，与 liveClientScenarioJS 的写次数断言互不干扰——
+//   - D1  重连后的首个 snapshot（同 boot 同 rev、数据已变）必须被接受并渲染；
+//     旧 socket 的迟到帧必须被丢弃；
+//   - D2  握手成功但立刻被 bye 断开时退避必须增长（1s→2s→4s）；
+//   - D10 后台换票遇 401 只当「没票据」照连，绝不弹出密钥门。
+const liveReconnectScenarioJS = `
+(async () => {
+  const out = {};
+  await tick(); await tick(); await tick();
+
+  const body = $('accBody');
+  const cred = uid => body.rows.filter(r => r.dataset.uid === uid)[0].children[3].innerHTML;
+
+  /* 基线：连接 → snapshot(rev=7)。服务端 attach 时发的这一帧 rev 用当前值，不递增。 */
+  const ws1 = lastSocket();
+  ws1.openFrame();
+  ws1.frame({ type: 'snapshot', boot: 'b1', rev: 7, data: overviewBody() });
+  out.base = { credB: cred('uid-b'), rev: __dsh.live().rev, ok: __dsh.live().ok, retry: __dsh.live().retry };
+
+  /* D1：唯一订阅者断开（隐藏标签页 / 网络抖动）→ 期间池状态变化 → 重连。
+     服务端 attach 重建基线，重连后这一帧 snapshot 与断线前同 boot 同 rev，但数据已经是
+     新的：前端必须接受（否则最长 60s 显示陈旧数据，而徽标还亮着「实时」）。 */
+  ws1.drop();
+  payload.accounts[1].credits = 99;
+  const pend1 = pendingBackoff().filter(t => !t.dead);
+  out.drop = {
+    pending: pend1.length,
+    ms: pend1.length ? pend1[pend1.length - 1].ms : 0,
+    ok: __dsh.live().ok,
+    badge: $('liveBadge').textContent,
+  };
+  const t1 = pend1[pend1.length - 1];
+  t1.dead = true; t1.fn();
+  await tick(); await tick(); await tick();
+  const ws2 = lastSocket();
+  ws2.openFrame();
+  // 新连接必须把 rev 水位复位（rev 只在单条连接内做去重）：不回退就是断线前那个值。
+  const revAfterOpen = __dsh.live().rev;
+  const html0 = body.htmlWrites;
+  ws2.frame({ type: 'snapshot', boot: 'b1', rev: 7, data: overviewBody() });
+  out.reSnapshot = {
+    fresh: ws2 !== ws1,
+    revAfterOpen: revAfterOpen,
+    credB: cred('uid-b'),
+    rev: __dsh.live().rev,
+    htmlWrites: body.htmlWrites - html0,
+    ok: __dsh.live().ok,
+    badge: $('liveBadge').textContent,
+    retry: __dsh.live().retry,
+  };
+
+  /* D1b：旧 socket 的迟到帧不得覆盖新连接的状态——它带着更大的 rev，光靠 rev 守卫拦不住。 */
+  const html1 = body.htmlWrites;
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 8, accounts: { 'uid-b': { credits: 5 } } });
+  out.staleFrame = { credB: cred('uid-b'), rev: __dsh.live().rev, htmlWrites: body.htmlWrites - html1 };
+
+  /* D2：握手成功但立刻被 bye 断开（slow_consumer / idle_timeout / 服务端重启循环）
+     → 退避必须增长：1s → 2s → 4s。若在 onopen 复位，这里会恒为 1s（永久 1s 重连）。 */
+  const byeDelays = [];
+  for (let i = 0; i < 3; i++) {
+    const ws = lastSocket();
+    ws.openFrame();
+    ws.frame({ type: 'bye', reason: 'slow_consumer' });
+    const p = pendingBackoff().filter(t => !t.dead);
+    byeDelays.push(p.length ? p[p.length - 1].ms : -1);
+    for (const q of p) q.dead = true;
+    if (p.length) p[p.length - 1].fn();
+    await tick(); await tick(); await tick();
+  }
+  out.byeBackoff = { delays: byeDelays, retry: __dsh.live().retry };
+
+  /* D1c：「snapshot 一律接受」的边界——全新服务端还没 tick 过，rev=0（attach 用当前 rev，
+     不递增），而新连接的 liveRev 刚复位成 0：靠 rev 守卫（0 <= 0）就会把这唯一一份基线
+     丢掉，页面永远停在旧值上。这个 socket 还没被 openFrame 过，正是「重连到一个刚重启的
+     服务端」的样子。 */
+  const ws0 = lastSocket();
+  ws0.openFrame();
+  payload.accounts[1].credits = 77;
+  const html2 = body.htmlWrites;
+  ws0.frame({ type: 'snapshot', boot: 'b1', rev: 0, data: overviewBody() });
+  out.zeroRev = {
+    credB: cred('uid-b'),
+    rev: __dsh.live().rev,
+    htmlWrites: body.htmlWrites - html2,
+    ok: __dsh.live().ok,
+  };
+
+  /* D10：后台换票遇 401（密钥被轮换）不该把用户刚关掉的密钥门又弹出来。
+     密钥门 = #keyVeil 被加上 .on（openKey → openVeil），桩里记 classList 操作序列。 */
+  const ws5 = lastSocket();
+  ws5.openFrame();
+  ws5.frame({ type: 'snapshot', boot: 'b1', rev: 9, data: overviewBody() });
+  const veil0 = $('keyVeil').classListOps.length;
+  const tk0 = ticketFetches();
+  ticketStatus = 401;
+  ws5.drop();
+  const p401 = pendingBackoff().filter(t => !t.dead);
+  if (p401.length) { p401[p401.length - 1].dead = true; p401[p401.length - 1].fn(); }
+  await tick(); await tick(); await tick();
+  const ws6 = lastSocket();
+  out.ticket401 = {
+    url: ws6 ? ws6.url : 'none',
+    veilOps: $('keyVeil').classListOps.length - veil0,
+    ticketFetches: ticketFetches() - tk0,
+    ok: __dsh.live().ok,
+  };
+
+  out.warns = warns.slice();
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { process.stderr.write('SCENARIO FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// liveResyncScenarioJS 是 TestAppJSLiveResync 的场景：补丁层的「失步自愈」与看门狗——
+//   - D3  应用补丁抛异常 → warn + 立刻 loadOverview 纠偏 + 断开重连；3s 内第二、第三帧
+//     坏数据不再重复触发（去抖），窗口过去后仍会重新同步；
+//   - D11 补丁提到本地不存在的 uid → 同样走一次主动重同步（不开小差、也不静默丢弃）；
+//   - D4  半开连接（90s 无帧，与后端 60s 自愈全量对齐）→ 5s 轮询那一轮触发重同步。
+//
+// 坏帧用 model_costs:{} 构造：mergeAccount 先把它并进本地账号对象，accountVM 里
+// `(s.model_costs || []).filter` 随即抛 TypeError——正是「一帧坏数据把应用阶段打挂」的样子。
+const liveResyncScenarioJS = `
+(async () => {
+  const out = {};
+  await tick(); await tick(); await tick();
+
+  const body = $('accBody');
+  const ml = $('mlBody');
+  const cred = uid => body.rows.filter(r => r.dataset.uid === uid)[0].children[3].innerHTML;
+  const warnOf = s => warns.filter(w => w.indexOf(s) >= 0).length;
+  const poll = intervals.filter(i => i.ms === 5000)[0];
+
+  const ws1 = lastSocket();
+  ws1.openFrame();
+  ws1.frame({ type: 'snapshot', boot: 'b1', rev: 7, data: overviewBody() });
+
+  /* 看门狗不能误伤正常连接：刚收到帧 → 这一轮 5s 轮询照旧不打 overview。 */
+  const rv0 = overviewFetches();
+  poll.fn(); await tick(); await tick();
+  out.watchdogFresh = {
+    ovf: overviewFetches() - rv0,
+    ok: __dsh.live().ok,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+  };
+
+  /* D3-a：补丁应用抛异常 → warn + 立刻拉全量纠正 DOM + 安排重连（只 warn 不修的话，
+     半更新的 DOM 会一直挂到 60s 后的兜底 snapshot）。 */
+  payload.accounts[1].credits = 88;
+  const ovf0 = overviewFetches();
+  ws1.frame({ type: 'patch', boot: 'b1', rev: 8, accounts: { 'uid-b': { model_costs: {} } } });
+  out.applyFailSync = { warns: warnOf('补丁应用失败'), resyncs: warnOf('主动重同步') };
+  await tick(); await tick(); await tick();
+  out.applyFail = {
+    warns: warnOf('补丁应用失败'),
+    resyncs: warnOf('主动重同步'),
+    ovf: overviewFetches() - ovf0,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+    ok: __dsh.live().ok,
+    badge: $('liveBadge').textContent,
+    oldClosed: ws1.closed === true,
+    credB: cred('uid-b'),
+  };
+
+  /* 退避重连拿一份干净基线（新连接的 snapshot 一定被接受）。 */
+  const p1 = pendingBackoff().filter(t => !t.dead);
+  if (p1.length) { p1[p1.length - 1].dead = true; p1[p1.length - 1].fn(); }
+  await tick(); await tick(); await tick();
+  const ws2 = lastSocket();
+  ws2.openFrame();
+  ws2.frame({ type: 'snapshot', boot: 'b1', rev: 20, data: overviewBody() });
+  out.resynced = { credB: cred('uid-b'), ok: __dsh.live().ok, retry: __dsh.live().retry, fresh: ws2 !== ws1 };
+
+  /* D3-b 去抖：3s 内的第二、第三帧坏数据不再重复触发——坏帧风暴下不会每秒打一次
+     overview，也不会把刚建好的连接反复掐掉。每一帧仍然各留一条 warn。 */
+  const ovf1 = overviewFetches();
+  const w1 = warnOf('补丁应用失败');
+  ws2.frame({ type: 'patch', boot: 'b1', rev: 21, accounts: { 'uid-b': { model_costs: {} } } });
+  ws2.frame({ type: 'patch', boot: 'b1', rev: 22, accounts: { 'uid-b': { model_costs: {} } } });
+  await tick(); await tick();
+  out.debounced = {
+    warns: warnOf('补丁应用失败') - w1,
+    resyncs: warnOf('主动重同步'),
+    ovf: overviewFetches() - ovf1,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+    ok: __dsh.live().ok,
+    closed: ws2.closed === true,
+  };
+
+  /* 清场：一帧干净 snapshot 把 accList 换回干净对象（被污染的只是本地那份对象，
+     服务端载荷始终是干净的——真实链路里服务端的下一次全量读取同样是对的）。 */
+  ws2.frame({ type: 'snapshot', boot: 'b1', rev: 30, data: overviewBody() });
+  out.cleanSnapshot = { credB: cred('uid-b'), uids: body.rows.map(r => r.dataset.uid) };
+
+  /* D11：补丁提到本地不存在的 uid = 本地基线错位 → 主动重同步（与 D3 同一去抖窗口）。
+     先推进假时钟跨过 3s 窗口（真机上是自然流逝的时间），顺带证明去抖不会永久锁死。 */
+  advance(3001);
+  const ovf2 = overviewFetches();
+  const w2 = warnOf('补丁应用失败');
+  ws2.frame({ type: 'patch', boot: 'b1', rev: 31, accounts: { 'uid-ghost': { credits: 1 } } });
+  await tick(); await tick(); await tick();
+  out.unknownUID = {
+    ovf: overviewFetches() - ovf2,
+    warnDelta: warnOf('补丁应用失败') - w2,
+    resyncs: warnOf('主动重同步'),
+    pending: pendingBackoff().filter(t => !t.dead).length,
+    ok: __dsh.live().ok,
+    uids: body.rows.map(r => r.dataset.uid),
+  };
+
+  /* D4：半开连接看门狗。先恢复一条「刚收到帧」的活连接，再人为把最后一帧调老 95s
+     （> 90s 阈值）：下一轮 5s 轮询必须走 liveResync（拉 overview + 换连接）。 */
+  const p2 = pendingBackoff().filter(t => !t.dead);
+  if (p2.length) { p2[p2.length - 1].dead = true; p2[p2.length - 1].fn(); }
+  await tick(); await tick(); await tick();
+  const ws3 = lastSocket();
+  ws3.openFrame();
+  ws3.frame({ type: 'snapshot', boot: 'b1', rev: 40, data: overviewBody() });
+  advance(3001);                    // 跨过 D11 那次重同步的去抖窗口
+  __dsh.stale(95000);               // 人为把「最后一帧」调老
+  const ovf3 = overviewFetches();
+  poll.fn(); await tick(); await tick(); await tick();
+  out.watchdog = {
+    ovf: overviewFetches() - ovf3,
+    pending: pendingBackoff().filter(t => !t.dead).length,
+    ok: __dsh.live().ok,
+    badge: $('liveBadge').textContent,
+    closed: ws3.closed === true,
+    mlKeys: ml.rows.map(r => r.dataset.mkey),
+  };
+
   out.warns = warns.slice();
   process.stdout.write(JSON.stringify(out));
   process.exit(0);
@@ -5629,6 +5953,15 @@ type liveProbeJS struct {
 	Rev            float64           `json:"rev"`
 	Boot           string            `json:"boot"`
 	URL            string            `json:"url"`
+	// 搬动计数与高亮操作序列（D5 / D7 / D8）：
+	Moves    int      `json:"moves"`    // appendChild + insertBefore 的调用次数（0 = 一个节点都没搬）
+	FirstOps []string `json:"firstOps"` // 第一次高亮的 classList 操作序列
+	Ops      []string `json:"ops"`      // 连续两次高亮的 classList 操作序列
+	Adds     int      `json:"adds"`     // .cell-flash 被加上的累计次数
+	On       bool     `json:"on"`       // 断言时 .cell-flash 是否还挂着
+	Started  bool     `json:"started"`  // liveStarted（liveStart 幂等标志）
+	Unload   int      `json:"unload"`   // beforeunload 监听数
+	Sockets  int      `json:"sockets"`  // 建过的 socket 总数
 }
 
 // runLiveScenario 跑一遍 liveStubJS + scenario 并解析出 JSON（node 缺失时跳过）。
@@ -5997,6 +6330,85 @@ func TestAppJSLiveClient(t *testing.T) {
 		t.Errorf("空态摘要应为空串且只写一次（note=%q writes=%d）", locksEmpty.Note, locksEmpty.NoteWrites)
 	}
 
+	// ── D5：order 与当前 DOM 顺序完全一致 → 一个节点都不许搬 ────────────
+	// （appendChild 会把节点摘下来再插回去：顺序没变也搬 = 丢 hover/焦点 + 强制重排，
+	//   所以这条断言看的是 body 桩上的搬动计数，而不是 DOM 的最终顺序。）
+	os := livePhase(t, raw, "orderSame")
+	if os.Moves != 0 {
+		t.Errorf("顺序未变的 order 补丁搬了 %d 个节点，want 0", os.Moves)
+	}
+	if strings.Join(os.Uids, ",") != "uid-e,uid-c,uid-b,uid-d" {
+		t.Errorf("顺序未变的 order 补丁改了行顺序：%v", os.Uids)
+	}
+	for i, same := range os.Identity {
+		if !same {
+			t.Errorf("顺序未变时第 %d 行的节点身份变了", i)
+		}
+	}
+	if strings.Join(os.AccList, ",") != "uid-e,uid-c,uid-b,uid-d" {
+		t.Errorf("accList 顺序=%v（必须与 DOM 同序）", os.AccList)
+	}
+
+	// 锁池表同理：行集与顺序都没变 → 0 次搬动。
+	mo := livePhase(t, raw, "mlOrderSame")
+	if mo.Moves != 0 {
+		t.Errorf("锁池行集与顺序都没变时搬了 %d 个节点，want 0", mo.Moves)
+	}
+	if strings.Join(mo.Keys, ",") != "gpt-5.2|global,x-preview|cn" {
+		t.Errorf("锁池行锚=%v", mo.Keys)
+	}
+
+	// ── D7：同一格 600ms 内连续两次变化 → class 先摘再加（动画重启）──────
+	fl := livePhase(t, raw, "flashRestart")
+	if strings.Join(fl.FirstOps, ",") != "add" {
+		t.Errorf("第一次高亮的 classList 操作=%v want [add]", fl.FirstOps)
+	}
+	if strings.Join(fl.Ops, ",") != "add,remove,add" {
+		t.Errorf("同一格第二次变化必须重启动画（class 先摘再加），实际操作序列=%v want [add remove add]", fl.Ops)
+	}
+	if fl.Adds != 2 {
+		t.Errorf("两次变化应加两次 .cell-flash，实际 %d 次", fl.Adds)
+	}
+	if !fl.On {
+		t.Error("600ms 未到，.cell-flash 应还挂在格子上（假定时器不会自己跑）")
+	}
+	if !strings.Contains(fl.CredHTML, "77<span") {
+		t.Errorf("第二次变化的内容没写进去：%s", fl.CredHTML)
+	}
+
+	// ── D5b：order 真的变了 → 必须搬，且一个单元格都不重写 ──────────────
+	oc := livePhase(t, raw, "orderChanged")
+	if oc.Moves == 0 {
+		t.Error("order 真的变了却没搬动任何节点（重排没生效）")
+	}
+	if strings.Join(oc.Uids, ",") != "uid-d,uid-e,uid-c,uid-b" {
+		t.Errorf("重排后的行顺序=%v want [uid-d uid-e uid-c uid-b]", oc.Uids)
+	}
+	for i, same := range oc.Identity {
+		if !same {
+			t.Errorf("重排后第 %d 行的节点身份变了（必须复用节点）", i)
+		}
+	}
+	for _, row := range oc.Delta {
+		for i, n := range row.Cells {
+			if n != 0 || row.RowCls != 0 {
+				t.Errorf("纯重排不该改写 %s（第 %d 格写了 %d 次，rowCls=%d）", row.Key, i+1, n, row.RowCls)
+			}
+		}
+	}
+
+	// ── D8：start() 二次调用（密钥门通过后的真实路径）→ 监听仍然各 1 个 ──
+	rs := livePhase(t, raw, "restart")
+	if rs.Handlers != 1 || rs.Unload != 1 {
+		t.Errorf("liveStart 必须幂等：visibilitychange=%d beforeunload=%d，want 1 / 1", rs.Handlers, rs.Unload)
+	}
+	if !rs.Started {
+		t.Error("liveStarted 标志没置位")
+	}
+	if !rs.RefTimer {
+		t.Error("5s 轮询定时器必须还在")
+	}
+
 	// ── 坏 JSON ──────────────────────────────────────────────────────
 	bad := livePhase(t, raw, "badFrame")
 	if bad.Warns != 1 {
@@ -6075,6 +6487,420 @@ func TestAppJSLiveClient(t *testing.T) {
 	un := livePhase(t, raw, "unload")
 	if !un.Closed || un.Pending != 0 {
 		t.Errorf("beforeunload 后应关闭且不再重连（closed=%v pending=%d）", un.Closed, un.Pending)
+	}
+}
+
+// livePhaseJSON 把某个阶段的 JSON 解成任意结构（livePhase 只服务 liveProbeJS 的形状）。
+func livePhaseJSON(t *testing.T, raw map[string]json.RawMessage, key string, dst any) {
+	t.Helper()
+	b, ok := raw[key]
+	if !ok {
+		t.Fatalf("场景输出里没有阶段 %q", key)
+	}
+	if err := json.Unmarshal(b, dst); err != nil {
+		t.Fatalf("阶段 %s 解析失败: %v", key, err)
+	}
+}
+
+// TestAppJSLiveReconnect 实时客户端的「连接生命周期」契约（独立场景，不掺写次数断言）：
+//   - D1  重连后的首个 snapshot 与断线前同 boot 同 rev、但数据已变 → 必须被接受并渲染
+//     （服务端 attach 重建基线时 rev 用当前值、不递增；回退修复这条断言必红）；
+//     旧 socket 的迟到帧必须被丢弃（它带着更大的 rev，光靠 rev 守卫拦不住）；
+//   - D2  握手成功但立刻被 bye 断开 → 退避按 1s→2s→4s 增长（回退到 onopen 复位则恒 1000）；
+//   - D10 后台换票遇 401 → 只当「没票据」照连，绝不弹出密钥门。
+func TestAppJSLiveReconnect(t *testing.T) {
+	raw := runLiveScenario(t, liveReconnectScenarioJS, "LIVE_WS=1", "LIVE_KEY=1")
+
+	var base struct {
+		CredB string  `json:"credB"`
+		Rev   float64 `json:"rev"`
+		OK    bool    `json:"ok"`
+	}
+	livePhaseJSON(t, raw, "base", &base)
+	if !strings.Contains(base.CredB, "20<span") || base.Rev != 7 || !base.OK {
+		t.Fatalf("基线不对：credB=%q rev=%v ok=%v（want 20/100、rev=7、ok）", base.CredB, base.Rev, base.OK)
+	}
+
+	var drop struct {
+		Pending int    `json:"pending"`
+		MS      int    `json:"ms"`
+		OK      bool   `json:"ok"`
+		Badge   string `json:"badge"`
+	}
+	livePhaseJSON(t, raw, "drop", &drop)
+	if drop.Pending != 1 || drop.MS != 1000 {
+		t.Errorf("断开后应排一次 1s 重连（pending=%d ms=%d）", drop.Pending, drop.MS)
+	}
+	if drop.OK || drop.Badge != "轮询" {
+		t.Errorf("断开后徽标应回落轮询（ok=%v badge=%q）", drop.OK, drop.Badge)
+	}
+
+	// ── D1 核心断言：同 boot 同 rev 的 snapshot 必须被接受 ──────────────
+	var re struct {
+		Fresh        bool    `json:"fresh"`
+		RevAfterOpen float64 `json:"revAfterOpen"`
+		CredB        string  `json:"credB"`
+		Rev          float64 `json:"rev"`
+		HTMLWrites   int     `json:"htmlWrites"`
+		OK           bool    `json:"ok"`
+		Badge        string  `json:"badge"`
+		Retry        float64 `json:"retry"`
+	}
+	livePhaseJSON(t, raw, "reSnapshot", &re)
+	if !re.Fresh {
+		t.Fatal("重连没有建出新 socket")
+	}
+	if re.RevAfterOpen != 0 {
+		t.Errorf("新连接的 rev 水位必须复位（onopen 后 rev=%v，want 0）：rev 只在单条连接内做去重", re.RevAfterOpen)
+	}
+	if !strings.Contains(re.CredB, "99<span") {
+		t.Errorf("重连后同 boot 同 rev 的 snapshot 被 rev 守卫丢掉了：积分列仍是 %q，want 99/100", re.CredB)
+	}
+	if re.HTMLWrites != 1 {
+		t.Errorf("被接受的 snapshot 应整表渲染一次（tbody innerHTML 写 %d 次，want 1）", re.HTMLWrites)
+	}
+	if re.Rev != 7 {
+		t.Errorf("snapshot 后 liveRev=%v want 7", re.Rev)
+	}
+	if !re.OK || re.Badge != "实时" {
+		t.Errorf("重连并应用后应为实时（ok=%v badge=%q）", re.OK, re.Badge)
+	}
+	if re.Retry != 0 {
+		t.Errorf("成功应用一帧后退避应复位（retry=%v）", re.Retry)
+	}
+
+	// ── D1b：旧 socket 的迟到帧不得覆盖新状态 ────────────────────────
+	var stale struct {
+		CredB      string  `json:"credB"`
+		Rev        float64 `json:"rev"`
+		HTMLWrites int     `json:"htmlWrites"`
+	}
+	livePhaseJSON(t, raw, "staleFrame", &stale)
+	if strings.Contains(stale.CredB, ">5<span") {
+		t.Errorf("旧 socket 的迟到帧被应用了（积分列变成 %q）", stale.CredB)
+	}
+	if !strings.Contains(stale.CredB, "99<span") || stale.Rev != 7 || stale.HTMLWrites != 0 {
+		t.Errorf("迟到帧必须整帧丢弃：credB=%q rev=%v htmlWrites=%d", stale.CredB, stale.Rev, stale.HTMLWrites)
+	}
+
+	// ── D1c：snapshot 一律接受（rev=0 的全新服务端是边界）────────────────
+	var zero struct {
+		CredB      string  `json:"credB"`
+		Rev        float64 `json:"rev"`
+		HTMLWrites int     `json:"htmlWrites"`
+		OK         bool    `json:"ok"`
+	}
+	livePhaseJSON(t, raw, "zeroRev", &zero)
+	if !strings.Contains(zero.CredB, "77<span") || zero.HTMLWrites != 1 {
+		t.Errorf("rev=0 的 snapshot 被 rev 守卫丢了（credB=%q htmlWrites=%d）：snapshot 自带全量，必须一律接受",
+			zero.CredB, zero.HTMLWrites)
+	}
+	if zero.Rev != 0 || !zero.OK {
+		t.Errorf("rev=0 的 snapshot 应用后 rev=%v ok=%v", zero.Rev, zero.OK)
+	}
+
+	// ── D2：open→bye 循环的退避必须增长 ──────────────────────────────
+	var bb struct {
+		Delays []int   `json:"delays"`
+		Retry  float64 `json:"retry"`
+	}
+	livePhaseJSON(t, raw, "byeBackoff", &bb)
+	wantDelays := []int{1000, 2000, 4000}
+	if len(bb.Delays) != len(wantDelays) {
+		t.Fatalf("open→bye 三轮的重连延迟=%v want %v", bb.Delays, wantDelays)
+	}
+	for i := range wantDelays {
+		if bb.Delays[i] != wantDelays[i] {
+			t.Fatalf("open→bye 三轮的重连延迟=%v want %v（onopen 复位退避会恒为 1000）", bb.Delays, wantDelays)
+		}
+	}
+
+	// ── D10：后台换票 401 不弹密钥门 ─────────────────────────────────
+	var tk struct {
+		URL           string `json:"url"`
+		VeilOps       int    `json:"veilOps"`
+		TicketFetches int    `json:"ticketFetches"`
+		OK            bool   `json:"ok"`
+	}
+	livePhaseJSON(t, raw, "ticket401", &tk)
+	if tk.TicketFetches == 0 {
+		t.Error("重连本该去换一次票据（前提不成立）")
+	}
+	if tk.VeilOps != 0 {
+		t.Errorf("后台换票 401 把密钥门弹了 %d 次（#keyVeil.classList 操作）——用户刚关掉的弹层不该自己回来", tk.VeilOps)
+	}
+	if tk.URL != "ws://localhost:1/panel/api/live" {
+		t.Errorf("取票失败应不带 ?ticket= 照连，实际 URL=%q", tk.URL)
+	}
+	if tk.OK {
+		t.Error("这个 socket 只是建出来（没收到帧），不该已是「实时」")
+	}
+
+	var warns []string
+	livePhaseJSON(t, raw, "warns", &warns)
+	if len(warns) != 0 {
+		t.Errorf("连接生命周期里不该有 console.warn：%v", warns)
+	}
+}
+
+// TestAppJSLiveResync 补丁层的「失步自愈」契约：
+//   - D3  applyLive 抛异常（patch 里塞会让 VM 抛的类型错误字段）→ 一条 warn + 立刻
+//     loadOverview 纠正 DOM + 断开重连；3s 内的后续坏帧不再重复触发（去抖）；
+//   - D11 补丁提到本地不存在的 uid → 同样主动重同步（去抖窗口过去后仍会生效）；
+//   - D4  半开连接（90s 无帧，与后端 60s 自愈全量对齐）→ 5s 轮询那一轮走 liveResync。
+func TestAppJSLiveResync(t *testing.T) {
+	raw := runLiveScenario(t, liveResyncScenarioJS, "LIVE_WS=1", "LIVE_KEY=1")
+
+	// 看门狗不能误伤正常连接：刚收到帧 → 照旧不轮询。
+	var fresh struct {
+		OVF     int  `json:"ovf"`
+		OK      bool `json:"ok"`
+		Pending int  `json:"pending"`
+	}
+	livePhaseJSON(t, raw, "watchdogFresh", &fresh)
+	if fresh.OVF != 0 || !fresh.OK || fresh.Pending != 0 {
+		t.Errorf("刚收到帧的连接不该触发看门狗（ovf=%d ok=%v pending=%d）", fresh.OVF, fresh.OK, fresh.Pending)
+	}
+
+	// 异常是同步收敛的：frame() 返回时 warn 与重同步都已经发生。
+	var sync struct {
+		Warns   int `json:"warns"`
+		Resyncs int `json:"resyncs"`
+	}
+	livePhaseJSON(t, raw, "applyFailSync", &sync)
+	if sync.Warns != 1 {
+		t.Errorf("补丁应用失败应留下 1 条 warn，实际 %d", sync.Warns)
+	}
+	if sync.Resyncs != 1 {
+		t.Errorf("补丁应用失败应立刻触发一次主动重同步，实际 %d", sync.Resyncs)
+	}
+
+	var fail struct {
+		Warns     int    `json:"warns"`
+		Resyncs   int    `json:"resyncs"`
+		OVF       int    `json:"ovf"`
+		Pending   int    `json:"pending"`
+		OK        bool   `json:"ok"`
+		Badge     string `json:"badge"`
+		OldClosed bool   `json:"oldClosed"`
+		CredB     string `json:"credB"`
+	}
+	livePhaseJSON(t, raw, "applyFail", &fail)
+	if fail.Warns != 1 || fail.Resyncs != 1 {
+		t.Errorf("warn / 重同步次数=%d / %d，want 1 / 1", fail.Warns, fail.Resyncs)
+	}
+	if fail.OVF != 1 {
+		t.Errorf("重同步必须立刻拉一次 overview 纠正 DOM，实际 %d 次", fail.OVF)
+	}
+	if !strings.Contains(fail.CredB, "88<span") {
+		t.Errorf("overview 纠偏后应显示服务端最新值（积分列=%q，want 88/100）", fail.CredB)
+	}
+	if !fail.OldClosed {
+		t.Error("重同步必须断开旧连接，换一份干净基线")
+	}
+	if fail.Pending != 1 {
+		t.Errorf("重同步后应排一次重连，实际 %d", fail.Pending)
+	}
+	if fail.OK || fail.Badge != "轮询" {
+		t.Errorf("失步后徽标必须回落轮询（ok=%v badge=%q）", fail.OK, fail.Badge)
+	}
+
+	var again struct {
+		CredB string  `json:"credB"`
+		OK    bool    `json:"ok"`
+		Retry float64 `json:"retry"`
+		Fresh bool    `json:"fresh"`
+	}
+	livePhaseJSON(t, raw, "resynced", &again)
+	if !again.Fresh || !again.OK || again.Retry != 0 || !strings.Contains(again.CredB, "88<span") {
+		t.Errorf("重连后的干净 snapshot 没落地：fresh=%v ok=%v retry=%v credB=%q",
+			again.Fresh, again.OK, again.Retry, again.CredB)
+	}
+
+	// ── D3 去抖：3s 内的第二、第三帧坏数据不重复触发 ──────────────────
+	var deb struct {
+		Warns   int  `json:"warns"`
+		Resyncs int  `json:"resyncs"`
+		OVF     int  `json:"ovf"`
+		Pending int  `json:"pending"`
+		OK      bool `json:"ok"`
+		Closed  bool `json:"closed"`
+	}
+	livePhaseJSON(t, raw, "debounced", &deb)
+	if deb.Warns != 2 {
+		t.Errorf("去抖窗口内的每一帧坏数据都要留痕（warn），实际 %d 条", deb.Warns)
+	}
+	if deb.Resyncs != 1 {
+		t.Errorf("3s 内不该重复触发重同步（累计 %d 次，want 仍为 1）", deb.Resyncs)
+	}
+	if deb.OVF != 0 {
+		t.Errorf("去抖窗口内不该再打 overview（打了 %d 次）；坏帧风暴下会变成每秒一次", deb.OVF)
+	}
+	if deb.Pending != 0 || deb.Closed {
+		t.Errorf("去抖窗口内不该再断连接（pending=%d closed=%v）", deb.Pending, deb.Closed)
+	}
+	if !deb.OK {
+		t.Error("去抖只是不重复纠偏，连接本身应保持实时")
+	}
+
+	var clean struct {
+		CredB string   `json:"credB"`
+		Uids  []string `json:"uids"`
+	}
+	livePhaseJSON(t, raw, "cleanSnapshot", &clean)
+	if !strings.Contains(clean.CredB, "88<span") || strings.Join(clean.Uids, ",") != "uid-a,uid-b,uid-c" {
+		t.Errorf("干净 snapshot 没把表恢复：credB=%q uids=%v", clean.CredB, clean.Uids)
+	}
+
+	// ── D11：补丁提到本地不存在的 uid → 主动重同步（去抖窗口过后）───────
+	var ghost struct {
+		OVF       int      `json:"ovf"`
+		WarnDelta int      `json:"warnDelta"`
+		Resyncs   int      `json:"resyncs"`
+		Pending   int      `json:"pending"`
+		OK        bool     `json:"ok"`
+		Uids      []string `json:"uids"`
+	}
+	livePhaseJSON(t, raw, "unknownUID", &ghost)
+	if ghost.OVF != 1 || ghost.Resyncs != 2 {
+		t.Errorf("未见的 uid 应触发一次主动重同步（overview=%d 累计重同步=%d，want 1 / 2）", ghost.OVF, ghost.Resyncs)
+	}
+	if ghost.WarnDelta != 0 {
+		t.Errorf("这条路径不该抛异常（补丁应用失败 warn 多了 %d 条）", ghost.WarnDelta)
+	}
+	if ghost.Pending != 1 || ghost.OK {
+		t.Errorf("重同步后应断开并排一次重连（pending=%d ok=%v）", ghost.Pending, ghost.OK)
+	}
+	if strings.Join(ghost.Uids, ",") != "uid-a,uid-b,uid-c" {
+		t.Errorf("未知 uid 只能靠全量纠正，不该长出一行：%v", ghost.Uids)
+	}
+
+	// ── D4：半开连接看门狗（90s 无帧）────────────────────────────────
+	var wd struct {
+		OVF     int      `json:"ovf"`
+		Pending int      `json:"pending"`
+		OK      bool     `json:"ok"`
+		Badge   string   `json:"badge"`
+		Closed  bool     `json:"closed"`
+		MLKeys  []string `json:"mlKeys"`
+	}
+	livePhaseJSON(t, raw, "watchdog", &wd)
+	if wd.OVF != 1 {
+		t.Errorf("90s 没收到帧必须走看门狗（overview 打了 %d 次，want 1）", wd.OVF)
+	}
+	if !wd.Closed || wd.Pending != 1 {
+		t.Errorf("看门狗必须断开半开连接并排一次重连（closed=%v pending=%d）", wd.Closed, wd.Pending)
+	}
+	if wd.OK || wd.Badge != "轮询" {
+		t.Errorf("半开连接被判定后徽标应回落轮询（ok=%v badge=%q）", wd.OK, wd.Badge)
+	}
+	if strings.Join(wd.MLKeys, ",") != "glm-5.3|cn,gpt-5.2|global" {
+		t.Errorf("看门狗那一轮的全量渲染应包含锁池：%v", wd.MLKeys)
+	}
+
+	// 三帧坏数据各留一条 warn，三次主动重同步各留一条：合计 6。
+	var warns []string
+	livePhaseJSON(t, raw, "warns", &warns)
+	if len(warns) != 6 {
+		t.Errorf("warn 条数=%d want 6（3 条补丁应用失败 + 3 条主动重同步）：%v", len(warns), warns)
+	}
+}
+
+// mergeAccountProtoJS 在 vm 切片沙箱里跑真实的 mergeAccount，验证原型污染防护：
+// JSON.parse('{"__proto__":…}') 产生的是**自有属性**，深合并时照直写会改掉 dst 的原型，
+// 递归分支更是直接写进 Object.prototype —— 页面上任何对象都被污染。
+// __bad 在沙箱外拼好再传进去，免得在探针源码里嵌套引号。
+const mergeAccountProtoJS = `
+const fs = require('fs');
+const vm = require('vm');
+const src = fs.readFileSync(process.argv[2], 'utf8');
+const start = src.indexOf('function mergeAccount(');
+const end = src.indexOf('/* accWriteCell');
+if (start < 0 || end < 0) { process.stderr.write('mergeAccount 切片失败'); process.exit(1); }
+const ctx = vm.createContext({});
+ctx.__bad = '{"__proto__":{"polluted":1},"constructor":{"prototype":{"polluted2":1}},"prototype":{"polluted3":1},"nested":{"y":2},"a":5}';
+vm.runInContext(src.slice(start, end), ctx);
+const out = vm.runInContext('(function () {\n' + [
+  'const dst = { a: 1, nested: { x: 1 } };',
+  'mergeAccount(dst, JSON.parse(__bad));',
+  'const deep = mergeAccount({ n: { deep: 1 } }, { n: { more: 2 } });',
+  'const arr = mergeAccount({ list: [1, 2] }, { list: [3] });',
+  'return {',
+  '  polluted: ({}).polluted === undefined,',
+  '  polluted2: ({}).polluted2 === undefined,',
+  '  polluted3: ({}).polluted3 === undefined,',
+  '  ownProto: Object.prototype.hasOwnProperty.call(dst, "__proto__"),',
+  '  protoIntact: Object.getPrototypeOf(dst) === Object.prototype,',
+  '  a: dst.a,',
+  '  nestedX: dst.nested.x,',
+  '  nestedY: dst.nested.y,',
+  '  deepMore: deep.n.more,',
+  '  deepKept: deep.n.deep,',
+  '  list: arr.list.join(","),',
+  '  nullSrc: mergeAccount({ keep: 1 }, null).keep,',
+  '};',
+].join('\n') + '\n})()', ctx);
+process.stdout.write(JSON.stringify(out));
+`
+
+// TestAppJSMergeAccountProtoGuard D9：mergeAccount 必须跳过 __proto__ / constructor /
+// prototype 三个键（纵深防御，后端正常不会下发），同时普通键与嵌套对象的深合并不受影响。
+func TestAppJSMergeAccountProtoGuard(t *testing.T) {
+	node, err := exec.LookPath("node")
+	if err != nil {
+		t.Skip("node not installed; mergeAccount proto guard test skipped")
+	}
+	f, err := os.CreateTemp(t.TempDir(), "merge-*.cjs")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := f.WriteString(mergeAccountProtoJS); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	cmd := exec.Command(node, f.Name(), "app.js")
+	cmd.Dir = "."
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("mergeAccount 探针运行失败: %v\n%s", err, out)
+	}
+	var got struct {
+		Polluted    bool   `json:"polluted"`
+		Polluted2   bool   `json:"polluted2"`
+		Polluted3   bool   `json:"polluted3"`
+		OwnProto    bool   `json:"ownProto"`
+		ProtoIntact bool   `json:"protoIntact"`
+		A           int    `json:"a"`
+		NestedX     int    `json:"nestedX"`
+		NestedY     int    `json:"nestedY"`
+		DeepMore    int    `json:"deepMore"`
+		DeepKept    int    `json:"deepKept"`
+		List        string `json:"list"`
+		NullSrc     int    `json:"nullSrc"`
+	}
+	if err := json.Unmarshal(bytes.TrimSpace(out), &got); err != nil {
+		t.Fatalf("mergeAccount 探针输出不是 JSON: %v\n%s", err, out)
+	}
+	if !got.Polluted || !got.Polluted2 || !got.Polluted3 {
+		t.Errorf("原型被污染：polluted=%v polluted2=%v polluted3=%v", got.Polluted, got.Polluted2, got.Polluted3)
+	}
+	if got.OwnProto {
+		t.Error("dst 长出了 __proto__ 自有属性")
+	}
+	if !got.ProtoIntact {
+		t.Error("dst 的原型被换掉了（__proto__ 赋值走了原型 setter）")
+	}
+	if got.A != 5 || got.NestedX != 1 || got.NestedY != 2 {
+		t.Errorf("正常键 / 嵌套对象的合并被误伤：a=%d nested.x=%d nested.y=%d", got.A, got.NestedX, got.NestedY)
+	}
+	if got.DeepMore != 2 || got.DeepKept != 1 {
+		t.Errorf("深合并不对：more=%d deep=%d（want 2 / 1）", got.DeepMore, got.DeepKept)
+	}
+	if got.List != "3" {
+		t.Errorf("数组应整体替换，实际 %q", got.List)
+	}
+	if got.NullSrc != 1 {
+		t.Errorf("src 为 null 时应原样返回 dst（keep=%d want 1）", got.NullSrc)
 	}
 }
 
@@ -6160,6 +6986,67 @@ func TestAppJSLiveNoWebSocket(t *testing.T) {
 	if strings.Contains(string(html), "cell-flash") &&
 		!strings.Contains(string(html), "@media (prefers-reduced-motion: reduce)") {
 		t.Error("缺 prefers-reduced-motion 关断块")
+	}
+}
+
+// liveHiddenScenarioJS 是 TestAppJSLiveHiddenTabStopsPolling 的场景（LIVE_WS=0：沙箱里
+// 没有 WebSocket，走的正是「WS 不可用 → 5s 轮询兜底」这条路径，所以轮询是否在打一眼可见）。
+const liveHiddenScenarioJS = `
+(async () => {
+  const out = {};
+  await tick(); await tick(); await tick();
+
+  const poll = intervals.filter(i => i.ms === 5000)[0];
+  out.base = { ok: __dsh.live().ok, registered: !!poll };
+
+  /* 隐藏：一次 tick 不得产生任何 overview 请求（隐藏时 WS 已主动断开，若这里继续轮询，
+     「省电」就是假的）。 */
+  __dsh.setHidden(true);
+  const h0 = overviewFetches();
+  poll.fn(); await tick(); await tick();
+  out.hidden = { ovf: overviewFetches() - h0 };
+
+  /* 可见：兜底轮询必须立刻恢复——隐藏只是暂停，不是永久关掉。 */
+  __dsh.setHidden(false);
+  const v0 = overviewFetches();
+  poll.fn(); await tick(); await tick();
+  out.shown = { ovf: overviewFetches() - v0 };
+
+  process.stdout.write(JSON.stringify(out));
+  process.exit(0);
+})().catch(e => { process.stderr.write('SCENARIO FAIL: ' + (e && e.stack ? e.stack : e)); process.exit(1); });
+`
+
+// TestAppJSLiveHiddenTabStopsPolling 隐藏标签页必须停止后台拉取（代码审查 F1）：
+// visibilitychange 已经主动断开 WebSocket 省电，refreshVisible 若照旧每 5s 拉一次
+// overview，等于"断了推送却在后台轮询"。回到前台由 WS 重连的全量 snapshot 补齐，
+// WS 完全用不了时（本场景）则由可见后的第一次轮询（≤5s）补齐，故隐藏期间刷新毫无价值。
+func TestAppJSLiveHiddenTabStopsPolling(t *testing.T) {
+	raw := runLiveScenario(t, liveHiddenScenarioJS, "LIVE_WS=0", "LIVE_KEY=1")
+	var base struct {
+		OK         bool `json:"ok"`
+		Registered bool `json:"registered"`
+	}
+	livePhaseJSON(t, raw, "base", &base)
+	if base.OK {
+		t.Fatal("LIVE_WS=0 环境下不该存在实时连接")
+	}
+	if !base.Registered {
+		t.Fatal("5s 兜底轮询没注册")
+	}
+	var hidden struct {
+		OVF int `json:"ovf"`
+	}
+	livePhaseJSON(t, raw, "hidden", &hidden)
+	if hidden.OVF != 0 {
+		t.Errorf("隐藏标签页不该后台轮询：这一轮拉了 %d 次 overview", hidden.OVF)
+	}
+	var shown struct {
+		OVF int `json:"ovf"`
+	}
+	livePhaseJSON(t, raw, "shown", &shown)
+	if shown.OVF == 0 {
+		t.Error("回到前台后兜底轮询必须恢复（隐藏只是暂停，不能永久关掉）")
 	}
 }
 

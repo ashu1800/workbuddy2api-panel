@@ -802,6 +802,12 @@ function accCtx() {
 function mergeAccount(dst, src) {
   if (!dst || !src || typeof src !== 'object') return dst;
   for (const k of Object.keys(src)) {
+    /* 纵深防御：__proto__ / constructor / prototype 三个键一律不合并。
+       JSON.parse('{"__proto__":{"polluted":1}}') 产生的是**自有属性**（不是原型），
+       照直写 dst[k] 会改掉 dst 的原型；递归分支更糟——cur = Object.prototype，
+       下一层就写进了全局原型，页面上任何对象都被污染。后端正常不会下发这三个键，
+       这里只是不让「一帧被构造过的补丁」变成原型污染。 */
+    if (k === '__proto__' || k === 'constructor' || k === 'prototype') continue;
     const v = src[k];
     if (v === undefined) continue;
     const cur = dst[k];
@@ -838,8 +844,10 @@ function accWriteCell(row, i, next) {
     cur.title = title; n++;
   }
   if (next.pct != null && cur.pct !== next.pct) {
-    // 只有「自身数字没变、池内基准变了」才会走到这里：整块 innerHTML 重写不值得，
-    // 直接改 CSS 变量（进度条宽度是它与 HTML 唯一的差异）。
+    /* 防御性兜底，**当前不可达**：积分列的 HTML 模板里已经内嵌了 --w（见 accountVM
+       的 cred.html），所以 pct 变化必然伴随 html 变化，上面那条分支已经把宽度连同
+       HTML 一起写进去了，也不会走到这里。留着是为了将来模板把宽度挪出 HTML 时的
+       最小代价更新路径（整块 innerHTML 重写不值得）。别把它当成活代码读。 */
     if (row.bar && row.bar.style && typeof row.bar.style.setProperty === 'function') {
       row.bar.style.setProperty('--w', next.pct + '%');
     }
@@ -853,6 +861,12 @@ function accWriteCell(row, i, next) {
    连续两次补丁时叠出两个定时器。 */
 function accFlash(td) {
   if (!td || !td.classList || typeof td.classList.add !== 'function') return;
+  /* 同一格在 600ms 内二次变化时 class 还挂在节点上：直接 add 是空操作，CSS 动画
+     不会重启，运维就看不到第二次变化。先摘掉 → 强制一次重排（让浏览器把动画重置
+     到起点）→ 再加回来，才真的重放。offsetWidth 读一次就够了（读布局属性即触发
+     重排）；极简 DOM 桩没有它，写成安全形式，绝不因为「桩上没有这个属性」而抛。 */
+  if (typeof td.classList.remove === 'function') td.classList.remove('cell-flash');
+  if (typeof td.offsetWidth === 'number') void td.offsetWidth;
   td.classList.add('cell-flash');
   if (td.__flashTimer) clearTimeout(td.__flashTimer);
   td.__flashTimer = setTimeout(() => {
@@ -895,6 +909,22 @@ function accInsertRef(tb, uid, order) {
   return null;
 }
 
+/* tbReorderFrom 返回「从哪个下标开始搬」：把目标顺序 seq 与 tb.children 的实际顺序
+   逐位比对，前缀一致的部分（含全等）都不用动。
+   · 完全一致 → 返回 seq.length（调用方一个节点都不搬）；
+   · 从第 i 个开始不同 → 返回 i（只补搬 i 之后的部分）；
+   · children 读不到（极简 DOM 桩）或长度不一致（有不该在表里的行）→ 返回 0，
+     退回整段重排——宁可多搬几次，也不能把行留在错误的位置上。
+   为什么要比：appendChild 会把节点从原位摘下来再插回去，即使最终顺序完全相同，
+   也会丢 hover / 按钮焦点、重放 CSS 动画并触发一次强制重排。 */
+function tbReorderFrom(tb, seq) {
+  const dom = tb ? tb.children : null;
+  if (!dom || typeof dom.length !== 'number' || dom.length !== seq.length) return 0;
+  let i = 0;
+  while (i < seq.length && dom[i] === seq[i].tr) i++;
+  return i;
+}
+
 /* patchAccounts 实时补丁：只写变化的单元格。
    · accounts：uid → 变化字段（绝对新值，深合并）；
    · added / removed：新增完整账号对象 / 移除 uid；
@@ -908,10 +938,17 @@ function patchAccounts(p) {
   for (const s of accList) index[s.uid] = s;
 
   const changed = (p.accounts && typeof p.accounts === 'object') ? p.accounts : null;
+  let unknownUID = false;
   if (changed) for (const uid of Object.keys(changed)) {
     const s = index[uid];
     if (s) mergeAccount(s, changed[uid]);
+    /* 补丁提到本地不存在的 uid = 本地基线已经错位（漏过 added 帧 / 池被外部改过）：
+       静默丢弃只会让这一行永远缺着，而 rev 还在前进、徽标还写着「实时」。记一笔并
+       立刻触发主动重同步（liveResync 自带 3s 去抖）——本帧剩下的字段照常应用，
+       纠偏交给它异步拉的那份全量。 */
+    else unknownUID = true;
   }
+  if (unknownUID) liveResync('unknown_uid');
   if (Array.isArray(p.added)) for (const s of p.added) {
     if (!s || typeof s.uid !== 'string') continue;
     // 已在池里的 uid 按「变化字段」处理：服务端重发同一条不该长出第二行。
@@ -970,7 +1007,11 @@ function patchAccounts(p) {
       const row = accRows[s.uid];
       if (row && !seen[s.uid]) { seen[s.uid] = 1; seq.push(row); }
     }
-    if (typeof tb.appendChild === 'function') for (const row of seq) tb.appendChild(row.tr);
+    if (typeof tb.appendChild === 'function') {
+      // 顺序真的变了才搬，且只从第一个不一致处开始搬（见 tbReorderFrom）。
+      const from = tbReorderFrom(tb, seq);
+      for (let i = from; i < seq.length; i++) tb.appendChild(seq[i].tr);
+    }
     // 源数组同步成同一顺序，维持「accList 顺序 = DOM 顺序」这一不变量。
     const byUid = Object.create(null);
     for (const s of accList) byUid[s.uid] = s;
@@ -1163,9 +1204,12 @@ function patchModelLocks(rows) {
     if (row && row.tr && typeof row.tr.remove === 'function') row.tr.remove();
     delete mlRows[key];
   }
-  // 顺序按服务端给定（它已按「整池不可用 → 没号可用 → 部分限流」排好），
-  // appendChild 复用同一批节点，不重建。
-  if (typeof tb.appendChild === 'function') for (const row of seq) tb.appendChild(row.tr);
+  // 顺序按服务端给定（它已按「整池不可用 → 没号可用 → 部分限流」排好）。同样只在
+  // 顺序真的与当前 DOM 不同时才 appendChild 复用节点，顺序相同时一次都不搬。
+  if (typeof tb.appendChild === 'function') {
+    const from = tbReorderFrom(tb, seq);
+    for (let i = from; i < seq.length; i++) tb.appendChild(seq[i].tr);
+  }
   if (note) paintMLNote(list, note);
 }
 
@@ -2147,6 +2191,18 @@ $('btnRefresh').onclick = async () => {
 /* 账号视图的 5s 轮询是**兜底**：WebSocket 通了就由推送更新（只写变化单元格），
    断了或浏览器不支持时才退回整表刷新。其余视图的轮询口径不变。 */
 function refreshVisible() {
+  /* 隐藏标签页不做任何后台拉取：visibilitychange 里已经主动断开了 WebSocket（省电），
+     若这里继续每 5s 拉一次 overview，等于"断了推送却在后台轮询"，把省电的意义抵消掉。
+     回到前台时 WS 重连会拿一份全量 snapshot；即便 WS 完全用不了，可见后第一次轮询
+     （≤5s）也会补齐——隐藏期间没人看，刷新没有任何价值。（代码审查 F1） */
+  if (document.hidden) return;
+  /* 看门狗：TCP 半开（拔网线 / NAT 超时 / 代理静默丢连接）时浏览器可能几分钟都不报
+     error，liveOk 一直是 true——表格冻在旧值上、徽标还是绿的，5s 轮询又因为「实时」
+     而不跑。阈值 90s 与后端 60s 的自愈全量 snapshot 对齐：正常连接最长 60s 必有一帧
+     （心跳是 WS 控制帧 PING，浏览器自动回 PONG，不计入），90s 一个字节都没收到就
+     只能是链路已经死了。
+     命中后直接 return：liveResync 本身已经拉了一份 overview 纠正 DOM，这一轮不必再拉。 */
+  if (liveOk && Date.now() - liveLastMsgAt > LIVE_WATCHDOG_MS) { liveResync('watchdog'); return; }
   if (view === 'accounts') { if (!liveOk) loadOverview(true); }
   else if (view === 'logs') loadLogs();
   else if (view === 'taskscenter') reattachQueueView();
@@ -2159,14 +2215,28 @@ function refreshVisible() {
    applyOverview），之后只发 patch（绝对新值 + 变化字段），由
    patchAccounts / patchPool / patchModelLocks 只写真正变化的单元格；
    60s 还会兜底重发一次 snapshot 纠正任何漂移。
+   失步自愈：补丁应用抛异常、看门狗判定半开（90s 无帧）、补丁提到本地不存在的 uid，
+   三种情况都走 liveResync —— 立刻拉一份 overview 纠正 DOM，同时断开重连拿干净基线。
    降级策略：拿不到票据、握手失败、浏览器没有 WebSocket（含测试沙箱）都不影响
    可用性——liveOk 始终为 false，refreshVisible 里的 5s 轮询照旧跑。 */
 let liveWs = null, liveOk = false, liveBoot = '', liveRev = 0, liveRetry = 0, liveTimer = null;
 let liveClosed = false;   // 主动断开（页面隐藏 / 卸载）时置位，避免 onclose 又排一次重连
+let liveStarted = false;  // liveStart 已挂过生命周期监听（start() 会被调用多次）
+let liveLastMsgAt = 0;    // 当前连接最近一次收到帧的时刻（refreshVisible 的看门狗用）
+let liveResyncAt = 0;     // 上一次主动重同步（liveResync）的时刻，做 3s 去抖
 
 /* 退避表 1→2→4→8→30s 封顶。面板常常挂在旁边盯一整天：失败即 1s 快速探活，
-   长期失败后退到 30s，既不会把服务端打满，也不会让人等太久才发现服务恢复了。 */
+   长期失败后退到 30s，既不会把服务端打满，也不会让人等太久才发现服务恢复了。
+   复位点在「成功应用一帧」之后（见 ws.onmessage），不是连接建立时——见那里的注释。 */
 const LIVE_BACKOFF = [1000, 2000, 4000, 8000, 30000];
+
+/* 看门狗阈值 90s：与后端 60s 的自愈全量 snapshot 对齐。正常连接最长 60s 必有一帧
+   （60 个 tick 的兜底全量），所以 90s（60s + 半个周期余量）一个字都没收到，就只能是
+   链路已经死了——TCP 半开时浏览器可能几分钟都不报 error，这期间 liveOk 仍是 true。 */
+const LIVE_WATCHDOG_MS = 90000;
+
+/* 主动重同步的去抖窗口 3s：坏帧风暴 / 连续异常时不要每秒打一次 overview。 */
+const LIVE_RESYNC_DEBOUNCE_MS = 3000;
 
 /* liveBadge 侧栏签名区的「实时 / 轮询」徽标。绿色 = 实时推送在跑，琥珀 = 兜底轮询
    （复用既有 .pulse 语义色，不新增配色）。只在文案/类名真的变化时写。 */
@@ -2198,6 +2268,42 @@ function liveClose() {
   if (ws) { try { ws.close(); } catch (e) { /* 已经断了：忽略 */ } }
 }
 
+/* liveResync 主动重同步（why 只进 console.warn，便于排查是哪个入口触发的）。
+   三种情况会走到这里：补丁应用抛异常、看门狗判定半开、补丁指向本地不存在的 uid。
+   它们的共同点是「本地 DOM 与 rev 都已经不可信」——只 warn 的话 rev 不推进、半更新
+   的 DOM 挂在那里、徽标还写着「实时」，最长要等 60s 的兜底 snapshot 才自愈。这里做两件事：
+     1. loadOverview(true)：立刻拉一份全量纠正 DOM（不等 60s）；
+     2. 断开并按退避重连：新连接的 snapshot 是权威基线（onopen 已复位 liveRev，
+        所以这一帧一定被接受）。
+   3s 去抖：窗口内只认第一次（坏帧风暴下不会每秒打一次 overview，也不会把刚建好的
+   连接反复掐掉）；窗口过去后下一次异常仍会重新同步，不是永久锁死。 */
+function liveResync(why) {
+  const now = Date.now();
+  if (now - liveResyncAt < LIVE_RESYNC_DEBOUNCE_MS) return false;
+  liveResyncAt = now;
+  console.warn('live: 主动重同步（' + why + '）');
+  loadOverview(true);
+  const ws = liveWs;
+  liveWs = null;
+  liveOk = false;
+  liveBadge();
+  if (ws) { try { ws.close(); } catch (e) { /* 已经断了：忽略 */ } }
+  liveSchedule();
+  return true;
+}
+
+/* liveTicket 换一张实时票据。刻意不走 api()：api() 在 401 时会 openKey() 弹密钥门，
+   而换票是**后台自动发起**的（重连 / 页面重新可见），用户刚关掉的弹层不该因为一次
+   后台请求又自己弹出来。失败一律当「没票据」照连（服务端收不收由它决定），
+   连接层会按退避重试，不需要在换票这一层再做任何 UI 动作。 */
+async function liveTicket() {
+  const k = localStorage.getItem(LS_KEY);
+  const r = await fetch('/panel/api/live/ticket', { headers: k ? { Authorization: 'Bearer ' + k } : {} });
+  if (!r || !r.ok) return '';
+  const d = await r.json().catch(() => ({}));
+  return (d && d.ticket) || '';
+}
+
 async function liveConnect() {
   if (typeof WebSocket !== 'function' || liveClosed) return;
   // 半开连接兜底：上一次只报了 error 却没触发 close 时，liveWs 会一直占着位置，
@@ -2209,7 +2315,7 @@ async function liveConnect() {
      模式，那时带上 ?ticket= 属于另一种（不该出现的）形态。取票失败也照连——
      拿不到票据不该让人看不到数据，收不收由服务端决定。 */
   if (localStorage.getItem(LS_KEY)) {
-    try { const r = await api('live/ticket'); ticket = (r && r.ticket) || ''; }
+    try { ticket = await liveTicket(); }
     catch (e) { ticket = ''; }
   }
   // 取票是异步的：这期间页面可能已被隐藏（liveClosed），或已经连上了。
@@ -2220,13 +2326,39 @@ async function liveConnect() {
   try { ws = new WebSocket(url); }
   catch (e) { console.warn('live: WebSocket 建立失败', e); liveSchedule(); return; }
   liveWs = ws;
-  ws.onopen = () => { liveOk = true; liveRetry = 0; liveBadge(); };
+  ws.onopen = () => {
+    /* liveRev 是「同一条连接内」用来丢弃重放 / 乱序帧的水位，跨连接没有可比性，必须复位：
+       服务端 attach 时重建基线、发的 snapshot 用的是**当前** rev（不递增）。不复位的话，
+       唯一订阅者断开（隐藏标签页 / 网络抖动）期间池状态变了、重连后的首个 snapshot
+       rev 与断线前相同 → 被 rev 守卫整帧丢掉 → 最长 60s 一直显示断线期间的陈旧数据，
+       而 liveOk 已经是 true、5s 轮询也停了、徽标还亮着「实时」。 */
+    liveRev = 0;
+    // 退避**不**在这里复位：见 onmessage 里的说明。
+    liveOk = true;
+    // 看门狗从连接建立就开始计时（不能停在 0）：连上了却一个字节都不来
+    //（服务端 attach 卡住 / 半开）同样要在 90s 后重连。
+    liveLastMsgAt = Date.now();
+    liveBadge();
+  };
   ws.onmessage = ev => {
+    /* 旧 socket 的迟到帧：连接已经被换掉（重连 / 重同步 / 主动断开），它的数据不再代表
+       当前状态，直接丢——否则会把新连接刚建立的状态覆盖回旧的（还可能带着更小的 rev
+       骗过守卫，因为新连接的 rev 刚从 0 起步）。 */
+    if (liveWs !== ws) return;
+    liveLastMsgAt = Date.now();   // 收到任何一帧都算「链路还活着」（看门狗的唯一依据）
     let msg;
     try { msg = JSON.parse(ev && ev.data); }
     catch (e) { console.warn('live: 坏帧已丢弃', e); return; }
-    // 一帧坏数据绝不能把页面打挂：应用阶段的异常一样收敛成 warn。
-    try { applyLive(msg); } catch (e) { console.warn('live: 补丁应用失败', e); }
+    /* 一帧坏数据绝不能把页面打挂：应用阶段的异常收敛成 warn + 主动重同步
+       （只 warn 的话 rev 不推进、半更新的 DOM 挂着、徽标还是「实时」）。 */
+    let applied = false;
+    try { applied = applyLive(msg); }
+    catch (e) { console.warn('live: 补丁应用失败', e); liveResync('apply_failed'); return; }
+    /* 退避复位点：**收到并成功应用一帧之后**，而不是 onopen。握手成功不等于链路可用
+       ——slow_consumer / idle_timeout / 服务端重启循环都是「接受连接 → 立刻 bye →
+       断开」，若在 onopen 复位，这种循环会永远以 1s 间隔重连（永远涨不到 30s 封顶），
+       既打满了服务端，也说明退避完全没起作用。 */
+    if (applied) liveRetry = 0;
   };
   ws.onerror = () => { liveOk = false; liveBadge(); liveSchedule(); };
   ws.onclose = () => {
@@ -2239,11 +2371,13 @@ async function liveConnect() {
 
 /* applyLive 处理一帧服务端消息（心跳是 WS 控制帧 PING，浏览器自动回 PONG，这里不用管）：
    · boot 变化 = 服务端重启过，rev 序列从头发起，旧 rev 不能用来丢弃新帧；
-   · rev <= liveRev = 重放 / 乱序，整帧丢弃；
+   · rev <= liveRev = 同一条连接内的重放 / 乱序，整帧丢弃（snapshot 除外，见下）；
    · snapshot 走整表渲染（与 /panel/api/overview 同一函数），patch 只写变化。
-   字段缺失一律跳过：补丁只带变化的东西，没提到的就是没变。 */
+   字段缺失一律跳过：补丁只带变化的东西，没提到的就是没变。
+   返回值 = 这帧是否真的应用了（onmessage 据此决定要不要复位退避）：bye / 未知类型 /
+   被 rev 守卫丢掉的帧都返回 false。 */
 function applyLive(msg) {
-  if (!msg || typeof msg !== 'object') return;
+  if (!msg || typeof msg !== 'object') return false;
   if (msg.boot != null && msg.boot !== liveBoot) { liveBoot = String(msg.boot); liveRev = 0; }
   const type = String(msg.type || '');
   if (type === 'bye') {
@@ -2252,10 +2386,13 @@ function applyLive(msg) {
     liveWs = null; liveOk = false; liveBadge();
     if (ws) { try { ws.close(); } catch (e) { /* 已经断了：忽略 */ } }
     liveSchedule();
-    return;
+    return false;
   }
   const hasRev = typeof msg.rev === 'number';
-  if (hasRev && msg.rev <= liveRev) return;
+  /* snapshot 自带全量，一律接受，不走 rev 守卫：重连后的第一帧就是这种「同 boot 同 rev、
+     但数据已经是新的」snapshot（服务端 attach 重建基线时 rev 不递增），丢掉它就等于
+     把重连期间的变化永久咽掉，只能干等 60s 的兜底全量。 */
+  if (hasRev && type !== 'snapshot' && msg.rev <= liveRev) return false;
   if (type === 'snapshot') {
     if (msg.data && typeof msg.data === 'object') applyOverview(msg.data);
   } else if (type === 'patch') {
@@ -2265,17 +2402,25 @@ function applyLive(msg) {
     // 用 in 判存在而不是真值：服务端把「字段消失」编码成显式 null（锁全解时
     // model_locks 就是 null），当成"没带这段"会一直挂着过期的锁池行。
     if ('model_locks' in msg) patchModelLocks(msg.model_locks);
-    if (msg.pool) patchPool(msg.pool);
+    // pool 与 model_locks 同一口径：也是 in 判存在（pool:null 同样算「这段有变化」），
+    // patchPool 内部已容忍 null / 缺字段，所以真值判断在这里只会制造第二种规则。
+    if ('pool' in msg) patchPool(msg.pool);
   } else {
-    return;   // 未知类型：不认识就不动，也不推进 rev
+    return false;   // 未知类型：不认识就不动，也不推进 rev
   }
   if (hasRev) liveRev = msg.rev;
+  return true;
 }
 
 /* liveStart 只在真有 WebSocket 时才挂生命周期监听：没有它（旧浏览器 / 测试沙箱）
-   就是纯轮询，连监听都不必注册。 */
+   就是纯轮询，连监听都不必注册。
+   liveStarted 保证幂等：密钥门通过后 start() 会再被调用一次，没有这道闸就会把
+   visibilitychange / beforeunload 各挂两个（隐藏时 liveClose 跑两遍、卸载时同理），
+   还会多打一次无谓的 liveConnect。 */
 function liveStart() {
   if (typeof WebSocket !== 'function') return;
+  if (liveStarted) return;
+  liveStarted = true;
   document.addEventListener('visibilitychange', () => {
     if (document.hidden) liveClose();          // 后台页面不占连接
     else { liveClosed = false; liveRetry = 0; liveConnect(); }

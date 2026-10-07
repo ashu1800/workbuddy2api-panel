@@ -295,6 +295,55 @@ func TestHubFirstSubscriberGetsOverviewSnapshot(t *testing.T) {
 	}
 }
 
+// TestHubReconnectSnapshotAdvancesRev 代码审查 D1 的服务端一侧：唯一订阅者断开期间池
+// 状态变化，重连时那帧 snapshot 必须带**新** rev。否则客户端（liveRev 停在断开前的值）
+// 会把这份全量当重放丢弃 —— 断开期间的变化再也补不上（基线已在 attach 时前进，增量不会
+// 重发），只能干等 60s 自愈全量，而前端此刻显示的却是绿色「实时」。
+func TestHubReconnectSnapshotAdvancesRev(t *testing.T) {
+	p, pl := newLiveTestPanel(t, "", "u1")
+	h := p.hub
+	h.tickInterval = time.Hour // 只由手动驱动：避免后台 ticker 干扰 rev 计数
+
+	sub1, peer1 := attachPipe(t, h)
+	first := peer1.next(t, 3*time.Second)
+	if first == nil {
+		t.Fatal("首订阅者没收到 snapshot")
+	}
+	rev1, _ := first["rev"].(float64)
+	if rev1 == 0 {
+		t.Fatalf("首个 snapshot 的 rev 无效: %v", first["rev"])
+	}
+
+	// 唯一订阅者断开（前端在标签页隐藏时会主动断开）：无订阅者 → ticker 停摆、rev 不再前进。
+	h.detach(sub1)
+	_ = peer1.conn.Close()
+
+	// 断开期间池状态变化：这一刻没有任何订阅者，服务端不会广播任何帧。
+	pl.SetCredits("u1", 999, 1000)
+
+	sub2, peer2 := attachPipe(t, h)
+	defer h.detach(sub2)
+	second := peer2.next(t, 3*time.Second)
+	if second == nil {
+		t.Fatal("重连没收到 snapshot")
+	}
+	if second["type"] != "snapshot" {
+		t.Fatalf("重连首帧 type=%v, want snapshot", second["type"])
+	}
+	rev2, _ := second["rev"].(float64)
+	if rev2 <= rev1 {
+		t.Errorf("重连 snapshot 的 rev=%v 没前进（断开前 %v）：客户端会当重放丢弃，断开期间的变化最长 60s 不显示", rev2, rev1)
+	}
+	data, _ := second["data"].(map[string]any)
+	accts, _ := data["accounts"].([]any)
+	if len(accts) != 1 {
+		t.Fatalf("重连 snapshot 的 accounts=%#v, want 1 个账号", data["accounts"])
+	}
+	if got := accts[0].(map[string]any)["credits"]; got != float64(999) {
+		t.Errorf("重连 snapshot 的 credits=%v, want 999（断开期间的变化必须随快照带上）", got)
+	}
+}
+
 // 只改 uptime_sec 不发帧：这是"排除 uptime_sec"这条设计决策的直接验证。
 func TestHubIgnoresUptimeSecChange(t *testing.T) {
 	p, _ := newLiveTestPanel(t, "", "u1")
@@ -1072,5 +1121,98 @@ func (h *liveHub) broadcastForTest(msg []byte) {
 	defer h.mu.Unlock()
 	for s := range h.subs {
 		s.enqueue(msg)
+	}
+}
+
+// liveOriginCases 是「Origin 与 Host 同源判定」在 HTTP 层的用例表：
+// 跨站必须拒；同源放行；不带 Origin 的运维脚本放行。
+// 同源判定的细节（大小写/端口/协议）由 TestWSSameOrigin 直接钉函数。
+func liveOriginCases() []struct {
+	name   string
+	origin string
+	want   int
+} {
+	return []struct {
+		name   string
+		origin string
+		want   int
+	}{
+		{"跨站 Origin 必须拒", "http://evil.example", http.StatusForbidden},
+		{"同源 Origin 放行", "http://127.0.0.1:7863", http.StatusNotImplemented},
+		{"协议不同但 Host 相同（https 反代）放行", "https://127.0.0.1:7863", http.StatusNotImplemented},
+		{"不带 Origin（运维脚本 / 裸 socket）放行", "", http.StatusNotImplemented},
+		{"Origin 不可解析 → 拒", "http://[::1", http.StatusForbidden},
+		{"Origin: null（沙箱 iframe）→ 拒", "null", http.StatusForbidden},
+	}
+}
+
+// TestLiveRejectsCrossSiteOriginWhenNoAPIKey 代码审查 F2：WebSocket **不受 CORS 约束**，
+// 无鉴权部署（api_key 为空）下任何站点都能借访客浏览器连上这条推送、把账号池
+//（uid / 昵称 / 积分 / 在途…）一路读走，而 panel 的普通 API 因为没有 CORS 头 fetch 不到。
+// 故无鉴权时要求 Origin 与 Host 同源；带鉴权时票据已证明身份，不再看 Origin，
+// 免得反代改写 Host/Origin 时把推送打断（降级到 5s 轮询，功能不缺）。
+func TestLiveRejectsCrossSiteOriginWhenNoAPIKey(t *testing.T) {
+	p, _ := newLiveTestPanel(t, "", "u1") // api_key 为空 = 无鉴权部署
+	for _, tc := range liveOriginCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			req := httptest.NewRequest(http.MethodGet, "/panel/api/live", nil)
+			req.Host = "127.0.0.1:7863"
+			req.Header.Set("Upgrade", "websocket")
+			req.Header.Set("Connection", "Upgrade")
+			req.Header.Set("Sec-WebSocket-Version", "13")
+			req.Header.Set("Sec-WebSocket-Key", base64.StdEncoding.EncodeToString([]byte("0123456789abcdef")))
+			if tc.origin != "" {
+				req.Header.Set("Origin", tc.origin)
+			}
+			rec := httptest.NewRecorder()
+			p.ServeHTTP(rec, req)
+			if rec.Code != tc.want {
+				t.Fatalf("Origin=%q → %d, want %d（body=%s）", tc.origin, rec.Code, tc.want, rec.Body.String())
+			}
+		})
+	}
+}
+
+// 带鉴权时不做 Origin 校验：票据已证明身份，跨站 Origin 也只该撞在 401 invalid_ticket 上
+//（而不是 403 bad_origin——那会把反代场景的合法客户端一起拒掉）。
+func TestLiveIgnoresOriginWhenAPIKeySet(t *testing.T) {
+	p, _ := newLiveTestPanel(t, "test-key", "u1")
+	req := httptest.NewRequest(http.MethodGet, "/panel/api/live?ticket=whatever", nil)
+	req.Host = "127.0.0.1:7863"
+	req.Header.Set("Origin", "http://evil.example")
+	rec := httptest.NewRecorder()
+	p.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("带鉴权时只该校验票据（401），得到 %d（body=%s）", rec.Code, rec.Body.String())
+	}
+}
+
+// 同源判定本身：空 Origin 放行、Host 相等（忽略大小写）放行、别的 Host/端口拒。
+func TestWSSameOrigin(t *testing.T) {
+	mk := func(host, origin string) *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/panel/api/live", nil)
+		r.Host = host
+		if origin != "" {
+			r.Header.Set("Origin", origin)
+		}
+		return r
+	}
+	cases := []struct {
+		host, origin string
+		want         bool
+	}{
+		{"127.0.0.1:7863", "", true},                            // 非浏览器客户端
+		{"127.0.0.1:7863", "http://127.0.0.1:7863", true},       // 同源
+		{"127.0.0.1:7863", "https://127.0.0.1:7863", true},      // 反代终止 TLS：协议不同、Host 相同
+		{"LOCALHOST:7863", "http://localhost:7863", true},       // 大小写不敏感
+		{"127.0.0.1:7863", "http://127.0.0.1:7864", false},      // 端口不同
+		{"127.0.0.1:7863", "http://evil.example", false},        // 跨站
+		{"127.0.0.1:7863", "null", false},                       // 沙箱 iframe 的 Origin: null
+		{"127.0.0.1:7863", "about:blank", false},                // 不可用 Origin
+	}
+	for _, tc := range cases {
+		if got := wsSameOrigin(mk(tc.host, tc.origin)); got != tc.want {
+			t.Errorf("wsSameOrigin(host=%q origin=%q)=%v, want %v", tc.host, tc.origin, got, tc.want)
+		}
 	}
 }

@@ -36,7 +36,9 @@ import (
 	"log"
 	"net"
 	"net/http"
+	"net/url"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -573,10 +575,14 @@ func (h *liveHub) attach(c *wsx.Conn) *liveSub {
 		// 从"无订阅者"回到"有订阅者"：重算基线。无订阅者期间 ticker 不跑，
 		// 旧基线可能已经陈旧很久（尤其是 uptime_sec）；重建一次，比让新客户端
 		// 先看到一个陈旧快照、再等 60s 的自愈全量纠正要划算。
+		//
+		// rev 也必须前进（代码审查 D1）：这一帧 snapshot 携带的是**新**状态，而 rev
+		// 的语义是"服务端已广播状态的版本"。若沿用旧 rev，刚重连的客户端（它的
+		// liveRev 还停在断开前的值）会把这帧当重放丢掉——无订阅者期间发生的变化就
+		// 再也补不上（增量已随基线一起前进），只能干等 60s 的自愈全量，而前端此时
+		// 仍显示绿色「实时」徽标。旧 rev 号在这条路径上没有任何用处，递增是零成本。
 		h.prev = h.buildState()
-		if h.rev == 0 {
-			h.rev = 1
-		}
+		h.rev++
 	}
 	h.subs[sub] = struct{}{}
 	if !h.running {
@@ -700,6 +706,21 @@ func (h *liveHub) currentRev() uint64 {
 // HTTP 端点
 // ---------------------------------------------------------------------------
 
+// wsSameOrigin 判断浏览器上报的 Origin 是否与本次请求同源（Host 相等）。
+// 没有 Origin 头时放行：跨站 WebSocket 读取的前提是"由访客浏览器自动发起"，运维脚本 /
+// 裸 socket 客户端本来就不带 Origin，拦下来只会误伤；上报了 Origin 却不解析的，判为不同源。
+func wsSameOrigin(r *http.Request) bool {
+	origin := r.Header.Get("Origin")
+	if origin == "" {
+		return true
+	}
+	u, err := url.Parse(origin)
+	if err != nil || u.Host == "" {
+		return false
+	}
+	return strings.EqualFold(u.Host, r.Host)
+}
+
 // liveTicket 签发一次性实时推送票据（走 withAuth：必须先有 api_key）。
 // api_key 为空（未启用鉴权）时也照常签发——前端拿票的动作不需要分叉，
 // 升级侧只是忽略票据而已。
@@ -721,6 +742,17 @@ func (p *Panel) live(w http.ResponseWriter, r *http.Request) {
 	//    api_key 为空时免票据，与面板其它接口同口径（裸跑本机/私网）。
 	if p.apiKey() != "" && !p.hub.tickets.consume(r.URL.Query().Get("ticket")) {
 		writeErr(w, http.StatusUnauthorized, "invalid_ticket")
+		return
+	}
+
+	// 1.5) 跨站读取防护（代码审查 F2）：WebSocket **不受 CORS 约束**，而 panel 的普通
+	//      API 受——所以无鉴权部署（api_key 为空，README 允许的私网/本机裸跑）下，
+	//      任何站点都能借访客的浏览器连上这条推送，把账号池（uid/昵称/积分/在途…）
+	//      一路读走，而 fetch 读不到。故此时要求 Origin 与 Host 同源；带鉴权时票据
+	//      本身已证明身份，不再校验 Origin，免得反代改写 Host/Origin 时误伤——
+	//      降级路径是 5s 轮询，失败也不会让人看不到数据。
+	if p.apiKey() == "" && !wsSameOrigin(r) {
+		writeErr(w, http.StatusForbidden, "bad_origin")
 		return
 	}
 
