@@ -53,7 +53,17 @@ import (
 // 兜 TCP 半开、顺序未变不搬 DOM（保住 hover/焦点/动画）、同格 600ms 内二次变化重播高亮、
 // liveStart 幂等（不再重复挂生命周期监听）、mergeAccount 跳过 __proto__ 等键、后台换票
 // 不再弹密钥门、隐藏标签页停止轮询、无鉴权部署校验 WebSocket 同源 Origin（WS 不受 CORS 约束）。
-const appVersion = "1.15.1-panel"
+//
+// 1.16.0-panel：合并上游 1.13.0（11 个提交）。**企业版账号能力门控 + 企业额度展示**：
+// auth 文件带非空 enterpriseId 的账号自动识别为企业版（面板加「企业版」标签、隐藏签到与
+// 任务按钮、余额改「额度」、不限量显示「不限」），网关不再对企业号发起签到 / 活跃上报 /
+// 猫猫旅行 / 夜猫子 / 连登管家五类必然被拒的调用，额度改走 get-enterprise-user-usage
+//（credit 是本周期已用 → 剩余 = limitNum − credit；limitNum=-1 为不限量）。同时带入：
+// 暂停选号单列统计（概况新增 paused 字段与第七张卡，禁用与暂停分开计）、速率扣 TTFB 后
+// 不足 200ms 退回端到端（issue #127，fork 的「推理速度」累计口径同批加同一道地板）、
+// 夜猫子门控可替换时钟。上游的「全部历史」与图表 tooltip 两条修复 fork 早在 418f32f
+// 与面板重写时已独立修好，不重复引入；不新增配置键，非企业账号行为不变。
+const appVersion = "1.16.0-panel"
 
 // usagePathFor 由 state 文件路径推出用量文件路径：同目录、文件名 usage.json。
 // 这样 config 里改 state_file 时用量数据跟着走，不需要额外配置项。

@@ -1775,6 +1775,50 @@ func TestRecordTokenUsageTTFBAndInference(t *testing.T) {
 	}
 }
 
+// TestRecordTokenUsageInferenceFloor 攒批下发时「扣完首字只剩几毫秒」必须退回端到端
+// （与 internal/server 的 minGenWindow 同一道地板，issue #127 的 fork 侧延伸）：
+// 上游把几百 token 攒到最后一起下发时，total−ttfb 只剩几毫秒，直接相除会得出上万
+// tok/s 的幻数，并**永久污染**面板「推理速度」的累计平均（这是与单条流水行不同的
+// 伤害：单条只错一行，累计会把后面所有样本一起带偏）。
+func TestRecordTokenUsageInferenceFloor(t *testing.T) {
+	p := New("")
+	p.Add(&auth.Auth{UID: "u1"})
+
+	// 攒批下发：总耗时 5s、首字 4950ms → 首字之后只剩 50ms（< 200ms 地板）
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 400,
+		HasLatencyMs: true, LatencyMs: 5000, HasTTFBMs: true, TTFBMs: 4950,
+	})
+	st, _ := p.Status("u1")
+	tu := st.TokenUsage
+	if tu.InferenceMsSum != 5000 {
+		t.Errorf("inference_ms_sum=%d want 5000（不足地板应退回端到端，而不是 50）", tu.InferenceMsSum)
+	}
+	if got := float64(tu.InferenceTokensSum) * 1000 / float64(tu.InferenceMsSum); got > 100 {
+		t.Errorf("推理速度=%.0f tok/s 出现幻数（地板失效）", got)
+	}
+
+	// 边界：恰好 200ms 仍按扣除后计（>= 地板）
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 100,
+		HasLatencyMs: true, LatencyMs: 1200, HasTTFBMs: true, TTFBMs: 1000,
+	})
+	st, _ = p.Status("u1")
+	if st.TokenUsage.InferenceMsSum != 5200 {
+		t.Errorf("恰好 200ms 应扣除：inference_ms_sum=%d want 5200 (5000+200)", st.TokenUsage.InferenceMsSum)
+	}
+
+	// 边界：199ms 退回端到端（总耗时 1199）
+	p.RecordTokenUsage("u1", TokenUsageDelta{
+		HasCompletionTokens: true, CompletionTokens: 100,
+		HasLatencyMs: true, LatencyMs: 1199, HasTTFBMs: true, TTFBMs: 1000,
+	})
+	st, _ = p.Status("u1")
+	if st.TokenUsage.InferenceMsSum != 6399 {
+		t.Errorf("199ms 应退回端到端：inference_ms_sum=%d want 6399 (5200+1199)", st.TokenUsage.InferenceMsSum)
+	}
+}
+
 // TestRecordTokenUsageOKCount 成功率分子必须与尝试次数在同一次记账里累加：
 // 这是「成功率不可能超过 100%」的结构性保证。用 pool 的 success_count 当分子做不到
 // ——它在「上游刚开流」时就 +1，早于尝试记账（线上实况 662次 | 100.15%）。

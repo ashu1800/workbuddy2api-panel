@@ -162,7 +162,7 @@ func (s *ticketStore) setClock(fn func() time.Time) {
 // 显式列 key（而不是把整份 overview 丢进比较）就是为了把 uptime_sec 排除在外：
 // 它是"每秒必变"的字段，一旦进比较，每个 tick 都会产生一次推送。
 var livePoolKeys = []string{
-	"total", "healthy", "cooling", "disabled", "in_flight_full", "sticky_sessions",
+	"total", "healthy", "cooling", "disabled", "paused", "in_flight_full", "sticky_sessions",
 }
 
 // liveAcct 单个账号的快照分片：既有完整对象（snapshot 的整数组 / patch 的 added

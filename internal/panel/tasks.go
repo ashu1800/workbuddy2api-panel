@@ -33,6 +33,17 @@ func (p *Panel) accountTasks(w http.ResponseWriter, r *http.Request) {
 	if a == nil {
 		return
 	}
+	// 企业版没有个人成长体系：上游对 GET /v2/activity/growth/tasks 直接 403
+	//（"growth system is only available for personal users"）。面板对企业号不渲染
+	//「任务」按钮，这里是 API 侧防御（外部脚本 / 旧缓存前端仍可能调用）——回空列表 +
+	// 说明，而不是把上游的 403 变成一次 502 报错。
+	if a.IsEnterprise() {
+		writeJSON(w, http.StatusOK, map[string]any{
+			"ok": true, "tasks": []any{},
+			"note": "企业账号无个人成长体系（上游 growth 接口对该账号返回 403）",
+		})
+		return
+	}
 	tasks, err := p.cfg.Upstream.ListTasks(a)
 	if err != nil {
 		writeErr(w, http.StatusBadGateway, "list tasks: "+err.Error())

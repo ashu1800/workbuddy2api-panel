@@ -884,6 +884,11 @@ func runLibraryRead(p *Panel, a *auth.Auth) (string, error) {
 // 判据 = 夜间窗口内 glm-5.2 真实对话 + chat 事件上报（WorkBuddy-Daily 实测口径）。
 // 窗口外不做（提示等排程）；网关 blackcat_hours（默认 23 点）排程会自动补足。
 func runBlackCat(p *Panel, a *auth.Auth) (string, error) {
+	// 企业版无个人成长体系：夜猫子领奖端点在服务端返回 400 code 10001
+	//「企业账号不支持该操作」（与 scheduler 里五处门控同一条判据）。
+	if a.IsEnterprise() {
+		return "企业账号无成长体系（夜猫子不适用），已跳过", nil
+	}
 	if !upstream.InNightWindow(time.Now()) {
 		return "当前不在 23:00–08:00 计数窗口，行为不计分；网关会在每日 23 点自动补足", nil
 	}
@@ -1116,6 +1121,16 @@ func runExpertBatch(p *Panel, a *auth.Auth, expertType string, count int) (strin
 // 再逐项执行行为链路。accept 不是进度产生的必要条件，但让后续状态流转规范。
 func (p *Panel) runAutoAll(a *auth.Auth) []map[string]any {
 	var out []map[string]any
+
+	// 企业版没有个人成长体系：任务列表与行为上报在服务端一律 403/400
+	//（"growth system is only available for personal users"）。面板对企业号不渲染
+	//「任务」按钮，这里是执行侧的兜底：直接回一条说明，而不是让用户看到一串报错。
+	if a.IsEnterprise() {
+		return []map[string]any{{
+			"task_code": "(全部任务)", "status": "skip",
+			"message": "企业账号无个人成长体系（上游 growth 接口返回 403），未执行任何任务",
+		}}
+	}
 
 	// 阶段 0：批量接受尚未接受的任务（失败不阻塞——行为事件才是进度唯一判据）。
 	if tasks, err := p.cfg.Upstream.ListTasks(a); err == nil {

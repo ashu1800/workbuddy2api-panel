@@ -285,7 +285,10 @@ func mergeTodayUsage(accts []pool.Status, byUID map[string]usage.KeyedAgg, day s
 // HTTP 轮询与 WS 实时推送共用这一份实现：两条路径各写一份必然漂移，而前端正是
 // "先拉一次 HTTP、再吃 WS 增量"的用法，一旦不同源就会自相矛盾。
 func (p *Panel) overviewPayload() map[string]any {
-	total, healthy, cooling, disabled, inFlightFull := p.cfg.Pool.CountsDetailed()
+	// 用 CountsDetailedWithPaused 而不是 CountsDetailed：后者把「暂停选号」并进 disabled
+	//（那是 /status 的「不可用」口径，供外部脚本判断能不能服务），而概况卡片要把两者
+	// 分开显示——暂停只关选号、照常签到保活，与禁用是两种状态（上游 issue #125）。
+	total, healthy, cooling, disabled, paused, inFlightFull := p.cfg.Pool.CountsDetailedWithPaused()
 	sticky := 0
 	if p.cfg.StickyCount != nil {
 		sticky = p.cfg.StickyCount()
@@ -309,6 +312,7 @@ func (p *Panel) overviewPayload() map[string]any {
 		"healthy":         healthy,
 		"cooling":         cooling,
 		"disabled":        disabled,
+		"paused":          paused,
 		"in_flight_full":  inFlightFull,
 		"accounts":        mergeTodayUsage(accts, byUID, now.Format("2006-01-02")),
 		// model_locks 模型级限流全清单（哪些模型不能用、锁了几个号、还要锁多久）：
@@ -578,7 +582,13 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 	}
 	checkinMsg := ""
 	checkinDone := false
-	if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
+	// 企业版没有个人成长体系：上游对 daily-checkin 返回 400 code 10001「企业账号不支持
+	// 该操作」。前端对企业号不渲染「签到」按钮，这里是 API 侧防御（外部脚本、旧缓存前端
+	// 仍可能调用），端点退化成「只刷新额度」——额度走 get-enterprise-user-usage 口径，
+	// 由下面的 UserResourceDetailedWithExpiry 自动分流。
+	if a.IsEnterprise() {
+		checkinMsg = "企业账号无签到体系（已跳过签到，仅刷新额度）"
+	} else if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 		checkinMsg = err.Error() // "今天已签到"等业务错误照常查余额
 		// 幂等拒绝同样是「今日已签」，标记后按钮显示「已签」。
 		if upstream.IsAlreadyCheckin(err) {
@@ -590,6 +600,9 @@ func (p *Panel) accountCheckin(w http.ResponseWriter, r *http.Request) {
 		checkinDone = true
 	}
 	resp := map[string]any{"ok": true, "checkin_done": checkinDone}
+	if a.IsEnterprise() {
+		resp["enterprise"] = true
+	}
 	if checkinMsg != "" {
 		resp["checkin_message"] = checkinMsg
 	}

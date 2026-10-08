@@ -597,13 +597,27 @@ function accountVM(s, ctx) {
   const tag = '<span class="tag ' + st.tone + '"' +
     (st.title ? ' title="' + esc(st.title) + '"' : '') + '>' + esc(st.label) + '</span>';
   const short = s.uid.length > 16 ? s.uid.slice(0, 16) + '…' : s.uid;
-  const cred = s.credits == null ? '—' : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits));
-  const pct = s.credits_total > 0
-    ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
-    : Math.round((s.credits || 0) / maxCred * 100);
+  /* 企业版「不限量」哨兵：上游 limitNum=-1 在池内被映射成 credits_total === -1，同时把
+     credits 写成 1<<40 的占位值。这两个数都不是真实额度：1<<40 直接显示会盖掉整列，
+     参与求和 / 池内基准比较还会把别的号一起带偏。故这里先识别哨兵，再分三条路展示：
+     不限量 → 「不限」；有分配额度 → 剩余 / 分配；其余形态（含旧数据无总额）保持原样。 */
+  const unlimited = s.credits_total === -1;
+  const cred = s.credits == null ? '—'
+    : (unlimited ? '不限'
+      : (s.credits_total > 0 ? s.credits + '<span class="of">/' + s.credits_total + '</span>' : String(s.credits)));
+  const pct = unlimited ? 100
+    : (s.credits_total > 0
+      ? Math.min(100, Math.round((s.credits || 0) / s.credits_total * 100))
+      : Math.round((s.credits || 0) / maxCred * 100));
   // 成本台账 tooltip（model_costs）：每模型实测单价（≤0 = 实测免费），运维据此
   // 看「为什么总选它」——免费号垄断 / 单价排序一眼可见。
-  let credTip = s.credits_total > 0 ? '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）' : '积分（相对池内最高）';
+  let credTip = unlimited ? '企业版不限量（上游 limitNum=-1）'
+    // 企业号的 credits_total 是「本周期分配额度」，不是个人号的充值总额，措辞必须区分，
+    // 否则运维会拿「总额」去对账个人套餐（口径不同）。
+    : (s.credits_total > 0
+      ? (s.enterprise ? '企业版剩余额度 ' + s.credits + ' / 分配 ' + s.credits_total + '（' + pct + '%）'
+        : '剩余 ' + s.credits + ' / 总额 ' + s.credits_total + '（' + pct + '%）')
+      : '积分（相对池内最高）');
   const costs = (s.model_costs || []).filter(c => c.model);
   if (costs.length) {
     credTip += '\n实测单价（credits/1K）：\n' + costs.map(c =>
@@ -654,7 +668,7 @@ function accountVM(s, ctx) {
     rowCls: cls,
     rowTitle: 'uid: ' + s.uid,
     mark: '<i></i>',
-    who: '<div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>',
+    who: '<div class="nm">' + (s.nickname ? esc(s.nickname) : '<span class="c-muted">未命名</span>') + (s.realm === 'global' ? ' <span class="realm-tag">国际版</span>' : '') + (s.enterprise ? ' <span class="realm-tag">企业版</span>' : '') + '</div><div class="id">' + esc(short) + '</div>',
     status: { html: tag, title: st.title || '' },
     cred: {
       html: '<div class="n">' + cred + '</div><div class="bar"><i style="--w:' + pct + '%"></i></div>',
@@ -687,9 +701,18 @@ function accountVM(s, ctx) {
     last: ago(s.last_success),
     acts: {
       html:
-      '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>' +
-      '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>' +
-      '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>' +
+      /* 企业版没有个人的成长体系：签到（个人积分）与「任务」（日常任务/连续签到）
+         在企业号上要么被上游拒绝、要么毫无意义，故企业号两个按钮都不渲染（后端
+         scheduler 的任务门控与此一致）；服务端返回的字段仍在，只在展示层门控。
+         「余额」对企业号是另一条上游路径（get-enterprise-user-usage，刷新的是本周期
+         已分配额度），文案改「额度」并把口径写进 title，避免运维按个人余额去理解。 */
+      (s.enterprise ? ''
+        : '<button class="xs ghost" data-a="checkin" data-u="' + esc(s.uid) + '"' + (s.checkin_done ? ' title="今日已签到；点击可重新签到并刷新余额"' : '') + '>' + (s.checkin_done ? '已签' : '签到') + '</button>') +
+      (s.enterprise
+        ? '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '" title="刷新企业版已分配额度（上游 get-enterprise-user-usage）">额度</button>'
+        : '<button class="xs ghost" data-a="balance" data-u="' + esc(s.uid) + '">余额</button>') +
+      (s.enterprise ? ''
+        : '<button class="xs ghost" data-a="tasks" data-u="' + esc(s.uid) + '">任务</button>') +
       (frozen ? '<button class="xs primary" data-a="revive" data-u="' + esc(s.uid) + '">解冻</button>'
               : '<button class="xs ghost" data-a="disable" data-u="' + esc(s.uid) + '">禁用</button>') +
       /* 暂停 / 恢复选号（上游 paused 合并过来的操作）：「解冻/禁用」旁并列的第二个开关，
@@ -699,11 +722,13 @@ function accountVM(s, ctx) {
          （意图立即生效，不必等冷却走完），故这一个按钮不看 frozen，只看 paused。
          已禁用账号不渲染它：禁用已含「不参与选号」，两个按钮并列会让人以为效果能叠加，
          也容易误以为禁用号的任务还能靠暂停挽回（本 fork 的 include_disabled_in_tasks
-         是全局开关，不是账号级补救）。 */
+         是全局开关，不是账号级补救）。
+         企业号的 title 单独写：它没有签到/任务，保活的是企业凭证，让位期间刷新的是额度
+         （照抄个人号的「签到 / 活跃上报」会指向两个企业号根本不会执行的动作）。 */
       (s.disabled ? ''
         : (s.paused
             ? '<button class="xs primary" data-a="resume" data-u="' + esc(s.uid) + '">恢复选号</button>'
-            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额">暂停选号</button>')) +
+            : '<button class="xs ghost" data-a="pause" data-u="' + esc(s.uid) + '" title="' + (s.enterprise ? '退出选号，但照常保活 / 刷新额度' : '退出选号，但照常签到 / 活跃上报 / 保活 / 刷新余额') + '">暂停选号</button>')) +
       '<button class="xs ghost danger" data-a="remove" data-u="' + esc(s.uid) + '">移除</button>',
     },
   };
@@ -792,7 +817,14 @@ function renderAccounts(list) {
    变化会（正确地）让没有 credits_total 的行的百分比跟着变。 */
 function accCtx() {
   let max = 1;
-  for (const s of accList) { const c = s.credits || 0; if (c > max) max = c; }
+  for (const s of accList) {
+    /* credits_total === -1 是企业版「不限量」哨兵（credits 是 1<<40 的占位值）。
+       它不是真实额度：一旦参与基准比较，1<<40 会顶满 max，池内所有普通号
+       （几十~几万）的进度条会一起塌成 0%，等于把相对基准这张卡彻底废掉。 */
+    if (s.credits_total === -1) continue;
+    const c = s.credits || 0;
+    if (c > max) max = c;
+  }
   return { maxCred: max };
 }
 
@@ -1034,9 +1066,19 @@ function paintPool() {
   setPoolText($('sHealthy'), p.healthy);
   setPoolText($('sCooling'), p.cooling);
   setPoolText($('sDisabled'), p.disabled);
-  let remSum = 0, totSum = 0;
-  for (const s of accList) { remSum += (s.credits || 0); totSum += (s.credits_total || 0); }
-  setPoolText($('sCredits'), totSum > 0 ? remSum + ' / ' + totSum : remSum);
+  setPoolText($('sPaused'), p.paused);
+  let remSum = 0, totSum = 0, allUnlimited = true;
+  for (const s of accList) {
+    /* credits_total === -1 是企业版「不限量」哨兵：credits 同时是 1<<40 的占位值。
+       两者都不是真实额度，参与求和会把 Σ剩余/Σ总额 抬成天文数字，真实余额被彻底掩盖
+       （accCtx 的池内基准也一并排除）。 */
+    if (s.credits_total === -1) continue;
+    allUnlimited = false;
+    remSum += (s.credits || 0); totSum += (s.credits_total || 0);
+  }
+  /* 池非空且全部不限量：Σ 里没有可加的真实额度，显示「不限」比显示 0 更贴近事实
+     （空池保持原样的 0，不能因为「全都不限量」这句空真命题而变成「不限」）。 */
+  setPoolText($('sCredits'), (accList.length && allUnlimited) ? '不限' : (totSum > 0 ? remSum + ' / ' + totSum : remSum));
   setPoolText($('sSticky'), p.sticky_sessions);
   setPoolText($('accNote'), p.in_flight_full ? p.in_flight_full + ' 个账号在途占满' : '');
   setPoolText($('navState'), p.healthy > 0 ? '服务正常' : (p.total ? '无可用账号' : '待添加账号'));
@@ -1056,7 +1098,7 @@ function setPoolText(el, v) {
 }
 
 /* POOL_KEYS 是统计卡与侧栏状态涉及的全部池字段（与 overview 顶层同名字段一一对应）。 */
-const POOL_KEYS = ['total', 'healthy', 'cooling', 'disabled', 'sticky_sessions', 'in_flight_full'];
+const POOL_KEYS = ['total', 'healthy', 'cooling', 'disabled', 'paused', 'sticky_sessions', 'in_flight_full'];
 
 /* patchPool 应用 pool 补丁（只带变化字段，值是绝对新值），随后由 paintPool 决定
    真正要写的节点——没变的统计数字一个字节都不动。 */
@@ -1237,6 +1279,9 @@ function applyOverview(d) {
   // poolState 与 accList 都到位后再刷统计卡：sCredits 要的是整池求和后的结果。
   poolState = {
     total: d.total, healthy: d.healthy, cooling: d.cooling, disabled: d.disabled,
+    // paused 是「已暂停选号」单列卡的来源（上游 issue #125）：overview 与 WS pool 补丁
+    // 用同一个字段名，两条路径（整包 applyOverview / 增量 patchPool）都能更新它。
+    paused: d.paused,
     sticky_sessions: d.sticky_sessions, in_flight_full: d.in_flight_full,
   };
   paintPool();
@@ -1264,7 +1309,13 @@ $('accBody').addEventListener('click', async ev => {
       toast('签到完成' + (r.credits != null ? '，积分 ' + r.credits + (r.credits_total > 0 ? '/' + r.credits_total : '') : '') + (r.checkin_message ? '（' + r.checkin_message + '）' : ''), 'ok');
     } else if (a === 'balance') {
       const r = await api('accounts/' + encodeURIComponent(u) + '/balance', { method: 'POST' });
-      toast('余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
+      /* 企业号的「额度」刷新走的是 get-enterprise-user-usage，不限量时 credits 就是 1<<40
+         哨兵：照个人号的「余额已更新：<数字>」拼会把占位值甩到运维脸上，故按账号类型分措辞
+         （个人号一字不改）。企业号的额度是「本周期分配」，也不该叫「余额」。 */
+      const ent = accList.some(s => s && s.uid === u && s.enterprise);
+      toast(ent
+        ? '额度已刷新：' + (r.credits_total === -1 ? '不限' : r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''))
+        : '余额已更新：' + r.credits + (r.credits_total > 0 ? ' / ' + r.credits_total : ''), 'ok');
     } else if (a === 'revive') {
       await api('accounts/' + encodeURIComponent(u) + '/revive', { method: 'POST' });
       toast('已解冻', 'ok');

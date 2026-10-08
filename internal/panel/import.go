@@ -142,6 +142,11 @@ func (p *Panel) importCockpit(w http.ResponseWriter, r *http.Request) {
 			} else if claimed {
 				log.Printf("panel: import global trial uid=%s 已领", uid)
 			}
+		} else if a.IsEnterprise() {
+			// 企业版无个人成长体系（上游 daily-checkin 返回 400 code 10001）：
+			// 导入后跳过签到，只刷新额度——额度由下面的 UserResource 取，客户端内部
+			// 已按 enterpriseId 分流到 get-enterprise-user-usage 口径。
+			log.Printf("panel: import checkin uid=%s 跳过（企业账号无签到体系）", uid)
 		} else {
 			if err := p.cfg.Upstream.DailyCheckin(a); err != nil {
 				log.Printf("panel: import checkin uid=%s: %v", uid, err)

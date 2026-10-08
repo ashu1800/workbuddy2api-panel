@@ -279,13 +279,20 @@ label.fld > .hint { display: block; font-size: var(--fs-11); color: var(--ink-2)
 .box .pad { padding: var(--sp-4); }
 .box:last-child { margin-bottom: 0; }
 
-/* 统计条：用 gap + 底色画 1px 网格，避免单元格描边与容器描边叠成双线 */
+/* 统计条：用 gap + 底色画 1px 网格，避免单元格描边与容器描边叠成双线。
+   这里刻意用 flex 换行而不是固定列数的 grid：卡片数会随视图变化（账号管理 7 张、
+   用量总览 6 张、积分扣除 5 张 + 1 个补位格），固定列数遇到除不尽的那一行就会
+   露出容器底色的灰块；flex 的末行会把剩余卡片按 flex-grow 均分填满，任何张数/宽度
+   都不会露底色，也不再需要为断点维护一份 grid-template-columns 覆盖。 */
 .stats {
-  display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); gap: 1px;
+  display: flex; flex-wrap: wrap; gap: 1px;
   background: var(--line-soft); border: 1px solid var(--line);
   border-radius: var(--r-md); overflow: hidden; margin-bottom: var(--sp-4);
 }
-.stat { background: var(--surface); padding: var(--sp-3) var(--sp-4); }
+/* flex:1 1 140px：140px 是卡片「数字 + 标签」不折行的舒适宽度，容器宽就多放几张、
+   窄就少放几张；放不满一行的卡片均分剩余宽度（.stat.blank 同规则，故补位格与
+   真卡片等宽，视觉上仍是整齐的网格）。 */
+.stat { flex: 1 1 140px; background: var(--surface); padding: var(--sp-3) var(--sp-4); }
 /* 空位补齐格：统计项不足列数时由 JS 补 .blank，避免容器底色透出成灰块 */
 .stat.blank { background: var(--surface); }
 .stat .v {
@@ -807,7 +814,6 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
    14. 响应式（控制台以桌面为主：只保证不横向滚动、导航可折叠）
    ════════════════════════════════════════════════════════════════════════ */
 @media (max-width: 1180px) {
-  .stats { grid-template-columns: repeat(3, minmax(0, 1fr)); }
   .grid3 { grid-template-columns: 1fr 1fr; }
 }
 @media (max-width: 900px) {
@@ -818,9 +824,6 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
   .grid2, .grid3 { grid-template-columns: 1fr; }
   .view { padding: var(--sp-4); }
   .topbar .bar { padding: 0 var(--sp-4); }
-}
-@media (max-width: 640px) {
-  .stats { grid-template-columns: repeat(2, minmax(0, 1fr)); }
 }
 </style>
 </head>
@@ -895,6 +898,9 @@ legend { font-size: var(--fs-12); color: var(--ink-2); font-weight: 600; padding
         <div class="stat good"><div class="v" id="sHealthy">-</div><div class="k">可用</div></div>
         <div class="stat warn"><div class="v" id="sCooling">-</div><div class="k">冷却中</div></div>
         <div class="stat bad"><div class="v" id="sDisabled">-</div><div class="k">已禁用</div></div>
+        <!-- 已暂停选号：主动让位（paused）既不是故障也不是禁用，用 warn 语义色提示「需要
+             关注但不紧急」，标签文案与账号行内的状态标签保持一致，便于对照。 -->
+        <div class="stat warn"><div class="v" id="sPaused">-</div><div class="k">已暂停选号</div></div>
         <div class="stat"><div class="v" id="sCredits">-</div><div class="k">积分剩余 / 总额</div></div>
         <div class="stat"><div class="v" id="sSticky">-</div><div class="k">粘性会话</div></div>
       </div>

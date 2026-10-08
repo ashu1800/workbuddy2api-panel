@@ -12,6 +12,13 @@ import (
 	"github.com/linguo2625469/workbuddy2api-panel/internal/logfmt"
 )
 
+// minInferWindowMs 可信生成窗口的下限（毫秒），与 internal/server 的 minGenWindow
+// （200ms）同值：扣掉首字等待后剩余窗口不足它，就说明这是「攒批下发」而不是真实生成
+// 吞吐，退回端到端计时（issue #127）。两边各写一份常量而不是共享，是因为 server 依赖
+// pool，pool 反向引用会成环；改动时**必须同步**，否则同一个账号在流水行与累计平均里
+// 会算出两种速度。
+const minInferWindowMs = 200
+
 func (p *Pool) Disable(uid, reason string) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
@@ -315,10 +322,15 @@ func (p *Pool) RecordTokenUsage(uid string, delta TokenUsageDelta) {
 		// 累计之后的时间」，比值放大几十倍（1.13.0 的线上实况：3096–20677 tok/s）。
 		// 首字未知（非流式、失败）或首字 >= 总耗时（时钟粒度/异常上游）时按总耗时
 		// 计：宁可把等待算进去，也不能让分母趋近 0 而算出天文速度把累计均值带偏。
-		// 减法只在 TTFBMs < inferMs 时发生，故结果恒 >= 1ms，无需再钳位。
+		//
+		// 扣完首字后**不足 200ms 一律退回端到端**（与 internal/server 的
+		// minGenWindow 同一道地板，issue #127）：上游攒批下发时 total−ttfb 只剩几毫秒，
+		// 几百 token 除出上万 tok/s 的幻数；这里的累计平均会把它永久带偏（面板「推理
+		// 速度」列），所以必须同口径设下限，不能只兜「TTFB >= 总耗时」。
 		if delta.HasCompletionTokens && delta.CompletionTokens >= 0 && delta.LatencyMs > 0 {
 			inferMs := delta.LatencyMs
-			if delta.HasTTFBMs && delta.TTFBMs > 0 && delta.TTFBMs < inferMs {
+			if delta.HasTTFBMs && delta.TTFBMs > 0 && delta.TTFBMs < inferMs &&
+				inferMs-delta.TTFBMs >= minInferWindowMs {
 				inferMs -= delta.TTFBMs
 			}
 			usage.InferenceMsSum += inferMs
